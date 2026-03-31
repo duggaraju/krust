@@ -5,7 +5,7 @@ rustup target add x86_64-unknown-none --toolchain nightly
 ```
 * Install llvm tools
 ```bash
-rustup component add llvm-tools-preview
+rustup component add llvm-tools-preview --toolchain nightly
 ```
 
 * Build the code

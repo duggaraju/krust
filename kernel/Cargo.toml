@@ -8,6 +8,9 @@ bootloader_api = "0.11.15"
 bootloader-x86_64-common = "0.11.15"
 bootloader-boot-config = "0.11.15"
 log = "0.4.29"
+uart_16550 = "0.6.0"
+x86_64 = "0.15.4"
+vga="0.2.9"
 
 [profile.dev]
 panic = "abort"
