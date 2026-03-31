@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-bootloader_api = "0.11.10"
-bootloader-x86_64-common = "0.11.10"
-bootloader-boot-config = "0.11.10"
-log = "0.4.27"
+bootloader_api = "0.11.15"
+bootloader-x86_64-common = "0.11.15"
+bootloader-boot-config = "0.11.15"
+log = "0.4.29"
 
 [profile.dev]
 panic = "abort"
