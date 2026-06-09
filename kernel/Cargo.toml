@@ -3,17 +3,25 @@ name = "kernel"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["mm", "process", "fs", "syscall", "shell"]
+mm = []
+process = ["mm"]
+fs = []
+syscall = ["process", "fs"]
+drivers = []
+modules = []
+shell = ["mm", "process", "fs", "syscall", "drivers"]
+
 [dependencies]
 bootloader_api = "0.11.15"
 bootloader-x86_64-common = "0.11.15"
 bootloader-boot-config = "0.11.15"
 log = "0.4.29"
 uart_16550 = "0.6.0"
+pc-keyboard = "0.9.0"
 x86_64 = "0.15.4"
-vga="0.2.9"
-
-[profile.dev]
-panic = "abort"
-[profile.release]
-panic = "abort"
-
+vga = "0.2.9"
+spin = "0.12"
+linked_list_allocator = "0.10"
+bitflags = "2"

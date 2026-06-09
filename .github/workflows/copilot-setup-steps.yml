@@ -1,0 +1,32 @@
+name: "Copilot Setup Steps"
+
+on:
+    workflow_dispatch:
+    push:
+        paths:
+            - .github/workflows/copilot-setup-steps.yml
+    pull_request:
+        paths:
+            - .github/workflows/copilot-setup-steps.yml
+
+jobs:
+    copilot-setup-steps:
+        runs-on: ubuntu-latest
+
+        permissions:
+            contents: read
+
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v5
+
+            - name: Install Rust nightly toolchain
+              uses: dtolnay/rust-toolchain@nightly
+              with:
+                  targets: x86_64-unknown-none
+                  components: llvm-tools-preview
+
+            - name: Allow agent to read ~/.cargo
+              run: |
+                  echo "$HOME/.cargo" >> "$GITHUB_PATH"
+                  echo "CARGO_HOME=$HOME/.cargo" >> "$GITHUB_ENV"
