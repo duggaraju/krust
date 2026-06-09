@@ -3,9 +3,10 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 
-use super::vfs::{DirEntry, FileSystem, FileType, FsError, Inode};
+use super::vfs::{DirCursor, DirEntry, FileSystem, FileType, FsError, Inode};
 
 pub struct RamFs {
     root: Arc<RamInode>,
@@ -36,6 +37,7 @@ impl FileSystem for RamFs {
 }
 
 pub struct RamInode {
+    ino: u64,
     file_type: FileType,
     inner: Mutex<RamInodeData>,
 }
@@ -47,12 +49,14 @@ enum RamInodeData {
 
 impl RamInode {
     pub fn new(file_type: FileType) -> Self {
+        let ino = next_inode_number();
         let inner = match file_type {
             FileType::Directory => RamInodeData::Directory(Vec::new()),
             _ => RamInodeData::File(Vec::new()),
         };
 
         Self {
+            ino,
             file_type,
             inner: Mutex::new(inner),
         }
@@ -64,6 +68,10 @@ impl RamInode {
 }
 
 impl Inode for RamInode {
+    fn ino(&self) -> u64 {
+        self.ino
+    }
+
     fn read(&self, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
         let inner = self.inner.lock();
 
@@ -152,17 +160,39 @@ impl Inode for RamInode {
         }
     }
 
-    fn readdir(&self) -> Result<Vec<DirEntry>, FsError> {
+    fn filesystem_name(&self) -> &'static str {
+        "ramfs"
+    }
+
+    fn readdir(
+        &self,
+        cursor: &mut DirCursor,
+        _name_buf: &mut [u8],
+        visit: &mut dyn for<'a> FnMut(DirEntry<'a>) -> bool,
+    ) -> Result<usize, FsError> {
         let inner = self.inner.lock();
         match &*inner {
-            RamInodeData::Directory(entries) => Ok(entries
-                .iter()
-                .map(|(name, inode)| DirEntry {
-                    name: name.clone(),
-                    file_type: inode.file_type(),
-                })
-                .collect()),
+            RamInodeData::Directory(entries) => {
+                let mut emitted = 0usize;
+                let mut index = cursor.offset as usize;
+                while index < entries.len() {
+                    let (name, inode) = &entries[index];
+                    let entry = DirEntry::new(name.as_str(), inode.file_type(), inode.ino());
+                    emitted += 1;
+                    index += 1;
+                    if !visit(entry) {
+                        break;
+                    }
+                }
+                cursor.offset = index as u64;
+                Ok(emitted)
+            }
             RamInodeData::File(_) => Err(FsError::NotADirectory),
         }
     }
+}
+
+fn next_inode_number() -> u64 {
+    static NEXT_INO: AtomicU64 = AtomicU64::new(1);
+    NEXT_INO.fetch_add(1, Ordering::Relaxed)
 }

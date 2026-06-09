@@ -1,3 +1,5 @@
+extern crate alloc;
+
 use core::slice;
 
 use bootloader_api::BootInfo;
@@ -12,7 +14,11 @@ pub struct BootConfig {
     pub log_level: LevelFilter,
     pub shell_port: u8,
     pub shell_console: ShellConsole,
+    pub virtual_consoles: usize,
 }
+
+pub const DEFAULT_VIRTUAL_CONSOLES: usize = 6;
+pub const MAX_VIRTUAL_CONSOLES: usize = 12;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShellConsole {
@@ -27,6 +33,7 @@ impl Default for BootConfig {
             log_level: LevelFilter::Info,
             shell_port: 1,
             shell_console: ShellConsole::Auto,
+            virtual_consoles: DEFAULT_VIRTUAL_CONSOLES,
         }
     }
 }
@@ -37,6 +44,8 @@ impl BootConfig {
         config.log_level = read_log_level(boot_info).unwrap_or(config.log_level);
         config.shell_port = read_shell_port(boot_info).unwrap_or(config.shell_port);
         config.shell_console = read_shell_console(boot_info).unwrap_or(config.shell_console);
+        config.virtual_consoles =
+            read_virtual_consoles(boot_info).unwrap_or(config.virtual_consoles);
         config
     }
 
@@ -57,6 +66,10 @@ impl BootConfig {
 
     pub fn shell_console(&self) -> ShellConsole {
         self.shell_console
+    }
+
+    pub fn virtual_consoles(&self) -> usize {
+        self.virtual_consoles
     }
 }
 
@@ -132,6 +145,30 @@ fn read_shell_console(boot_info: &BootInfo) -> Option<ShellConsole> {
     parse_shell_console(contents)
 }
 
+fn read_virtual_consoles(boot_info: &BootInfo) -> Option<usize> {
+    let ramdisk_addr = match boot_info.ramdisk_addr {
+        Optional::Some(addr) if boot_info.ramdisk_len > 0 => addr,
+        _ => return None,
+    };
+
+    let len = boot_info.ramdisk_len as usize;
+    let ptr = VirtAddr::new(ramdisk_addr).as_ptr();
+    let ramdisk = unsafe {
+        // SAFETY: the bootloader already maps the ramdisk into virtual memory and
+        // exposes the mapped address in BootInfo::ramdisk_addr.
+        slice::from_raw_parts(ptr, len)
+    };
+
+    let fs = InitrdFs::new(ramdisk).ok()?;
+    let root = fs.root_inode();
+    let config = root.lookup("boot.toml").ok()?;
+
+    let mut buf = [0u8; 256];
+    let read = config.read(0, &mut buf).ok()?;
+    let contents = core::str::from_utf8(&buf[..read]).ok()?;
+    parse_virtual_consoles(contents)
+}
+
 fn parse_log_level(contents: &str) -> Option<LevelFilter> {
     for line in contents.lines() {
         let line = line.trim();
@@ -200,6 +237,28 @@ fn parse_shell_console(contents: &str) -> Option<ShellConsole> {
             "framebuffer" => Some(ShellConsole::Framebuffer),
             _ => None,
         };
+    }
+
+    None
+}
+
+fn parse_virtual_consoles(contents: &str) -> Option<usize> {
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let (key, value) = line.split_once('=')?;
+        if key.trim() != "virtual_consoles" {
+            continue;
+        }
+
+        let value = value.trim().trim_matches('"');
+        return value
+            .parse::<usize>()
+            .ok()
+            .map(|count| count.clamp(1, MAX_VIRTUAL_CONSOLES));
     }
 
     None

@@ -6,6 +6,25 @@ pub mod x86_64;
 #[cfg(target_arch = "x86_64")]
 pub use self::x86_64 as current;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownStatus {
+    Success,
+    Failure,
+}
+
+pub fn shutdown(status: ShutdownStatus) -> ! {
+    #[cfg(target_arch = "x86_64")]
+    {
+        current::shutdown(status)
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    loop {
+        let _ = status;
+        core::hint::spin_loop();
+    }
+}
+
 pub trait ArchInterrupts {
     fn enable();
     fn disable();

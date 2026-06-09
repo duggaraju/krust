@@ -8,7 +8,10 @@ use core::cmp::min;
 
 use spin::Mutex;
 
-use super::vfs::{DirEntry, FileSystem, FileType, FsError, Inode};
+use crate::drivers::traits::{BlockDevice, DeviceError};
+use crate::module::traits::{KernelModule, KernelRegistry, ModuleError};
+
+use super::vfs::{DirCursor, DirEntry, FileSystem, FileType, FsError, Inode, copy_name_into};
 
 const DIR_ENTRY_SIZE: usize = 32;
 const ATTR_READ_ONLY: u8 = 0x01;
@@ -62,7 +65,7 @@ struct ParsedDirEntry {
 }
 
 struct FatFsInner {
-    image: &'static mut [u8],
+    device: Arc<dyn BlockDevice>,
     bpb: BiosParameterBlock,
     fat_type: FatType,
     root_dir_sectors: u32,
@@ -70,12 +73,25 @@ struct FatFsInner {
     first_fat_sector: u32,
     first_data_sector: u32,
     total_clusters: u32,
+    sector_size: usize,
     next_free_hint: u32,
 }
 
 pub struct FatFs {
     inner: Arc<Mutex<FatFsInner>>,
     root: Arc<FatInode>,
+}
+
+#[cfg(all(feature = "fs", feature = "drivers"))]
+pub struct FatFsModule {
+    device: Arc<dyn BlockDevice>,
+}
+
+#[cfg(all(feature = "fs", feature = "drivers"))]
+impl FatFsModule {
+    pub fn new(device: Arc<dyn BlockDevice>) -> Self {
+        Self { device }
+    }
 }
 
 pub struct FatInode {
@@ -85,13 +101,18 @@ pub struct FatInode {
 }
 
 impl FatFs {
-    pub fn mount(image: &'static mut [u8]) -> Result<Self, FsError> {
-        if image.len() < 512 {
+    pub fn mount(device: Arc<dyn BlockDevice>) -> Result<Self, FsError> {
+        let sector_size = device.sector_size();
+        if sector_size < 512 {
             return Err(FsError::IoError);
         }
 
-        let bpb = parse_bpb(&image[..512])?;
-        validate_bpb(&bpb, image.len())?;
+        let mut boot_sector = vec![0u8; sector_size];
+        device
+            .read_sector(0, &mut boot_sector)
+            .map_err(map_device_error)?;
+        let bpb = parse_bpb(&boot_sector[..512])?;
+        validate_bpb(&bpb, device.sector_count(), sector_size)?;
 
         let root_dir_sectors = ((u32::from(bpb.root_entry_count) * 32)
             + (u32::from(bpb.bytes_per_sector) - 1))
@@ -132,7 +153,7 @@ impl FatFs {
         };
 
         let inner = Arc::new(Mutex::new(FatFsInner {
-            image,
+            device,
             bpb,
             fat_type,
             root_dir_sectors,
@@ -140,6 +161,7 @@ impl FatFs {
             first_fat_sector,
             first_data_sector,
             total_clusters,
+            sector_size,
             next_free_hint: 2,
         }));
 
@@ -155,18 +177,6 @@ impl FatFs {
     pub fn read_fat_entry(&self, cluster: u32) -> u32 {
         self.inner.lock().read_fat_entry(cluster)
     }
-
-    pub fn write_fat_entry(&mut self, cluster: u32, value: u32) {
-        self.inner.lock().write_fat_entry(cluster, value);
-    }
-
-    pub fn allocate_cluster(&mut self) -> Result<u32, FsError> {
-        self.inner.lock().allocate_cluster()
-    }
-
-    pub fn cluster_to_offset(&self, cluster: u32) -> usize {
-        self.inner.lock().cluster_to_offset(cluster)
-    }
 }
 
 impl FileSystem for FatFs {
@@ -177,6 +187,38 @@ impl FileSystem for FatFs {
     fn root_inode(&self) -> Arc<dyn Inode> {
         self.root.clone()
     }
+}
+
+#[cfg(all(feature = "fs", feature = "drivers"))]
+impl KernelModule for FatFsModule {
+    fn name(&self) -> &str {
+        "fatfs"
+    }
+
+    fn version(&self) -> &str {
+        "0.1.0"
+    }
+
+    fn description(&self) -> &str {
+        "FAT filesystem"
+    }
+
+    fn init(&self, registry: &dyn KernelRegistry) -> Result<(), ModuleError> {
+        let fs = FatFs::mount(Arc::clone(&self.device)).map_err(|_| ModuleError::InitFailed)?;
+        registry.register_filesystem(Arc::new(fs))?;
+        Ok(())
+    }
+
+    fn cleanup(&self, registry: &dyn KernelRegistry) -> Result<(), ModuleError> {
+        registry.unregister_filesystem("fat")?;
+        Ok(())
+    }
+}
+
+#[cfg(all(feature = "fs", feature = "drivers"))]
+pub fn register_module(registry: &dyn KernelRegistry, device: Arc<dyn BlockDevice>) {
+    let module: Arc<dyn KernelModule> = Arc::new(FatFsModule::new(device));
+    let _ = registry.register_module(module);
 }
 
 impl FatInode {
@@ -232,16 +274,9 @@ impl Inode for FatInode {
             let cluster = chain[cluster_index];
             let image_offset = inner.cluster_to_offset(cluster);
             let chunk = min(limit - copied, cluster_size - cluster_offset);
-            let end = image_offset
-                .checked_add(cluster_offset + chunk)
-                .ok_or(FsError::IoError)?;
-            if end > inner.image.len() {
-                return Err(FsError::IoError);
-            }
-
-            buf[copied..copied + chunk].copy_from_slice(
-                &inner.image[image_offset + cluster_offset..image_offset + cluster_offset + chunk],
-            );
+            let mut chunk_buf = vec![0u8; chunk];
+            inner.read_bytes(image_offset + cluster_offset, &mut chunk_buf)?;
+            buf[copied..copied + chunk].copy_from_slice(&chunk_buf);
             copied += chunk;
             cluster_index += 1;
             cluster_offset = 0;
@@ -276,15 +311,10 @@ impl Inode for FatInode {
                 let cluster = chain[cluster_index];
                 let image_offset = inner.cluster_to_offset(cluster);
                 let chunk = min(buf.len() - written, cluster_size - cluster_offset);
-                let write_end = image_offset
-                    .checked_add(cluster_offset + chunk)
-                    .ok_or(FsError::IoError)?;
-                if write_end > inner.image.len() {
-                    return Err(FsError::IoError);
-                }
-
-                inner.image[image_offset + cluster_offset..image_offset + cluster_offset + chunk]
-                    .copy_from_slice(&buf[written..written + chunk]);
+                inner.write_bytes(
+                    image_offset + cluster_offset,
+                    &buf[written..written + chunk],
+                )?;
                 written += chunk;
                 cluster_index += 1;
                 cluster_offset = 0;
@@ -420,7 +450,16 @@ impl Inode for FatInode {
         }
     }
 
-    fn readdir(&self) -> Result<Vec<DirEntry>, FsError> {
+    fn filesystem_name(&self) -> &'static str {
+        "fat"
+    }
+
+    fn readdir(
+        &self,
+        cursor: &mut DirCursor,
+        name_buf: &mut [u8],
+        visit: &mut dyn for<'a> FnMut(DirEntry<'a>) -> bool,
+    ) -> Result<usize, FsError> {
         if self.file_type != FileType::Directory {
             return Err(FsError::NotADirectory);
         }
@@ -428,30 +467,38 @@ impl Inode for FatInode {
         let state = self.snapshot();
         let inner = self.fs.lock();
         let entries = read_directory_entries(&inner, state)?;
+        let mut emitted = 0usize;
+        let mut index = cursor.offset as usize;
 
-        Ok(entries
-            .into_iter()
-            .filter(|entry| entry.name != "." && entry.name != "..")
-            .map(|entry| DirEntry {
-                name: entry.name,
-                file_type: entry.file_type,
-            })
-            .collect())
+        while index < entries.len() {
+            let entry = &entries[index];
+            let name = copy_name_into(entry.name.as_str(), name_buf)?;
+            let out = DirEntry::new(name, entry.file_type, entry.entry_offset as u64);
+            emitted += 1;
+            index += 1;
+            if !visit(out) {
+                cursor.offset = index as u64;
+                return Ok(emitted);
+            }
+        }
+
+        cursor.offset = index as u64;
+        Ok(emitted)
     }
 }
 
 impl FatFsInner {
     fn cluster_size(&self) -> usize {
-        usize::from(self.bpb.bytes_per_sector) * usize::from(self.bpb.sectors_per_cluster)
+        self.sector_size * usize::from(self.bpb.sectors_per_cluster)
     }
 
     fn fat_offset(&self, fat_index: u32) -> usize {
         let fat_sector = self.first_fat_sector + fat_index * self.bpb.fat_size;
-        fat_sector as usize * usize::from(self.bpb.bytes_per_sector)
+        fat_sector as usize * self.sector_size
     }
 
     fn root_dir_offset(&self) -> usize {
-        self.root_dir_sector as usize * usize::from(self.bpb.bytes_per_sector)
+        self.root_dir_sector as usize * self.sector_size
     }
 
     fn max_cluster(&self) -> u32 {
@@ -474,15 +521,36 @@ impl FatFsInner {
         }
     }
 
+    fn read_bytes(&self, offset: usize, buf: &mut [u8]) -> Result<(), FsError> {
+        self.device
+            .read_bytes(offset, buf)
+            .map_err(map_device_error)
+    }
+
+    fn write_bytes(&self, offset: usize, buf: &[u8]) -> Result<(), FsError> {
+        self.device
+            .write_bytes(offset, buf)
+            .map_err(map_device_error)
+    }
+
+    fn read_u16(&self, offset: usize) -> Result<u16, FsError> {
+        let mut bytes = [0u8; 2];
+        self.read_bytes(offset, &mut bytes)?;
+        Ok(u16::from_le_bytes(bytes))
+    }
+
+    fn read_u32(&self, offset: usize) -> Result<u32, FsError> {
+        let mut bytes = [0u8; 4];
+        self.read_bytes(offset, &mut bytes)?;
+        Ok(u32::from_le_bytes(bytes))
+    }
+
     fn read_fat_entry(&self, cluster: u32) -> u32 {
         let fat = self.fat_offset(0);
         match self.fat_type {
             FatType::Fat12 => {
                 let offset = fat + (cluster as usize * 3 / 2);
-                if offset + 1 >= self.image.len() {
-                    return 0;
-                }
-                let value = u16::from_le_bytes([self.image[offset], self.image[offset + 1]]);
+                let value = self.read_u16(offset).unwrap_or(0);
                 if cluster & 1 == 0 {
                     u32::from(value & 0x0FFF)
                 } else {
@@ -491,22 +559,13 @@ impl FatFsInner {
             }
             FatType::Fat16 => {
                 let offset = fat + cluster as usize * 2;
-                if offset + 1 >= self.image.len() {
-                    return 0;
-                }
-                u16::from_le_bytes([self.image[offset], self.image[offset + 1]]) as u32
+                self.read_u16(offset).map(u32::from).unwrap_or(0)
             }
             FatType::Fat32 => {
                 let offset = fat + cluster as usize * 4;
-                if offset + 3 >= self.image.len() {
-                    return 0;
-                }
-                u32::from_le_bytes([
-                    self.image[offset],
-                    self.image[offset + 1],
-                    self.image[offset + 2],
-                    self.image[offset + 3],
-                ]) & 0x0FFF_FFFF
+                self.read_u32(offset)
+                    .map(|value| value & 0x0FFF_FFFF)
+                    .unwrap_or(0)
             }
         }
     }
@@ -517,42 +576,36 @@ impl FatFsInner {
             match self.fat_type {
                 FatType::Fat12 => {
                     let offset = fat + (cluster as usize * 3 / 2);
-                    if offset + 1 >= self.image.len() {
+                    let mut bytes = [0u8; 2];
+                    if self.read_bytes(offset, &mut bytes).is_err() {
                         continue;
                     }
-                    let current = u16::from_le_bytes([self.image[offset], self.image[offset + 1]]);
+                    let current = u16::from_le_bytes(bytes);
                     let next = if cluster & 1 == 0 {
                         (current & 0xF000) | (value as u16 & 0x0FFF)
                     } else {
                         (current & 0x000F) | (((value as u16) & 0x0FFF) << 4)
                     };
                     let bytes = next.to_le_bytes();
-                    self.image[offset] = bytes[0];
-                    self.image[offset + 1] = bytes[1];
+                    let _ = self.write_bytes(offset, &bytes);
                 }
                 FatType::Fat16 => {
                     let offset = fat + cluster as usize * 2;
-                    if offset + 1 >= self.image.len() {
+                    let bytes = (value as u16).to_le_bytes();
+                    if self.write_bytes(offset, &bytes).is_err() {
                         continue;
                     }
-                    let bytes = (value as u16).to_le_bytes();
-                    self.image[offset] = bytes[0];
-                    self.image[offset + 1] = bytes[1];
                 }
                 FatType::Fat32 => {
                     let offset = fat + cluster as usize * 4;
-                    if offset + 3 >= self.image.len() {
+                    let mut bytes = [0u8; 4];
+                    if self.read_bytes(offset, &mut bytes).is_err() {
                         continue;
                     }
-                    let current = u32::from_le_bytes([
-                        self.image[offset],
-                        self.image[offset + 1],
-                        self.image[offset + 2],
-                        self.image[offset + 3],
-                    ]);
+                    let current = u32::from_le_bytes(bytes);
                     let next = (current & 0xF000_0000) | (value & 0x0FFF_FFFF);
                     let bytes = next.to_le_bytes();
-                    self.image[offset..offset + 4].copy_from_slice(&bytes);
+                    let _ = self.write_bytes(offset, &bytes);
                 }
             }
         }
@@ -578,20 +631,14 @@ impl FatFsInner {
 
     fn zero_cluster(&mut self, cluster: u32) -> Result<(), FsError> {
         let offset = self.cluster_to_offset(cluster);
-        let end = offset
-            .checked_add(self.cluster_size())
-            .ok_or(FsError::IoError)?;
-        if end > self.image.len() {
-            return Err(FsError::IoError);
-        }
-        self.image[offset..end].fill(0);
+        self.write_bytes(offset, &vec![0u8; self.cluster_size()])?;
         Ok(())
     }
 
     fn cluster_to_offset(&self, cluster: u32) -> usize {
         let sector =
             self.first_data_sector + (cluster - 2) * u32::from(self.bpb.sectors_per_cluster);
-        sector as usize * usize::from(self.bpb.bytes_per_sector)
+        sector as usize * self.sector_size
     }
 
     fn collect_chain(&self, start_cluster: u32) -> Result<Vec<u32>, FsError> {
@@ -683,7 +730,11 @@ fn parse_bpb(sector: &[u8]) -> Result<BiosParameterBlock, FsError> {
     })
 }
 
-fn validate_bpb(bpb: &BiosParameterBlock, image_len: usize) -> Result<(), FsError> {
+fn validate_bpb(
+    bpb: &BiosParameterBlock,
+    sector_count: u64,
+    sector_size: usize,
+) -> Result<(), FsError> {
     if bpb.bytes_per_sector == 0
         || bpb.sectors_per_cluster == 0
         || bpb.reserved_sectors == 0
@@ -694,14 +745,30 @@ fn validate_bpb(bpb: &BiosParameterBlock, image_len: usize) -> Result<(), FsErro
         return Err(FsError::IoError);
     }
 
-    let total_bytes = usize::from(bpb.bytes_per_sector)
+    if usize::from(bpb.bytes_per_sector) != sector_size {
+        return Err(FsError::IoError);
+    }
+
+    let total_bytes = sector_size
         .checked_mul(bpb.total_sectors as usize)
         .ok_or(FsError::IoError)?;
-    if total_bytes > image_len {
+    let device_bytes = sector_size
+        .checked_mul(sector_count as usize)
+        .ok_or(FsError::IoError)?;
+    if total_bytes > device_bytes {
         return Err(FsError::IoError);
     }
 
     Ok(())
+}
+
+fn map_device_error(err: DeviceError) -> FsError {
+    match err {
+        DeviceError::IoError | DeviceError::NotReady => FsError::IoError,
+        DeviceError::InvalidArgument | DeviceError::NotFound => FsError::NotFound,
+        DeviceError::Busy => FsError::Busy,
+        DeviceError::NotSupported => FsError::NotSupported,
+    }
 }
 
 fn read_directory_entries(
@@ -713,13 +780,10 @@ fn read_directory_entries(
 
     for (offset, len) in regions {
         let end = offset.checked_add(len).ok_or(FsError::IoError)?;
-        if end > inner.image.len() {
-            return Err(FsError::IoError);
-        }
-
         let mut entry_offset = offset;
         while entry_offset + DIR_ENTRY_SIZE <= end {
-            let entry = &inner.image[entry_offset..entry_offset + DIR_ENTRY_SIZE];
+            let mut entry = [0u8; DIR_ENTRY_SIZE];
+            inner.read_bytes(entry_offset, &mut entry)?;
             let first_byte = entry[0];
             if first_byte == 0x00 {
                 return Ok(entries);
@@ -766,7 +830,7 @@ fn directory_regions(
     match state.storage {
         InodeStorage::FixedRoot => Ok(vec![(
             inner.root_dir_offset(),
-            inner.root_dir_sectors as usize * usize::from(inner.bpb.bytes_per_sector),
+            inner.root_dir_sectors as usize * inner.sector_size,
         )]),
         InodeStorage::ClusterChain => {
             let mut regions = Vec::new();
@@ -782,13 +846,13 @@ fn find_free_dir_entry(inner: &mut FatFsInner, state: FatInodeState) -> Result<u
     let regions = directory_regions(inner, state)?;
     for (offset, len) in regions {
         let end = offset.checked_add(len).ok_or(FsError::IoError)?;
-        if end > inner.image.len() {
-            return Err(FsError::IoError);
-        }
-
         let mut entry_offset = offset;
         while entry_offset + DIR_ENTRY_SIZE <= end {
-            let first_byte = inner.image[entry_offset];
+            let first_byte = {
+                let mut byte = [0u8; 1];
+                inner.read_bytes(entry_offset, &mut byte)?;
+                byte[0]
+            };
             if first_byte == 0x00 || first_byte == 0xE5 {
                 return Ok(entry_offset);
             }
@@ -816,14 +880,7 @@ fn write_raw_dir_entry(
     first_cluster: u32,
     size: u32,
 ) -> Result<(), FsError> {
-    let end = entry_offset
-        .checked_add(DIR_ENTRY_SIZE)
-        .ok_or(FsError::IoError)?;
-    if end > inner.image.len() {
-        return Err(FsError::IoError);
-    }
-
-    let entry = &mut inner.image[entry_offset..end];
+    let mut entry = [0u8; DIR_ENTRY_SIZE];
     entry.fill(0);
     entry[0..11].copy_from_slice(short_name);
     entry[11] = attributes;
@@ -833,6 +890,7 @@ fn write_raw_dir_entry(
     entry[20..22].copy_from_slice(&hi);
     entry[26..28].copy_from_slice(&lo);
     entry[28..32].copy_from_slice(&size.to_le_bytes());
+    inner.write_bytes(entry_offset, &entry)?;
     Ok(())
 }
 
@@ -842,19 +900,14 @@ fn update_dir_entry_metadata(
     first_cluster: u32,
     size: u32,
 ) -> Result<(), FsError> {
-    let end = entry_offset
-        .checked_add(DIR_ENTRY_SIZE)
-        .ok_or(FsError::IoError)?;
-    if end > inner.image.len() {
-        return Err(FsError::IoError);
-    }
-
-    let entry = &mut inner.image[entry_offset..end];
+    let mut entry = [0u8; DIR_ENTRY_SIZE];
+    inner.read_bytes(entry_offset, &mut entry)?;
     let hi = ((first_cluster >> 16) as u16).to_le_bytes();
     let lo = (first_cluster as u16).to_le_bytes();
     entry[20..22].copy_from_slice(&hi);
     entry[26..28].copy_from_slice(&lo);
     entry[28..32].copy_from_slice(&size.to_le_bytes());
+    inner.write_bytes(entry_offset, &entry)?;
     Ok(())
 }
 
@@ -867,11 +920,7 @@ fn initialize_directory_cluster(
     let end = offset
         .checked_add(inner.cluster_size())
         .ok_or(FsError::IoError)?;
-    if end > inner.image.len() {
-        return Err(FsError::IoError);
-    }
-
-    inner.image[offset..end].fill(0);
+    inner.write_bytes(offset, &vec![0u8; end - offset])?;
 
     let mut dot = [b' '; 11];
     dot[0] = b'.';

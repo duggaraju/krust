@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use super::console::Console;
 
 /// Dispatch a command line to the appropriate handler.
-pub fn dispatch(line: &str, console: &mut Console) {
+pub fn dispatch(line: &str, console: &mut Console) -> bool {
     let parts: Vec<&str> = line.trim().splitn(2, ' ').collect();
     let cmd = parts[0];
     let args = parts.get(1).unwrap_or(&"");
@@ -18,17 +18,21 @@ pub fn dispatch(line: &str, console: &mut Console) {
         "mem" => cmd_mem(console),
         "ps" => cmd_ps(console),
         "ls" => cmd_ls(args, console),
+        "stat" => cmd_stat(args, console),
         "cat" => cmd_cat(args, console),
+        "cd" => cmd_cd(args, console),
         "mkdir" => cmd_mkdir(args, console),
         "write" => cmd_write(args, console),
         "lsdev" => cmd_lsdev(console),
         "lsmod" => cmd_lsmod(console),
         "uptime" => cmd_uptime(console),
-        "shutdown" | "exit" => cmd_shutdown(),
+        "shutdown" | "exit" => return false,
         _ => {
             console.write_str(&format!("unknown command: '{}'\n", cmd));
         }
     }
+
+    true
 }
 
 fn cmd_help(console: &mut Console) {
@@ -38,8 +42,10 @@ fn cmd_help(console: &mut Console) {
     console.write_str("  clear         - clear screen\n");
     console.write_str("  mem           - show memory stats\n");
     console.write_str("  ps            - list processes\n");
-    console.write_str("  ls [path]     - list directory\n");
+    console.write_str("  ls [-a] [-l] [path] - list directory\n");
+    console.write_str("  stat <path>   - show inode details\n");
     console.write_str("  cat <path>    - read file contents\n");
+    console.write_str("  cd <path>     - change directory\n");
     console.write_str("  mkdir <path>  - create directory\n");
     console.write_str("  write <path> <data> - write to file\n");
     console.write_str("  lsdev         - list devices\n");
@@ -63,12 +69,22 @@ fn cmd_clear(console: &mut Console) {
 
 #[cfg(feature = "mm")]
 fn cmd_mem(console: &mut Console) {
-    use crate::mm::heap::{HEAP_SIZE, HEAP_START};
-    console.write_str(&format!(
-        "Kernel heap: start=0x{:x}, size={} KiB\n",
-        HEAP_START,
-        HEAP_SIZE / 1024
-    ));
+    use crate::syscall::impls;
+
+    match impls::open("/proc/meminfo") {
+        Ok(fd) => {
+            let mut buf = [0u8; 256];
+            loop {
+                match impls::read(fd, &mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => console.write_bytes(&buf[..n]),
+                    Err(_) => break,
+                }
+            }
+            let _ = impls::close(fd);
+        }
+        Err(errno) => console.write_str(&format!("mem: errno {}\n", errno)),
+    }
 }
 
 #[cfg(not(feature = "mm"))]
@@ -80,20 +96,61 @@ fn cmd_mem(console: &mut Console) {
 
 #[cfg(feature = "process")]
 fn cmd_ps(console: &mut Console) {
-    use crate::process::scheduler::SCHEDULER;
-    let scheduler = SCHEDULER.lock();
-    match scheduler.as_ref() {
-        Some(sched) => {
-            console.write_str("PID  STATE    NAME\n");
-            console.write_str("---  -----    ----\n");
-            if let Some(task) = sched.current() {
-                console.write_str(&format!(
-                    "{:<4} {:?}  {}\n",
-                    task.pid, task.state, task.name
-                ));
-            }
+    use crate::syscall::impls;
+
+    let fd = match impls::open("/proc") {
+        Ok(fd) => fd,
+        Err(_) => {
+            console.write_str("ps: failed to read /proc\n");
+            return;
         }
-        None => console.write_str("scheduler not initialized\n"),
+    };
+
+    let mut pids: Vec<usize> = Vec::new();
+    let mut visit = |entry: crate::fs::vfs::DirEntry<'_>| {
+        if let Ok(pid) = entry.name.parse::<usize>() {
+            pids.push(pid);
+        }
+        true
+    };
+    let mut cursor = crate::fs::vfs::DirCursor::default();
+    let mut name_buf = [0u8; 32];
+    let _ = impls::readdir(fd, &mut cursor, &mut name_buf, &mut visit);
+    let _ = impls::close(fd);
+    pids.sort_unstable();
+
+    console.write_str("PID  PPID   STATE   NAME\n");
+    console.write_str("---  ----   -----   ----\n");
+
+    for pid in &pids {
+        let status_path = format!("/proc/{pid}/status");
+        let Ok(fd) = impls::open(&status_path) else {
+            continue;
+        };
+        let mut buf = [0u8; 256];
+        let mut total = 0usize;
+        loop {
+            match impls::read(fd, &mut buf[total..]) {
+                Ok(0) => break,
+                Ok(n) => total += n,
+                Err(_) => break,
+            }
+            if total >= buf.len() { break; }
+        }
+        let _ = impls::close(fd);
+        let Ok(text) = core::str::from_utf8(&buf[..total]) else { continue; };
+        let mut name = "";
+        let mut state = "";
+        let mut ppid = "";
+        for line in text.lines() {
+            if let Some(v) = line.strip_prefix("Name:\t") { name = v; }
+            else if let Some(v) = line.strip_prefix("State:\t") { state = v; }
+            else if let Some(v) = line.strip_prefix("PPid:\t") { ppid = v; }
+        }
+        console.write_str(&format!(
+            "{:<4} {:<6} {:<7} {}\n",
+            pid, ppid, state, name
+        ));
     }
 }
 
@@ -106,50 +163,72 @@ fn cmd_ps(console: &mut Console) {
 
 #[cfg(feature = "fs")]
 fn cmd_ls(args: &str, console: &mut Console) {
-    use crate::fs::vfs::{self, FileType};
+    use crate::syscall::impls;
 
-    let root = match vfs::root_inode() {
-        Ok(r) => r,
+    let (show_all, show_long, path) = parse_ls_args(args);
+    let stat = match impls::stat(path) {
+        Ok(stat) => stat,
+        Err(errno) => {
+            console.write_str(&format!("ls: errno {}\n", errno));
+            return;
+        }
+    };
+    if stat.file_type != impls::STAT_TYPE_DIRECTORY {
+        if show_long {
+            console.write_str(&format!("{}\n", format_stat_entry(path, &stat, "")));
+        } else {
+            console.write_str(&format!("{} (file, {} bytes)\n", path, stat.size));
+        }
+        return;
+    }
+
+    let fd = match open_dir_fd(path) {
+        Ok(fd) => fd,
         Err(_) => {
-            console.write_str("no filesystem mounted\n");
+            console.write_str("ls: failed to read directory\n");
             return;
         }
     };
 
-    let inode = if args.is_empty() || args == "/" {
-        root
-    } else {
-        let name = args.trim_start_matches('/');
-        match root.lookup(name) {
-            Ok(i) => i,
-            Err(e) => {
-                console.write_str(&format!("ls: {:?}\n", e));
-                return;
-            }
+    let mut cursor = crate::fs::vfs::DirCursor::default();
+    let mut name_buf = [0u8; 128];
+    let mut seen = 0usize;
+    let mut visit = |entry: crate::fs::vfs::DirEntry<'_>| {
+        seen += 1;
+        if !show_all && (entry.name == "." || entry.name == "..") {
+            return true;
         }
+        if show_long {
+            let entry_path = join_path(path, entry.name);
+            match impls::stat(&entry_path) {
+                Ok(entry_stat) => {
+                    console.write_str(&format!(
+                        "{}\n",
+                        format_stat_entry(
+                            entry.name,
+                            &entry_stat,
+                            entry_type_indicator(entry.file_type)
+                        )
+                    ));
+                }
+                Err(errno) => {
+                    console.write_str(&format!("  {}: errno {}\n", entry.name, errno));
+                }
+            }
+        } else {
+            let type_indicator = entry_type_indicator(entry.file_type);
+            console.write_str(&format!("  {}{}\n", entry.name, type_indicator));
+        }
+        true
     };
+    let result = impls::readdir(fd, &mut cursor, &mut name_buf, &mut visit);
+    let _ = impls::close(fd);
 
-    if inode.file_type() != FileType::Directory {
-        console.write_str(&format!("{} (file, {} bytes)\n", args, inode.size()));
-        return;
-    }
-
-    match inode.readdir() {
-        Ok(entries) if entries.is_empty() => {
+    match result {
+        Ok(_) if seen == 0 => {
             console.write_str("(empty directory)\n");
         }
-        Ok(entries) => {
-            for entry in &entries {
-                let type_indicator = match entry.file_type {
-                    FileType::Directory => "/",
-                    FileType::Symlink => "@",
-                    FileType::CharDevice => "%",
-                    FileType::BlockDevice => "#",
-                    _ => "",
-                };
-                console.write_str(&format!("  {}{}\n", entry.name, type_indicator));
-            }
-        }
+        Ok(_) => {}
         Err(e) => console.write_str(&format!("ls: {:?}\n", e)),
     }
 }
@@ -161,56 +240,41 @@ fn cmd_ls(_args: &str, console: &mut Console) {
 
 #[cfg(feature = "fs")]
 fn cmd_cat(args: &str, console: &mut Console) {
-    use crate::fs::vfs::{self, FileType};
+    use crate::syscall::impls;
 
     if args.is_empty() {
-        console.write_str("usage: cat <filename>\n");
+        console.write_str("usage: cat <path>\n");
         return;
     }
 
-    let root = match vfs::root_inode() {
-        Ok(r) => r,
-        Err(_) => {
-            console.write_str("no filesystem mounted\n");
+    let stat = match impls::stat(args) {
+        Ok(stat) => stat,
+        Err(errno) => {
+            console.write_str(&format!("cat: {}: errno {}\n", args, errno));
             return;
         }
     };
 
-    let name = args.trim_start_matches('/');
-    let inode = match root.lookup(name) {
-        Ok(i) => i,
-        Err(e) => {
-            console.write_str(&format!("cat: {}: {:?}\n", name, e));
-            return;
-        }
-    };
-
-    if inode.file_type() == FileType::Directory {
-        console.write_str(&format!("cat: {}: Is a directory\n", name));
+    if stat.file_type == impls::STAT_TYPE_DIRECTORY {
+        console.write_str(&format!("cat: {}: Is a directory\n", args));
         return;
     }
 
-    let mut buf = [0u8; 512];
-    let mut offset = 0;
-    loop {
-        match inode.read(offset, &mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                if let Ok(s) = core::str::from_utf8(&buf[..n]) {
-                    console.write_str(s);
-                } else {
-                    console.write_str("<binary data>\n");
-                    break;
+    match impls::open(args) {
+        Ok(fd) => {
+            let mut buf = [0u8; 512];
+            loop {
+                match impls::read(fd, &mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => console.write_bytes(&buf[..n]),
+                    Err(_) => break,
                 }
-                offset += n;
             }
-            Err(e) => {
-                console.write_str(&format!("\ncat: read error: {:?}\n", e));
-                break;
-            }
+            let _ = impls::close(fd);
+            console.write_bytes(b"\n");
         }
+        Err(errno) => console.write_str(&format!("cat: {}: errno {}\n", args, errno)),
     }
-    console.write_str("\n");
 }
 
 #[cfg(not(feature = "fs"))]
@@ -219,26 +283,59 @@ fn cmd_cat(_args: &str, console: &mut Console) {
 }
 
 #[cfg(feature = "fs")]
-fn cmd_mkdir(args: &str, console: &mut Console) {
-    use crate::fs::vfs::{self, FileType};
+fn cmd_cd(args: &str, console: &mut Console) {
+    use crate::syscall::impls;
 
     if args.is_empty() {
-        console.write_str("usage: mkdir <dirname>\n");
+        console.write_str("usage: cd <path>\n");
         return;
     }
 
-    let root = match vfs::root_inode() {
-        Ok(r) => r,
-        Err(_) => {
-            console.write_str("no filesystem mounted\n");
-            return;
-        }
-    };
+    match impls::chdir(args) {
+        Ok(()) => {}
+        Err(errno) => console.write_str(&format!("cd: errno {}\n", errno)),
+    }
+}
 
-    let name = args.trim_start_matches('/');
-    match root.create(name, FileType::Directory) {
-        Ok(_) => console.write_str(&format!("created directory: {}\n", name)),
-        Err(e) => console.write_str(&format!("mkdir: {:?}\n", e)),
+#[cfg(not(feature = "fs"))]
+fn cmd_cd(_args: &str, console: &mut Console) {
+    console.write_str("filesystem not enabled (feature 'fs' disabled)\n");
+}
+
+#[cfg(feature = "fs")]
+fn cmd_stat(args: &str, console: &mut Console) {
+    use crate::syscall::impls;
+
+    if args.is_empty() {
+        console.write_str("usage: stat <path>\n");
+        return;
+    }
+
+    match impls::stat(args) {
+        Ok(stat) => {
+            console.write_str(&format!("{}\n", format_stat_entry(args, &stat, "")));
+        }
+        Err(errno) => console.write_str(&format!("stat: errno {}\n", errno)),
+    }
+}
+
+#[cfg(not(feature = "fs"))]
+fn cmd_stat(_args: &str, console: &mut Console) {
+    console.write_str("filesystem not enabled (feature 'fs' disabled)\n");
+}
+
+#[cfg(feature = "fs")]
+fn cmd_mkdir(args: &str, console: &mut Console) {
+    use crate::syscall::impls;
+
+    if args.is_empty() {
+        console.write_str("usage: mkdir <path>\n");
+        return;
+    }
+
+    match impls::mkdir(args) {
+        Ok(_) => console.write_str(&format!("created directory: {}\n", args)),
+        Err(errno) => console.write_str(&format!("mkdir: errno {}\n", errno)),
     }
 }
 
@@ -249,39 +346,19 @@ fn cmd_mkdir(_args: &str, console: &mut Console) {
 
 #[cfg(feature = "fs")]
 fn cmd_write(args: &str, console: &mut Console) {
-    use crate::fs::vfs::{self, FileType};
+    use crate::syscall::impls;
 
     let parts: Vec<&str> = args.splitn(2, ' ').collect();
     if parts.len() < 2 {
-        console.write_str("usage: write <filename> <data>\n");
+        console.write_str("usage: write <path> <data>\n");
         return;
     }
-    let name = parts[0].trim_start_matches('/');
+    let path = parts[0];
     let data = parts[1];
 
-    let root = match vfs::root_inode() {
-        Ok(r) => r,
-        Err(_) => {
-            console.write_str("no filesystem mounted\n");
-            return;
-        }
-    };
-
-    // Create file if it doesn't exist
-    let inode = match root.lookup(name) {
-        Ok(i) => i,
-        Err(_) => match root.create(name, FileType::Regular) {
-            Ok(i) => i,
-            Err(e) => {
-                console.write_str(&format!("write: create failed: {:?}\n", e));
-                return;
-            }
-        },
-    };
-
-    match inode.write(0, data.as_bytes()) {
-        Ok(n) => console.write_str(&format!("wrote {} bytes to {}\n", n, name)),
-        Err(e) => console.write_str(&format!("write: {:?}\n", e)),
+    match impls::write_file(path, data.as_bytes()) {
+        Ok(n) => console.write_str(&format!("wrote {} bytes to {}\n", n, path)),
+        Err(errno) => console.write_str(&format!("write: errno {}\n", errno)),
     }
 }
 
@@ -294,15 +371,31 @@ fn cmd_write(_args: &str, console: &mut Console) {
 
 #[cfg(feature = "drivers")]
 fn cmd_lsdev(console: &mut Console) {
-    use crate::drivers::registry;
-    let devices = registry::list();
-    if devices.is_empty() {
-        console.write_str("no devices registered\n");
-    } else {
-        console.write_str("Registered devices:\n");
-        for name in &devices {
-            console.write_str(&format!("  {}\n", name));
+    use crate::syscall::impls;
+
+    let fd = match impls::open("/dev") {
+        Ok(fd) => fd,
+        Err(_) => {
+            console.write_str("lsdev: failed to read /dev\n");
+            return;
         }
+    };
+    console.write_str("Registered devices:\n");
+    let mut seen = 0usize;
+    let mut cursor = crate::fs::vfs::DirCursor::default();
+    let mut name_buf = [0u8; 64];
+    let mut visit = |entry: crate::fs::vfs::DirEntry<'_>| {
+        if entry.name == "." || entry.name == ".." {
+            return true;
+        }
+        seen += 1;
+        console.write_str(&format!("  {}\n", entry.name));
+        true
+    };
+    let _ = impls::readdir(fd, &mut cursor, &mut name_buf, &mut visit);
+    let _ = impls::close(fd);
+    if seen == 0 {
+        console.write_str("  (none)\n");
     }
 }
 
@@ -315,16 +408,31 @@ fn cmd_lsdev(console: &mut Console) {
 
 #[cfg(feature = "modules")]
 fn cmd_lsmod(console: &mut Console) {
-    use crate::module::registry::MODULE_REGISTRY;
-    let registry = MODULE_REGISTRY.lock();
-    let modules = registry.loaded_modules();
-    if modules.is_empty() {
-        console.write_str("no modules loaded\n");
-    } else {
-        console.write_str("Loaded modules:\n");
-        for name in &modules {
-            console.write_str(&format!("  {}\n", name));
+    use crate::syscall::impls;
+
+    let fd = match impls::open("/proc/modules") {
+        Ok(fd) => fd,
+        Err(_) => {
+            console.write_str("lsmod: failed to read /proc/modules\n");
+            return;
         }
+    };
+    console.write_str("Loaded modules:\n");
+    let mut seen = 0usize;
+    let mut cursor = crate::fs::vfs::DirCursor::default();
+    let mut name_buf = [0u8; 64];
+    let mut visit = |entry: crate::fs::vfs::DirEntry<'_>| {
+        if entry.name == "." || entry.name == ".." {
+            return true;
+        }
+        seen += 1;
+        console.write_str(&format!("  {}\n", entry.name));
+        true
+    };
+    let _ = impls::readdir(fd, &mut cursor, &mut name_buf, &mut visit);
+    let _ = impls::close(fd);
+    if seen == 0 {
+        console.write_str("  (none)\n");
     }
 }
 
@@ -336,34 +444,81 @@ fn cmd_lsmod(console: &mut Console) {
 // --- Misc ---
 
 fn cmd_uptime(console: &mut Console) {
-    // Read TSC as a rough "ticks since boot" indicator
-    let ticks = unsafe { core::arch::x86_64::_rdtsc() };
-    console.write_str(&format!("TSC ticks since boot: {}\n", ticks));
+    use crate::syscall::impls;
+
+    let ticks = impls::times();
+    console.write_str(&format!("ticks since boot: {}\n", ticks));
 }
 
-fn cmd_shutdown() -> ! {
-    #[cfg(feature = "syscall")]
-    {
-        use crate::syscall::dispatch::SyscallArgs;
-        use crate::syscall::handlers::sys_shutdown;
+#[cfg(feature = "fs")]
+fn parse_ls_args(args: &str) -> (bool, bool, &str) {
+    let mut show_long = false;
+    let mut show_all = false;
+    let mut path = ".";
 
-        let args = SyscallArgs {
-            number: crate::syscall::numbers::SYS_SHUTDOWN,
-            arg0: 0,
-            arg1: 0,
-            arg2: 0,
-            arg3: 0,
-            arg4: 0,
-            arg5: 0,
-        };
-        let _ = sys_shutdown(&args);
-        loop {
-            x86_64::instructions::hlt();
+    for token in args.split_whitespace() {
+        if token == "-l" {
+            show_long = true;
+        } else if token == "-a" {
+            show_all = true;
+        } else {
+            path = token;
         }
     }
 
-    #[cfg(not(feature = "syscall"))]
-    {
-        crate::exit_qemu(crate::QemuExitCode::Success)
+    (show_all, show_long, path)
+}
+
+#[cfg(feature = "fs")]
+fn entry_type_indicator(file_type: crate::fs::vfs::FileType) -> &'static str {
+    match file_type {
+        crate::fs::vfs::FileType::Directory => "/",
+        crate::fs::vfs::FileType::Symlink => "@",
+        crate::fs::vfs::FileType::CharDevice => "%",
+        crate::fs::vfs::FileType::BlockDevice => "#",
+        _ => "",
     }
+}
+
+#[cfg(feature = "fs")]
+fn format_stat_entry(
+    name: &str,
+    stat: &crate::syscall::impls::Stat,
+    type_suffix: &str,
+) -> alloc::string::String {
+    let file_type = match stat.file_type {
+        crate::syscall::impls::STAT_TYPE_REGULAR => "file",
+        crate::syscall::impls::STAT_TYPE_DIRECTORY => "dir",
+        crate::syscall::impls::STAT_TYPE_CHAR_DEVICE => "char",
+        crate::syscall::impls::STAT_TYPE_BLOCK_DEVICE => "block",
+        crate::syscall::impls::STAT_TYPE_SYMLINK => "symlink",
+        _ => "unknown",
+    };
+
+    format!(
+        "{:<20} ino={:<8} size={:<8} type={}",
+        format!("{name}{type_suffix}"),
+        stat.ino,
+        stat.size,
+        file_type
+    )
+}
+
+#[cfg(feature = "fs")]
+fn join_path(base: &str, name: &str) -> alloc::string::String {
+    if base == "/" {
+        return format!("/{}", name);
+    }
+    if base == "." {
+        return format!("./{}", name);
+    }
+
+    format!("{}/{}", base.trim_end_matches('/'), name)
+}
+
+#[cfg(feature = "fs")]
+fn open_dir_fd(path: &str) -> Result<usize, isize> {
+    use crate::syscall::impls;
+
+    impls::open(path)
 }

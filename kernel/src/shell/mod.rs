@@ -6,15 +6,20 @@ mod console;
 use log::info;
 
 use self::console::Console;
-pub use self::console::ConsoleTarget;
+
 const PROMPT: &str = "krust> ";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellExitReason {
+    ExitRequested,
+}
+
 /// Entry point for the kernel shell task.
-/// This runs as a kernel-mode loop reading cooked lines from the tty.
-pub fn run(target: ConsoleTarget) -> ! {
+/// Reads its controlling terminal from the current process — set by the kernel
+/// before calling this function.
+pub fn run() -> ShellExitReason {
     info!("kernel shell started");
-    info!("shell: waiting for cooked tty line input");
-    let mut console = Console::new(target);
+    let mut console = Console::new();
 
     console.write_str("\nkrust kernel shell\nType 'help' for available commands.\n\n");
     console.write_str(PROMPT);
@@ -24,14 +29,13 @@ pub fn run(target: ConsoleTarget) -> ! {
         info!("shell: received line len={} value={:?}", line.len(), line);
         if !line.is_empty() {
             info!("shell: dispatching command {:?}", line);
-            commands::dispatch(&line, &mut console);
+            let keep_running = commands::dispatch(&line, &mut console);
             info!("shell: command completed");
+            if !keep_running {
+                info!("shell: exit requested");
+                return ShellExitReason::ExitRequested;
+            }
         }
         console.write_str(PROMPT);
     }
-}
-
-pub fn init() {
-    crate::tty::init();
-    info!("shell subsystem initialized");
 }

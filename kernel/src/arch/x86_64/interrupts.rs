@@ -1,11 +1,11 @@
-use spin::Lazy;
+use spin::LazyLock;
 use x86_64::instructions::{hlt, interrupts};
 use x86_64::registers::control::Cr2;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
 use super::gdt;
 
-static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
+static IDT: LazyLock<InterruptDescriptorTable> = LazyLock::new(|| {
     let mut idt = InterruptDescriptorTable::new();
     idt.breakpoint.set_handler_fn(breakpoint_handler);
     unsafe {

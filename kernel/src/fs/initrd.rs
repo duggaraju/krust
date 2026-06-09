@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use core::cmp::min;
 use core::str;
 
-use super::vfs::{DirEntry, FileSystem, FileType, FsError, Inode};
+use super::vfs::{DirCursor, DirEntry, FileSystem, FileType, FsError, Inode};
 
 const CPIO_NEWC_MAGIC: &[u8; 6] = b"070701";
 const CPIO_HEADER_LEN: usize = 110;
@@ -126,15 +126,32 @@ impl Inode for InitrdInode {
         }
     }
 
-    fn readdir(&self) -> Result<Vec<DirEntry>, FsError> {
+    fn filesystem_name(&self) -> &'static str {
+        "initrd"
+    }
+
+    fn readdir(
+        &self,
+        cursor: &mut DirCursor,
+        _name_buf: &mut [u8],
+        visit: &mut dyn for<'a> FnMut(DirEntry<'a>) -> bool,
+    ) -> Result<usize, FsError> {
         match &self.inner {
-            InitrdInodeData::Directory(children) => Ok(children
-                .iter()
-                .map(|(name, inode)| DirEntry {
-                    name: name.clone(),
-                    file_type: inode.file_type(),
-                })
-                .collect()),
+            InitrdInodeData::Directory(children) => {
+                let mut emitted = 0usize;
+                let mut index = cursor.offset as usize;
+                while index < children.len() {
+                    let (name, inode) = &children[index];
+                    let entry = DirEntry::new(name.as_str(), inode.file_type(), inode.ino());
+                    emitted += 1;
+                    index += 1;
+                    if !visit(entry) {
+                        break;
+                    }
+                }
+                cursor.offset = index as u64;
+                Ok(emitted)
+            }
             InitrdInodeData::File(_) => Err(FsError::NotADirectory),
         }
     }

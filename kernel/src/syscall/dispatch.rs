@@ -3,8 +3,8 @@ use log::warn;
 use crate::syscall::{
     handlers,
     numbers::{
-        SYS_BRK, SYS_CLOSE, SYS_EXECVE, SYS_EXIT, SYS_FORK, SYS_GETPID, SYS_MMAP, SYS_OPEN,
-        SYS_READ, SYS_SHUTDOWN, SYS_WAIT4, SYS_WRITE,
+        SYS_BRK, SYS_CHDIR, SYS_CLOSE, SYS_EXECVE, SYS_EXIT, SYS_FORK, SYS_GETPID, SYS_MMAP,
+        SYS_OPEN, SYS_READ, SYS_SHUTDOWN, SYS_STAT, SYS_TIMES, SYS_WAIT4, SYS_WRITE,
     },
 };
 
@@ -27,6 +27,9 @@ pub fn dispatch(args: &SyscallArgs) -> isize {
         SYS_WRITE => Some(handlers::sys_write),
         SYS_OPEN => Some(handlers::sys_open),
         SYS_CLOSE => Some(handlers::sys_close),
+        SYS_STAT => Some(handlers::sys_stat),
+        SYS_CHDIR => Some(handlers::sys_chdir),
+        SYS_TIMES => Some(handlers::sys_times),
         SYS_GETPID => Some(handlers::sys_getpid),
         SYS_FORK => Some(handlers::sys_fork),
         SYS_EXECVE => Some(handlers::sys_execve),

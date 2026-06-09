@@ -23,7 +23,11 @@ impl ModuleRegistry {
         }
     }
 
-    pub fn load(&mut self, module: Arc<dyn KernelModule>) -> Result<(), ModuleError> {
+    pub fn load(
+        &mut self,
+        module: Arc<dyn KernelModule>,
+        registry: &dyn super::traits::KernelRegistry,
+    ) -> Result<(), ModuleError> {
         let name = module.name();
 
         if name.is_empty() || module.version().is_empty() {
@@ -45,10 +49,15 @@ impl ModuleRegistry {
             }
         }
 
-        module.init()?;
+        module.init(registry)?;
         self.loaded_modules
             .insert(name.to_string(), Arc::clone(&module));
-        info!("loaded module '{}' v{}", name, module.version());
+        info!(
+            "loaded module '{}' v{} ({})",
+            name,
+            module.version(),
+            module.description()
+        );
         Ok(())
     }
 
@@ -66,7 +75,8 @@ impl ModuleRegistry {
             return Err(ModuleError::CleanupFailed);
         }
 
-        module.cleanup()?;
+        let registry = super::kernel_services();
+        module.cleanup(&registry)?;
         self.loaded_modules.remove(name);
         info!("unloaded module '{}'", name);
         Ok(())
@@ -78,6 +88,13 @@ impl ModuleRegistry {
 
     pub fn loaded_modules(&self) -> Vec<&str> {
         self.loaded_modules.keys().map(String::as_str).collect()
+    }
+
+    pub fn loaded_modules_with_info(&self) -> Vec<(&str, &str, &str)> {
+        self.loaded_modules
+            .iter()
+            .map(|(name, module)| (name.as_str(), module.version(), module.description()))
+            .collect()
     }
 
     fn find_dependent(&self, name: &str) -> Option<&str> {

@@ -1,4 +1,4 @@
-use spin::Lazy;
+use spin::LazyLock;
 use x86_64::VirtAddr;
 use x86_64::instructions::segmentation::{CS, DS, ES, SS, Segment};
 use x86_64::instructions::tables::load_tss;
@@ -9,7 +9,7 @@ pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
 const DOUBLE_FAULT_STACK_SIZE: usize = 4096 * 5;
 
-static TSS: Lazy<TaskStateSegment> = Lazy::new(|| {
+static TSS: LazyLock<TaskStateSegment> = LazyLock::new(|| {
     let mut tss = TaskStateSegment::new();
     static DOUBLE_FAULT_STACK: [u8; DOUBLE_FAULT_STACK_SIZE] = [0; DOUBLE_FAULT_STACK_SIZE];
 
@@ -25,7 +25,7 @@ struct Selectors {
     tss_selector: SegmentSelector,
 }
 
-static GDT: Lazy<(GlobalDescriptorTable, Selectors)> = Lazy::new(|| {
+static GDT: LazyLock<(GlobalDescriptorTable, Selectors)> = LazyLock::new(|| {
     let mut gdt = GlobalDescriptorTable::new();
     let code_selector = gdt.append(Descriptor::kernel_code_segment());
     let data_selector = gdt.append(Descriptor::kernel_data_segment());

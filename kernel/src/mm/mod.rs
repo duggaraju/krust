@@ -1,6 +1,7 @@
 pub mod address;
 pub mod frame_allocator;
 pub mod heap;
+pub mod stats;
 
 use bootloader_api::info::MemoryRegion;
 use log::info;
@@ -20,6 +21,7 @@ pub fn init_with(physical_memory_offset: u64, memory_regions: &'static [MemoryRe
     let mut mapper = unsafe { init_mapper(phys_offset) };
     let mut frame_allocator = BootInfoFrameAllocator::init(memory_regions);
 
+    stats::init(memory_regions);
     heap::init(&mut mapper, &mut frame_allocator);
     info!("memory management initialized");
 }

@@ -1,10 +1,29 @@
 use bootloader_api::BootInfo;
+use x86_64::instructions::port::{PortGeneric, ReadWriteAccess};
 
 use crate::arch::{ArchContext, ArchInterrupts, ArchPaging};
 
 pub mod gdt;
 pub mod interrupts;
 pub mod paging;
+
+pub fn shutdown(status: crate::arch::ShutdownStatus) -> ! {
+    use x86_64::instructions::port::Port;
+
+    // Best-effort emulator shutdown via ISA debug-exit.
+    // Environments that do not expose this port will simply fall through.
+    let code = match status {
+        crate::arch::ShutdownStatus::Success => 0x10u32,
+        crate::arch::ShutdownStatus::Failure => 0x11u32,
+    };
+
+    unsafe {
+        let mut port: PortGeneric<u32, ReadWriteAccess> = Port::new(0xf4);
+        port.write(code);
+    }
+
+    interrupts::halt_loop()
+}
 
 pub fn init() {
     gdt::init();

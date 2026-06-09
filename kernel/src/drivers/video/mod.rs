@@ -1,5 +1,6 @@
 extern crate alloc;
 
+use alloc::sync::Arc;
 use bootloader_api::info::FrameBufferInfo;
 use bootloader_x86_64_common::framebuffer::FrameBufferWriter;
 use core::fmt::Write;
@@ -8,6 +9,9 @@ use spin::{Mutex, Once};
 use vga::colors::{Color16, TextModeColor};
 use vga::writers::{Graphics640x480x16, GraphicsWriter};
 use vga::writers::{PrimitiveDrawing, ScreenCharacter, Text80x25, TextWriter};
+
+use crate::drivers::traits::{Device, DeviceError, DeviceType};
+use crate::module::traits::{KernelModule, KernelRegistry, ModuleError};
 
 static FRAMEBUFFER: Once<Mutex<FrameBufferWriter>> = Once::new();
 
@@ -28,6 +32,71 @@ pub fn write_str(s: &str) {
     if let Some(writer) = framebuffer() {
         let mut writer = writer.lock();
         let _ = writer.write_str(s);
+    }
+}
+
+pub fn is_initialized() -> bool {
+    FRAMEBUFFER.get().is_some()
+}
+
+pub struct FrameBufferDevice;
+
+pub struct FrameBufferDeviceModule;
+
+impl FrameBufferDevice {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Device for FrameBufferDevice {
+    fn name(&self) -> &str {
+        "fb"
+    }
+
+    fn device_type(&self) -> DeviceType {
+        DeviceType::Char
+    }
+
+    fn read(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize, DeviceError> {
+        Err(DeviceError::NotSupported)
+    }
+
+    fn write(&self, _offset: usize, buf: &[u8]) -> Result<usize, DeviceError> {
+        let text = core::str::from_utf8(buf).map_err(|_| DeviceError::InvalidArgument)?;
+        if !is_initialized() {
+            return Err(DeviceError::NotReady);
+        }
+        write_str(text);
+        Ok(buf.len())
+    }
+
+    fn seek(&self, _current: usize, _pos: crate::fs::vfs::SeekFrom) -> Result<usize, DeviceError> {
+        Err(DeviceError::NotSupported)
+    }
+}
+
+impl KernelModule for FrameBufferDeviceModule {
+    fn name(&self) -> &str {
+        "fbdev"
+    }
+
+    fn version(&self) -> &str {
+        "0.1.0"
+    }
+
+    fn description(&self) -> &str {
+        "Framebuffer device"
+    }
+
+    fn init(&self, registry: &dyn KernelRegistry) -> Result<(), ModuleError> {
+        registry.register_device("fb", Arc::new(FrameBufferDevice::new()), 29, 0)?;
+        Ok(())
+    }
+
+    fn cleanup(&self, registry: &dyn KernelRegistry) -> Result<(), ModuleError> {
+        registry.unregister_device("fb")?;
+        Ok(())
     }
 }
 

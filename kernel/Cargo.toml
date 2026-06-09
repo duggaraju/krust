@@ -4,14 +4,30 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["mm", "process", "fs", "syscall", "shell"]
+default = ["mm", "process", "fs", "drivers", "modules", "shell"]
 mm = []
 process = ["mm"]
-fs = []
-syscall = ["process", "fs"]
-drivers = []
-modules = []
-shell = ["mm", "process", "fs", "syscall", "drivers"]
+
+# Device feature families. Keep `drivers` as a compatibility umbrella while we
+# migrate call sites from coarse `cfg(feature = "drivers")` checks.
+device = []
+device-null = ["device"]
+device-serial = ["device"]
+device-video = ["device"]
+device-tty = ["device", "device-serial", "device-video"]
+drivers = ["device-null", "device-serial", "device-video", "device-tty"]
+
+# Filesystem feature families. Keep `fs` as the compatibility umbrella.
+fs-core = []
+fs-ramfs = ["fs-core"]
+fs-initrd = ["fs-core"]
+fs-fat32 = ["fs-core", "device"]
+fs-dev = ["fs-core", "device"]
+fs-proc = ["fs-core", "process"]
+fs = ["fs-core", "fs-ramfs", "fs-initrd", "fs-fat32", "fs-dev", "fs-proc"]
+
+modules = ["fs"]
+shell = []
 
 [dependencies]
 bootloader_api = "0.11.15"

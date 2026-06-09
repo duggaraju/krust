@@ -21,16 +21,14 @@ pub mod module;
 pub mod process;
 #[cfg(feature = "shell")]
 pub mod shell;
-#[cfg(feature = "syscall")]
 pub mod syscall;
-pub mod tty;
+pub mod time;
 
 use bootloader_api::config::Mapping;
 use bootloader_api::info::Optional;
 use bootloader_api::{BootInfo, BootloaderConfig, entry_point};
 use core::panic::PanicInfo;
-use log::{error, info};
-use x86_64::instructions::port::{PortGeneric, ReadWriteAccess};
+use log::info;
 
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
@@ -39,27 +37,6 @@ pub static BOOTLOADER_CONFIG: BootloaderConfig = {
 };
 
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum QemuExitCode {
-    Success = 0x10,
-    Failed = 0x11,
-}
-
-pub fn exit_qemu(exit_code: QemuExitCode) -> ! {
-    use x86_64::instructions::port::Port;
-
-    unsafe {
-        let mut port: PortGeneric<u32, ReadWriteAccess> = Port::new(0xf4);
-        info!("Exiting QEMU with code: {:?}", exit_code);
-        port.write(exit_code as u32);
-    }
-
-    loop {
-        x86_64::instructions::hlt();
-    }
-}
 
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // Move framebuffer out so we don't keep borrowing `boot_info`.
@@ -83,7 +60,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
 
     let boot_config = boot_config::BootConfig::from_boot_info(boot_info);
-    tty::set_port(boot_config.shell_port());
 
     let framebuffer_logger = match boot_config.shell_console() {
         boot_config::ShellConsole::Auto => {
@@ -133,9 +109,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         boot_config.shell_console(),
         boot_config::ShellConsole::Serial
     ) {
+        // Serial is the shell console — traces share the same port.
         Some(0x3F8)
     } else if framebuffer_logger.is_some() {
-        None
+        // Framebuffer UI is active: route kernel traces to COM1 and suppress
+        // the tty layer's own serial echo so shell output stays on the screen.
+        #[cfg(feature = "drivers")]
+        crate::drivers::tty::set_serial_echo(false);
+        Some(0x3F8)
     } else {
         Some(0x2F8)
     };
@@ -148,6 +129,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // Initialize architecture (GDT, IDT)
     arch::x86_64::init();
+    time::init();
 
     // Initialize process management
     #[cfg(feature = "process")]
@@ -158,23 +140,107 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     fs::init();
 
     // Initialize syscall interface
-    #[cfg(feature = "syscall")]
     syscall::init();
 
     // Initialize device drivers
     #[cfg(feature = "drivers")]
-    drivers::init();
+    drivers::init(boot_config.virtual_consoles());
+
+    // Wire the ttyS serial device into the tty echo/input layer.
+    #[cfg(feature = "drivers")]
+    {
+        let echo_name = if boot_config.shell_port() == 2 { "ttyS1" } else { "ttyS0" };
+        if let Some(dev) = crate::drivers::registry::get(echo_name) {
+            crate::drivers::tty::set_serial_device(dev);
+        }
+    }
 
     // Initialize module subsystem
     #[cfg(feature = "modules")]
     module::init();
 
+    #[cfg(feature = "fs")]
+    {
+        let _ = crate::fs::register_mount("/", "ramfs", crate::fs::MountDevice::None);
+        #[cfg(feature = "process")]
+        let _ = crate::fs::register_mount("/proc", "proc", crate::fs::MountDevice::None);
+        #[cfg(feature = "drivers")]
+        let _ = crate::fs::register_mount("/dev", "dev", crate::fs::MountDevice::None);
+
+        if let Err(err) = fs::mount_registered_filesystems() {
+            log::error!("failed to mount registered filesystems: {:?}", err);
+        }
+    }
+
     info!("Kernel initialization complete.");
 
-    // Start the kernel shell (never returns)
+    // Start the kernel shell.
     #[cfg(feature = "shell")]
     {
-        shell::run(crate::shell::ConsoleTarget::Serial);
+        #[cfg(feature = "process")]
+        let root_cwd_inode = {
+            #[cfg(feature = "fs")]
+            {
+                crate::fs::vfs::root_inode()
+                    .expect("root inode must exist before shell startup")
+            }
+            #[cfg(not(feature = "fs"))]
+            {
+                unreachable!("process feature requires fs for shell startup")
+            }
+        };
+
+        #[cfg(feature = "process")]
+        process::register_boot_processes(root_cwd_inode);
+        #[cfg(feature = "process")]
+        process::set_current_pid(crate::process::SHELL_PID);
+
+        // Determine whether the shell console is framebuffer-based.
+        let use_framebuffer = match boot_config.shell_console() {
+            boot_config::ShellConsole::Framebuffer => true,
+            boot_config::ShellConsole::Serial => false,
+            boot_config::ShellConsole::Auto => matches!(framebuffer, Optional::Some(_)),
+        };
+
+        // Init framebuffer console output if needed.
+        #[cfg(feature = "drivers")]
+        if use_framebuffer {
+            if let Optional::Some(framebuffer) = &mut framebuffer {
+                let info = framebuffer.info();
+                let buffer = framebuffer.buffer_mut();
+                let buffer =
+                    unsafe { core::slice::from_raw_parts_mut(buffer.as_mut_ptr(), buffer.len()) };
+                crate::drivers::video::init_framebuffer_console(buffer, info);
+            }
+        }
+
+        // Assign the controlling terminal for the shell process.
+        // Framebuffer mode → tty0 (virtual console); serial mode → ttyS0.
+        #[cfg(feature = "drivers")]
+        {
+            let ctty = if use_framebuffer {
+                crate::process::task::ControllingTerminal::VirtualConsole(0)
+            } else {
+                crate::process::task::ControllingTerminal::Serial(
+                    boot_config.shell_port().saturating_sub(1) as usize,
+                )
+            };
+            process::set_controlling_terminal(crate::process::SHELL_PID, ctty);
+        }
+
+        let reason = shell::run();
+        info!("shell exited: {:?}", reason);
+
+        #[cfg(feature = "process")]
+        {
+            process::mark_shell_exited();
+            if process::terminate_root_process() {
+                info!("root process terminated; shutting down kernel");
+                arch::shutdown(arch::ShutdownStatus::Success);
+            }
+        }
+
+        arch::shutdown(arch::ShutdownStatus::Success);
     }
 
     // If shell is disabled, just show VGA output and exit
@@ -182,13 +248,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     {
         #[cfg(feature = "drivers")]
         drivers::video::print_something();
-        exit_qemu(QemuExitCode::Success);
+        arch::shutdown(arch::ShutdownStatus::Success);
     }
 }
 
 #[panic_handler]
 #[cfg(not(test))]
 fn panic(info: &PanicInfo) -> ! {
+    use log::error;
     error!("Kernel panic: {:#?}", info);
-    exit_qemu(QemuExitCode::Failed);
+    arch::shutdown(arch::ShutdownStatus::Failure);
 }
