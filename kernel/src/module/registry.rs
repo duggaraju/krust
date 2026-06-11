@@ -1,8 +1,7 @@
 extern crate alloc;
 
 use alloc::{
-    boxed::Box,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     string::{String, ToString},
     sync::Arc,
     vec::Vec,
@@ -14,24 +13,26 @@ use super::traits::{KernelModule, ModuleError};
 
 pub struct ModuleRegistry {
     loaded_modules: BTreeMap<String, Arc<dyn KernelModule>>,
+    known_modules: BTreeMap<String, Arc<dyn KernelModule>>,
+    loading_modules: BTreeSet<String>,
+    failed_modules: BTreeSet<String>,
 }
 
 impl ModuleRegistry {
     pub const fn new() -> Self {
         Self {
             loaded_modules: BTreeMap::new(),
+            known_modules: BTreeMap::new(),
+            loading_modules: BTreeSet::new(),
+            failed_modules: BTreeSet::new(),
         }
     }
 
-    pub fn load(
-        &mut self,
-        module: Arc<dyn KernelModule>,
-        registry: &dyn super::traits::KernelRegistry,
-    ) -> Result<(), ModuleError> {
+    pub fn register_known(&mut self, module: Arc<dyn KernelModule>) -> Result<(), ModuleError> {
         let name = module.name();
 
         if name.is_empty() || module.version().is_empty() {
-            warn!("refusing to load invalid module metadata");
+            warn!("refusing to register invalid module metadata");
             return Err(ModuleError::InvalidModule);
         }
 
@@ -40,25 +41,53 @@ impl ModuleRegistry {
             return Err(ModuleError::AlreadyLoaded);
         }
 
-        for dependency in module.dependencies() {
-            if !self.loaded_modules.contains_key(*dependency) {
-                error!("module '{}' is missing dependency '{}'", name, dependency);
-                return Err(ModuleError::DependencyMissing(leak_dependency_name(
-                    dependency,
-                )));
-            }
+        // Clear any previous failure so callers can retry a failed module by
+        // submitting a fresh Arc (e.g. after fixing a device state).
+        if self.failed_modules.remove(name) {
+            info!("module '{}' previously failed; clearing failure state for retry", name);
         }
 
-        module.init(registry)?;
-        self.loaded_modules
+        self.known_modules
             .insert(name.to_string(), Arc::clone(&module));
-        info!(
-            "loaded module '{}' v{} ({})",
-            name,
-            module.version(),
-            module.description()
-        );
         Ok(())
+    }
+
+    pub fn known(&self, name: &str) -> Option<Arc<dyn KernelModule>> {
+        self.known_modules.get(name).cloned()
+    }
+
+    pub fn is_loaded(&self, name: &str) -> bool {
+        self.loaded_modules.contains_key(name)
+    }
+
+    pub fn is_loading(&self, name: &str) -> bool {
+        self.loading_modules.contains(name)
+    }
+
+    pub fn has_failed(&self, name: &str) -> bool {
+        self.failed_modules.contains(name)
+    }
+
+    pub fn mark_loading(&mut self, name: &str) {
+        self.loading_modules.insert(name.to_string());
+    }
+
+    pub fn clear_loading(&mut self, name: &str) {
+        self.loading_modules.remove(name);
+    }
+
+    pub fn mark_failed(&mut self, name: &str) {
+        self.failed_modules.insert(name.to_string());
+    }
+
+    pub fn clear_failed(&mut self, name: &str) {
+        self.failed_modules.remove(name);
+    }
+
+    pub fn mark_loaded(&mut self, module: Arc<dyn KernelModule>) {
+        let name = module.name().to_string();
+        self.loaded_modules.insert(name.clone(), module);
+        self.failed_modules.remove(&name);
     }
 
     pub fn unload(&mut self, name: &str) -> Result<(), ModuleError> {
@@ -122,8 +151,4 @@ pub fn init() {
     let mut registry = MODULE_REGISTRY.lock();
     *registry = ModuleRegistry::new();
     info!("module registry initialized");
-}
-
-fn leak_dependency_name(name: &str) -> &'static str {
-    Box::leak(name.to_string().into_boxed_str())
 }

@@ -1,52 +1,130 @@
+use clap::{Parser, Subcommand, ValueEnum};
 use ovmf_prebuilt::{Arch, FileType, Prebuilt, Source};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
-use std::process::{Command, exit};
+use std::process::Command;
+
+mod disk;
+
+
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum BootMode {
+    Uefi,
+    Bios,
+}
+
+#[derive(Parser, Debug)]
+#[command(name = "krust", about = "krust kernel tools")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Run the kernel in QEMU
+    Run(RunArgs),
+    /// Create a FAT32 VHD image from a directory
+    Mkdisk(MkdiskArgs),
+}
+
+#[derive(Parser, Debug)]
+struct RunArgs {
+    #[arg(value_enum)]
+    mode: BootMode,
+
+    #[arg(long)]
+    headless: bool,
+
+    #[arg(long)]
+    pty: bool,
+
+    #[arg(long, value_name = "PATH")]
+    vhd: Option<PathBuf>,
+
+    #[arg(long = "no-vhd")]
+    no_vhd: bool,
+}
+
+#[derive(Parser, Debug)]
+struct MkdiskArgs {
+    /// Source directory to pack into the image
+    #[arg(value_name = "DIR")]
+    source_dir: PathBuf,
+
+    /// Output VHD path
+    #[arg(value_name = "OUTPUT")]
+    output: PathBuf,
+
+    /// Image size in MiB (minimum 32)
+    #[arg(long, default_value = "64")]
+    size_mib: u64,
+
+    /// Comma-separated list of directory names to exclude
+    #[arg(long, default_value = "")]
+    exclude: String,
+}
 
 fn main() {
+    let cli = Cli::parse();
+    match cli.command {
+        Commands::Run(args) => cmd_run(args),
+        Commands::Mkdisk(args) => cmd_mkdisk(args),
+    }
+}
+
+fn cmd_mkdisk(args: MkdiskArgs) {
+    if !args.source_dir.is_dir() {
+        eprintln!("error: '{}' is not a directory", args.source_dir.display());
+        std::process::exit(1);
+    }
+    let exclude_dirs: std::collections::HashSet<_> = args
+        .exclude
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    eprintln!(
+        "creating {}MiB VHD from '{}' → '{}' (exclude: {:?})",
+        args.size_mib,
+        args.source_dir.display(),
+        args.output.display(),
+        exclude_dirs
+    );
+    disk::create_vhd_from_dir(&args.source_dir, &args.output, args.size_mib, exclude_dirs)
+        .unwrap_or_else(|err| {
+            eprintln!("error: {}", err);
+            std::process::exit(1);
+        });
+    eprintln!("done: {}", args.output.display());
+}
+
+fn cmd_run(cli: RunArgs) {
     // read env variables that were set in build script
     let kernel_path = env!("KERNEL_PATH");
     let boot_log_level = env!("KRUST_BOOT_LOG_LEVEL");
     let uefi_path = env!("UEFI_PATH");
     let bios_path = env!("BIOS_PATH");
 
-    // parse mode from CLI
-    let args: Vec<String> = env::args().collect();
-    let prog = &args[0];
+    let mode_uefi = matches!(cli.mode, BootMode::Uefi);
+    let uefi = if cli.headless || cli.pty { true } else { mode_uefi };
 
-    let mut uefi = None;
-    let mut headless = false;
-    let mut pty = false;
-    for arg in args.iter().skip(1) {
-        match arg.to_lowercase().as_str() {
-            "uefi" => uefi = Some(true),
-            "bios" => uefi = Some(false),
-            "--headless" | "headless" => headless = true,
-            "--pty" | "pty" => pty = true,
-            "-h" | "--help" => {
-                println!("Usage: {prog} [uefi|bios] [--headless|--pty]");
-                println!("  uefi       - boot using OVMF (UEFI)");
-                println!("  bios       - boot using legacy BIOS");
-                println!("  --headless - run without a QEMU window (UEFI only)");
-                println!("  --pty      - use COM2 PTY for trace output");
-                exit(0);
-            }
-            _ => {
-                eprintln!("Usage: {prog} [uefi|bios] [--headless|--pty]");
-                exit(1);
-            }
+    let sata_vhd = if cli.no_vhd {
+        None
+    } else if let Some(path) = cli.vhd {
+        if !path.exists() {
+            eprintln!("error: VHD not found: {}", path.display());
+            eprintln!("hint:  cargo run -Z bindeps -- mkdisk <rootfs_dir> {}", path.display());
+            std::process::exit(1);
         }
-    }
-
-    let uefi = uefi.unwrap_or_else(|| {
-        eprintln!("Usage: {prog} [uefi|bios] [--headless|--pty]");
-        exit(1);
-    });
-    let uefi = if headless || pty { true } else { uefi };
-
+        Some(path)
+    } else {
+        None
+    };
     let mut cmd = Command::new("qemu-system-x86_64");
-    if headless {
+    if cli.headless {
         let trace_path = env::temp_dir().join(format!("krust-trace-{}.log", std::process::id()));
         eprintln!("headless kernel trace log: {}", trace_path.display());
         cmd.arg("-display").arg("none");
@@ -55,7 +133,7 @@ fn main() {
             .arg(format!("file,path={},id=trace", trace_path.display()));
         cmd.arg("-serial").arg("chardev:trace");
         cmd.arg("-serial").arg("stdio");
-    } else if pty {
+    } else if cli.pty {
         cmd.arg("-display").arg("none");
         cmd.arg("-monitor").arg("none");
         cmd.arg("-serial").arg("stdio");
@@ -70,13 +148,23 @@ fn main() {
     cmd.arg("-device")
         .arg("isa-debug-exit,iobase=0xf4,iosize=0x04");
 
+    if let Some(path) = sata_vhd.as_ref() {
+        cmd.arg("-device").arg("ahci,id=ahci0");
+        cmd.arg("-drive").arg(format!(
+            "if=none,id=krust_disk,format=vpc,file={}",
+            path.display()
+        ));
+        cmd.arg("-device").arg("ide-hd,drive=krust_disk,bus=ahci0.0");
+        eprintln!("attached SATA VHD: {}", path.display());
+    }
+
     if uefi {
         let prebuilt =
             Prebuilt::fetch(Source::LATEST, "target/ovmf").expect("failed to update prebuilt");
 
         let code = prebuilt.get_file(Arch::X64, FileType::Code);
         let vars = prebuilt.get_file(Arch::X64, FileType::Vars);
-        let image_path = if headless || pty {
+        let image_path = if cli.headless || cli.pty {
             build_headless_uefi_image(kernel_path, boot_log_level)
         } else {
             PathBuf::from(uefi_path)

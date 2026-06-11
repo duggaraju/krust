@@ -1,14 +1,16 @@
 extern crate alloc;
 
 pub mod block;
-pub mod ldisc;
-pub mod null;
-pub mod pty;
+pub mod bus;
+pub mod char;
 pub mod registry;
-pub mod serial;
 pub mod traits;
 pub mod tty;
 pub mod video;
+
+// Compatibility re-exports for existing call sites.
+pub use bus::pci;
+pub use char::{ldisc, null, pty, serial};
 
 use crate::module::traits::KernelRegistry;
 use alloc::sync::Arc;
@@ -57,4 +59,10 @@ pub fn init(virtual_console_count: usize) {
 
 pub fn register_modules(registry: &dyn KernelRegistry) {
     let _ = registry.register_module(Arc::new(video::FrameBufferDeviceModule));
+
+    #[cfg(target_arch = "x86_64")]
+    let _ = registry.register_module(Arc::new(pci::PciBusModule));
+
+    #[cfg(target_arch = "x86_64")]
+    let _ = registry.register_module(Arc::new(block::sata::SataDeviceModule::new()));
 }

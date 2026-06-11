@@ -1,5 +1,8 @@
 extern crate alloc;
 
+use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 use crate::fs::vfs::SeekFrom;
 use alloc::vec;
 
@@ -18,6 +21,54 @@ pub enum DeviceError {
     Busy,
     NotFound,
     NotSupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BusType {
+    Pci,
+    Sata,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BusError {
+    InvalidName,
+    AlreadyRegistered,
+    NotFound,
+    Busy,
+    EnumerationFailed,
+}
+
+#[derive(Clone)]
+pub struct BusDeviceInfo {
+    pub name: String,
+    pub bus_type: BusType,
+    pub device_type_hint: Option<DeviceType>,
+    pub pci_bus: Option<u8>,
+    pub pci_device: Option<u8>,
+    pub pci_function: Option<u8>,
+    pub class_code: Option<u8>,
+    pub subclass: Option<u8>,
+    pub prog_if: Option<u8>,
+    pub bar5: Option<u64>,
+}
+
+pub trait Bus: Send + Sync {
+    fn name(&self) -> &str;
+    fn bus_type(&self) -> BusType;
+    fn enumerate(&self) -> Result<Vec<BusDeviceInfo>, BusError>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverError {
+    Unsupported,
+    ProbeFailed,
+    InitFailed,
+}
+
+pub trait Driver: Send + Sync {
+    fn name(&self) -> &str;
+    fn probe(&self, bus_device: &BusDeviceInfo) -> Result<Option<Arc<dyn Device>>, DriverError>;
 }
 
 pub trait Device: Send + Sync {

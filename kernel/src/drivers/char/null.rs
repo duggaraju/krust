@@ -1,4 +1,4 @@
-use super::traits::{Device, DeviceError, DeviceType};
+use crate::drivers::traits::{Device, DeviceError, DeviceType};
 
 pub struct NullDevice;
 

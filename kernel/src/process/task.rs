@@ -3,8 +3,14 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use alloc::vec;
+use alloc::collections::BTreeMap;
 use super::context::CpuContext;
 use crate::fs::vfs::{File, FileDescriptor, FileOpenMode, Inode, OpenFile, SeekFrom};
+
+/// Environment variable map: Copy-on-Write semantics via Arc<BTreeMap>
+/// Wrapped in Arc for zero-cost task cloning. Only allocates on modification.
+pub type EnvMap = BTreeMap<String, String>;
 
 #[cfg(feature = "drivers")]
 #[derive(Clone, Copy)]
@@ -23,6 +29,12 @@ pub enum TaskState {
     Zombie,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskMode {
+    Kernel,
+    User,
+}
+
 pub struct Task {
     pub pid: Pid,
     pub parent_pid: Pid,
@@ -30,10 +42,16 @@ pub struct Task {
     pub cwd_path: String,
     cwd: Arc<dyn Inode>,
     pub state: TaskState,
+    pub mode: TaskMode,
     pub name: &'static str,
     pub kernel_stack_top: usize,
     pub context: CpuContext,
     fds: FdTable,
+    /// Environment variables: Arc<EnvMap> enables CoW semantics.
+    /// Cloning a task is O(1); modifying an env var triggers Arc::make_mut().
+    pub env: Arc<EnvMap>,
+    /// Command-line arguments passed to the binary
+    pub argv: Vec<String>,
     /// The controlling terminal for this process. Set by the kernel when
     /// spawning shell/interactive tasks; `None` for background tasks.
     #[cfg(feature = "drivers")]
@@ -89,10 +107,13 @@ impl Task {
             cwd_path,
             cwd,
             state: TaskState::Ready,
+            mode: TaskMode::User,
             name,
             kernel_stack_top: 0,
             context,
             fds: FdTable::new(),
+            env: Arc::new(BTreeMap::new()),
+            argv: vec![],
             #[cfg(feature = "drivers")]
             controlling_terminal,
         }
@@ -100,7 +121,7 @@ impl Task {
     }
 
     pub fn child_of(pid: Pid, parent: &Task, name: &'static str, entry_point: fn()) -> Self {
-        Self::new_with_terminal(
+        let mut child = Self::new_with_terminal(
             pid,
             parent.pid,
             Arc::clone(&parent.cwd),
@@ -111,7 +132,10 @@ impl Task {
             parent.controlling_terminal,
             #[cfg(not(feature = "drivers"))]
             None,
-        )
+        );
+        // Share parent's environment map (CoW: cloned only on modification)
+        child.env = Arc::clone(&parent.env);
+        child
     }
 
     pub fn cwd(&self) -> Arc<dyn Inode> {
@@ -135,6 +159,10 @@ impl Task {
         self.cwd_inode = cwd.ino();
         self.cwd_path = cwd_path;
         self.cwd = cwd;
+    }
+
+    pub fn set_mode(&mut self, mode: TaskMode) {
+        self.mode = mode;
     }
 
     fn with_default_stdio(mut self) -> Self {
@@ -195,6 +223,33 @@ impl Task {
     pub fn fd_descriptor(&self, fd: usize) -> Option<FileDescriptor> {
         self.fds.descriptor(fd)
     }
+
+    /// Get an environment variable (zero-copy)
+    pub fn get_env(&self, key: &str) -> Option<&str> {
+        self.env.get(key).map(|s| s.as_str())
+    }
+
+    /// Set an environment variable (CoW: clones map only if shared)
+    pub fn set_env(&mut self, key: String, value: String) {
+        Arc::make_mut(&mut self.env).insert(key, value);
+    }
+
+    /// Set command-line arguments
+    pub fn set_argv(&mut self, argv: Vec<String>) {
+        self.argv = argv;
+    }
+
+    /// Update task's entry point for a loaded binary
+    #[cfg(target_arch = "x86_64")]
+    pub fn set_entry_point(&mut self, entry: usize) {
+        self.context.rip = entry as u64;
+    }
+
+    /// Apply a binary LoadPlan: update argv and entry point
+    pub fn apply_load_plan(&mut self, plan: &crate::process::binfmt::LoadPlan, argv: Vec<String>) {
+        self.set_argv(argv);
+        self.set_entry_point(plan.entry_point);
+    }
 }
 
 struct FdTable {
@@ -215,10 +270,13 @@ impl Clone for Task {
             cwd_path: self.cwd_path.clone(),
             cwd: Arc::clone(&self.cwd),
             state: self.state,
+            mode: self.mode,
             name: self.name,
             kernel_stack_top: self.kernel_stack_top,
             context: self.context,
             fds: self.fds.clone(),
+            env: Arc::clone(&self.env),  // CoW: cheap clone
+            argv: self.argv.clone(),
             #[cfg(feature = "drivers")]
             controlling_terminal: self.controlling_terminal,
         }

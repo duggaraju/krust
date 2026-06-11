@@ -1,6 +1,7 @@
 extern crate alloc;
 
 use alloc::format;
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use super::console::Console;
@@ -24,6 +25,7 @@ pub fn dispatch(line: &str, console: &mut Console) -> bool {
         "mkdir" => cmd_mkdir(args, console),
         "write" => cmd_write(args, console),
         "lsdev" => cmd_lsdev(console),
+        "lspci" => cmd_lspci(console),
         "lsmod" => cmd_lsmod(console),
         "uptime" => cmd_uptime(console),
         "shutdown" | "exit" => return false,
@@ -49,6 +51,7 @@ fn cmd_help(console: &mut Console) {
     console.write_str("  mkdir <path>  - create directory\n");
     console.write_str("  write <path> <data> - write to file\n");
     console.write_str("  lsdev         - list devices\n");
+    console.write_str("  lspci         - list PCI bus devices\n");
     console.write_str("  lsmod         - list loaded modules\n");
     console.write_str("  uptime        - show ticks since boot\n");
     console.write_str("  shutdown      - shut down the VM\n");
@@ -401,6 +404,43 @@ fn cmd_lsdev(console: &mut Console) {
 
 #[cfg(not(feature = "drivers"))]
 fn cmd_lsdev(console: &mut Console) {
+    console.write_str("drivers not enabled (feature 'drivers' disabled)\n");
+}
+
+#[cfg(feature = "drivers")]
+fn cmd_lspci(console: &mut Console) {
+    let buses = crate::drivers::registry::list_buses();
+    if buses.is_empty() {
+        console.write_str("no buses registered\n");
+        return;
+    }
+
+    for bus in buses {
+        console.write_str(&format!("bus: {}\n", bus));
+        if let Some(devices) = crate::drivers::registry::list_bus_devices(bus.as_str()) {
+            for device in devices {
+                let class_info = match (device.class_code, device.subclass, device.prog_if) {
+                    (Some(class_code), Some(subclass), Some(prog_if)) => {
+                        format!("class={:02x} subclass={:02x} prog_if={:02x}", class_code, subclass, prog_if)
+                    }
+                    _ => String::from("class=unknown"),
+                };
+                let location = match (device.pci_bus, device.pci_device, device.pci_function) {
+                    (Some(bus), Some(dev), Some(func)) => format!("{:02x}:{:02x}.{}", bus, dev, func),
+                    _ => String::from("unknown"),
+                };
+                let bar5 = device
+                    .bar5
+                    .map(|value| format!("bar5=0x{:x}", value))
+                    .unwrap_or_else(|| String::from("bar5=unknown"));
+                console.write_str(&format!("  {:<10} {} {} {}\n", device.name, location, class_info, bar5));
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "drivers"))]
+fn cmd_lspci(console: &mut Console) {
     console.write_str("drivers not enabled (feature 'drivers' disabled)\n");
 }
 

@@ -5,7 +5,7 @@ use spin::Mutex;
 use uart_16550::backend::PioBackend;
 use uart_16550::{Config, Uart16550};
 
-use super::traits::{Device, DeviceError, DeviceType};
+use crate::drivers::traits::{Device, DeviceError, DeviceType};
 
 /// Standard x86 COM port addresses.
 const COM_PORTS: [u16; 2] = [0x3F8, 0x2F8];

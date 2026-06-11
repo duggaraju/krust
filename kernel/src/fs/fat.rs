@@ -84,13 +84,17 @@ pub struct FatFs {
 
 #[cfg(all(feature = "fs", feature = "drivers"))]
 pub struct FatFsModule {
+    module_name: String,
     device: Arc<dyn BlockDevice>,
 }
 
 #[cfg(all(feature = "fs", feature = "drivers"))]
 impl FatFsModule {
-    pub fn new(device: Arc<dyn BlockDevice>) -> Self {
-        Self { device }
+    pub fn new(module_name: String, device: Arc<dyn BlockDevice>) -> Self {
+        Self {
+            module_name,
+            device,
+        }
     }
 }
 
@@ -189,10 +193,37 @@ impl FileSystem for FatFs {
     }
 }
 
+#[cfg(feature = "drivers")]
+pub struct FatFsFactory;
+
+#[cfg(feature = "drivers")]
+impl super::FileSystemFactory for FatFsFactory {
+    fn mount(
+        &self,
+        mountpoint: Arc<dyn Inode>,
+        device: Option<super::MountBlockDevice>,
+    ) -> Result<Arc<dyn FileSystem>, FsError> {
+        let _ = mountpoint;
+        let block = device.ok_or(FsError::NotFound)?;
+        let fs = FatFs::mount(block)?;
+        Ok(Arc::new(fs))
+    }
+
+    fn unmount(
+        &self,
+        mountpoint: Arc<dyn Inode>,
+        device: Option<super::MountBlockDevice>,
+    ) -> Result<(), FsError> {
+        let _ = mountpoint;
+        let _ = device;
+        Ok(())
+    }
+}
+
 #[cfg(all(feature = "fs", feature = "drivers"))]
 impl KernelModule for FatFsModule {
     fn name(&self) -> &str {
-        "fatfs"
+        self.module_name.as_str()
     }
 
     fn version(&self) -> &str {
@@ -203,21 +234,23 @@ impl KernelModule for FatFsModule {
         "FAT filesystem"
     }
 
-    fn init(&self, registry: &dyn KernelRegistry) -> Result<(), ModuleError> {
+    fn init(&self, _registry: &dyn KernelRegistry) -> Result<(), ModuleError> {
         let fs = FatFs::mount(Arc::clone(&self.device)).map_err(|_| ModuleError::InitFailed)?;
-        registry.register_filesystem(Arc::new(fs))?;
-        Ok(())
+        crate::fs::register_filesystem(Arc::new(fs)).map_err(|_| ModuleError::InitFailed)
     }
 
-    fn cleanup(&self, registry: &dyn KernelRegistry) -> Result<(), ModuleError> {
-        registry.unregister_filesystem("fat")?;
-        Ok(())
+    fn cleanup(&self, _registry: &dyn KernelRegistry) -> Result<(), ModuleError> {
+        crate::fs::unregister_filesystem("fat").map_err(|_| ModuleError::CleanupFailed)
     }
 }
 
 #[cfg(all(feature = "fs", feature = "drivers"))]
-pub fn register_module(registry: &dyn KernelRegistry, device: Arc<dyn BlockDevice>) {
-    let module: Arc<dyn KernelModule> = Arc::new(FatFsModule::new(device));
+pub fn register_module(
+    registry: &dyn KernelRegistry,
+    module_name: String,
+    device: Arc<dyn BlockDevice>,
+) {
+    let module: Arc<dyn KernelModule> = Arc::new(FatFsModule::new(module_name, device));
     let _ = registry.register_module(module);
 }
 
@@ -465,8 +498,11 @@ impl Inode for FatInode {
         }
 
         let state = self.snapshot();
-        let inner = self.fs.lock();
-        let entries = read_directory_entries(&inner, state)?;
+        let entries = {
+            let inner = self.fs.lock();
+            read_directory_entries(&inner, state)?
+        };
+
         let mut emitted = 0usize;
         let mut index = cursor.offset as usize;
 
@@ -781,6 +817,8 @@ fn read_directory_entries(
     for (offset, len) in regions {
         let end = offset.checked_add(len).ok_or(FsError::IoError)?;
         let mut entry_offset = offset;
+        let mut lfn_parts: Vec<String> = Vec::new();
+
         while entry_offset + DIR_ENTRY_SIZE <= end {
             let mut entry = [0u8; DIR_ENTRY_SIZE];
             inner.read_bytes(entry_offset, &mut entry)?;
@@ -789,17 +827,36 @@ fn read_directory_entries(
                 return Ok(entries);
             }
             if first_byte == 0xE5 {
+                lfn_parts.clear();
                 entry_offset += DIR_ENTRY_SIZE;
                 continue;
             }
 
             let attrs = entry[11];
-            if attrs == ATTR_LFN || (attrs & ATTR_VOLUME_ID) != 0 {
+            if attrs == ATTR_LFN {
+                // This is an LFN entry — parse it and add to our buffer
+                if let Some(part) = parse_lfn_entry(&entry) {
+                    lfn_parts.insert(0, part);
+                }
                 entry_offset += DIR_ENTRY_SIZE;
                 continue;
             }
 
-            if let Some(name) = decode_short_name(&entry[0..11]) {
+            if (attrs & ATTR_VOLUME_ID) != 0 {
+                lfn_parts.clear();
+                entry_offset += DIR_ENTRY_SIZE;
+                continue;
+            }
+
+            if let Some(short_name) = decode_short_name(&entry[0..11]) {
+                // Use LFN if we collected parts; otherwise use short name
+                let name = if !lfn_parts.is_empty() {
+                    lfn_parts.join("")
+                } else {
+                    short_name
+                };
+                lfn_parts.clear();
+
                 let first_cluster = (u32::from(u16::from_le_bytes([entry[20], entry[21]])) << 16)
                     | u32::from(u16::from_le_bytes([entry[26], entry[27]]));
                 let size = u32::from_le_bytes([entry[28], entry[29], entry[30], entry[31]]);
@@ -821,6 +878,70 @@ fn read_directory_entries(
     }
 
     Ok(entries)
+}
+
+fn parse_lfn_entry(entry: &[u8]) -> Option<String> {
+    if entry.len() != DIR_ENTRY_SIZE {
+        return None;
+    }
+    
+    // LFN entries store 13 characters in UTF-16LE across 3 regions
+    // Offset 1: chars 0-4 (bytes 1-10)
+    // Offset 14: chars 5-10 (bytes 14-25)
+    // Offset 28: chars 11-12 (bytes 28-31)
+    
+    let mut chars = Vec::new();
+    
+    // First region: bytes 1-10 (5 chars)
+    for i in (1..=9).step_by(2) {
+        let low = entry[i];
+        let high = entry[i + 1];
+        if low == 0xFF && high == 0xFF {
+            break;
+        }
+        if low == 0x00 && high == 0x00 {
+            break;
+        }
+        if let Some(ch) = char::from_u32((high as u32) << 8 | low as u32) {
+            chars.push(ch);
+        }
+    }
+    
+    // Second region: bytes 14-25 (6 chars)
+    for i in (14..=23).step_by(2) {
+        let low = entry[i];
+        let high = entry[i + 1];
+        if low == 0xFF && high == 0xFF {
+            break;
+        }
+        if low == 0x00 && high == 0x00 {
+            break;
+        }
+        if let Some(ch) = char::from_u32((high as u32) << 8 | low as u32) {
+            chars.push(ch);
+        }
+    }
+    
+    // Third region: bytes 28-31 (2 chars)
+    for i in (28..=29).step_by(2) {
+        let low = entry[i];
+        let high = entry[i + 1];
+        if low == 0xFF && high == 0xFF {
+            break;
+        }
+        if low == 0x00 && high == 0x00 {
+            break;
+        }
+        if let Some(ch) = char::from_u32((high as u32) << 8 | low as u32) {
+            chars.push(ch);
+        }
+    }
+    
+    if chars.is_empty() {
+        None
+    } else {
+        Some(chars.iter().collect())
+    }
 }
 
 fn directory_regions(

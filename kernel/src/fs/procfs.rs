@@ -9,7 +9,7 @@ use core::arch::x86_64::__cpuid;
 use crate::mm::stats;
 use crate::module::traits::{KernelModule, KernelRegistry, ModuleError};
 use crate::process::scheduler::SCHEDULER;
-use crate::process::task::{Pid, TaskState};
+use crate::process::task::{Pid, TaskMode, TaskState};
 
 use super::vfs::{
     copy_name_into, write_u64_decimal_into, DirCursor, DirEntry, FileSystem, FileType, FsError,
@@ -47,14 +47,13 @@ impl KernelModule for ProcFsModule {
         "Process information filesystem"
     }
 
-    fn init(&self, registry: &dyn KernelRegistry) -> Result<(), ModuleError> {
-        registry.register_filesystem(Arc::new(ProcFs::new()))?;
-        Ok(())
+    fn init(&self, _registry: &dyn KernelRegistry) -> Result<(), ModuleError> {
+        crate::fs::register_filesystem(Arc::new(ProcFs::new()))
+            .map_err(|_| ModuleError::InitFailed)
     }
 
-    fn cleanup(&self, registry: &dyn KernelRegistry) -> Result<(), ModuleError> {
-        registry.unregister_filesystem("proc")?;
-        Ok(())
+    fn cleanup(&self, _registry: &dyn KernelRegistry) -> Result<(), ModuleError> {
+        crate::fs::unregister_filesystem("proc").map_err(|_| ModuleError::CleanupFailed)
     }
 }
 
@@ -789,6 +788,13 @@ fn state_name(state: TaskState) -> &'static str {
     }
 }
 
+fn mode_name(mode: TaskMode) -> &'static str {
+    match mode {
+        TaskMode::Kernel => "Kernel",
+        TaskMode::User => "User",
+    }
+}
+
 fn read_text(content: &str, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
     let bytes = content.as_bytes();
     if offset >= bytes.len() {
@@ -821,9 +827,10 @@ fn task_status_content(pid: Pid) -> Result<String, FsError> {
     };
 
     Ok(format!(
-        "Name:\t{}\nState:\t{}\nPid:\t{}\nPPid:\t{}\n",
+        "Name:\t{}\nState:\t{}\nMode:\t{}\nPid:\t{}\nPPid:\t{}\n",
         task.name,
         state_name(task.state),
+        mode_name(task.mode),
         task.pid,
         task.parent_pid,
     ))
@@ -863,12 +870,13 @@ fn task_stat_content(pid: Pid) -> Result<String, FsError> {
     };
 
     let mut content = format!(
-        "pid: {}\nppid: {}\ncwd_inode: {}\nname: {}\nstate: {}\n",
+        "pid: {}\nppid: {}\ncwd_inode: {}\nname: {}\nstate: {}\nmode: {}\n",
         task.pid,
         task.parent_pid,
         task.cwd_inode,
         task.name,
         state_name(task.state),
+        mode_name(task.mode),
     );
 
     for (fd, desc) in task.fd_entries() {

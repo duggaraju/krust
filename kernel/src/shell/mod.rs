@@ -3,7 +3,7 @@ extern crate alloc;
 mod commands;
 mod console;
 
-use log::info;
+use log::debug;
 
 use self::console::Console;
 
@@ -18,7 +18,7 @@ pub enum ShellExitReason {
 /// Reads its controlling terminal from the current process — set by the kernel
 /// before calling this function.
 pub fn run() -> ShellExitReason {
-    info!("kernel shell started");
+    debug!("kernel shell started");
     let mut console = Console::new();
 
     console.write_str("\nkrust kernel shell\nType 'help' for available commands.\n\n");
@@ -26,13 +26,13 @@ pub fn run() -> ShellExitReason {
 
     loop {
         let line = console.read_line();
-        info!("shell: received line len={} value={:?}", line.len(), line);
+        debug!("shell: received line len={} value={:?}", line.len(), line);
         if !line.is_empty() {
-            info!("shell: dispatching command {:?}", line);
+            debug!("shell: dispatching command {:?}", line);
             let keep_running = commands::dispatch(&line, &mut console);
-            info!("shell: command completed");
+            debug!("shell: command completed");
             if !keep_running {
-                info!("shell: exit requested");
+                debug!("shell: exit requested");
                 return ShellExitReason::ExitRequested;
             }
         }

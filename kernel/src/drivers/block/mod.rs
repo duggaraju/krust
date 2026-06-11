@@ -1,10 +1,14 @@
 extern crate alloc;
 
+pub mod sata;
+
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use spin::Mutex;
 
-use super::traits::{BlockDevice, DeviceError};
+use crate::drivers::traits::{BlockDevice, DeviceError};
+
+pub use sata::{SataBlockDevice, SataControllerLocation};
 
 pub struct MemoryBlockDevice {
     sector_size: usize,

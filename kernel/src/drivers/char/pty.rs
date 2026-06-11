@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 use spin::Mutex;
 
 use super::ldisc::LineDiscipline;
-use super::traits::{Device, DeviceError, DeviceType};
+use crate::drivers::traits::{Device, DeviceError, DeviceType};
 
 /// Maximum number of bytes that can be queued in either direction of a PTY pipe.
 const PTY_BUF_SIZE: usize = 4096;
@@ -208,19 +208,21 @@ static PTY_TABLE: Mutex<PtyTable> = Mutex::new(PtyTable::new());
 ///
 /// - Manager device registered as `ptmN`  (major 5, minor 128+N).
 /// - Subsidiary registered as `ptsN` (major 136, minor N).
-pub fn alloc_pty() -> Result<usize, super::registry::RegistryError> {
+pub fn alloc_pty() -> Result<usize, crate::drivers::registry::RegistryError> {
+    use crate::drivers::registry;
+
     let (index, manager, subsidiary) = PTY_TABLE.lock().alloc();
 
     let mgr_name = format!("ptm{}", index);
     let sub_name = format!("pts{}", index);
 
-    super::registry::register(
+    registry::register(
         &mgr_name,
         manager,
         PTY_MANAGER_MAJOR,
         PTY_MANAGER_MINOR_BASE + index as u16,
     )?;
-    super::registry::register(&sub_name, subsidiary, PTY_SUB_MAJOR, index as u16)?;
+    registry::register(&sub_name, subsidiary, PTY_SUB_MAJOR, index as u16)?;
 
     Ok(index)
 }

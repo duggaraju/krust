@@ -137,9 +137,17 @@ pub fn sys_fork(_args: &SyscallArgs) -> isize {
     -38
 }
 
-pub fn sys_execve(_args: &SyscallArgs) -> isize {
-    warn!("sys_execve is unimplemented");
-    -38
+pub fn sys_execve(args: &SyscallArgs) -> isize {
+    let path_ptr = args.arg0 as *const u8;
+    let Some(path) = (unsafe { read_cstr(path_ptr) }) else {
+        warn!("sys_execve received invalid path pointer");
+        return -14;
+    };
+
+    match impls::execve(path) {
+        Ok(()) => 0,
+        Err(errno) => errno,
+    }
 }
 
 unsafe fn read_cstr(ptr: *const u8) -> Option<&'static str> {

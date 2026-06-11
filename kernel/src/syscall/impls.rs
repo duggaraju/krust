@@ -144,7 +144,85 @@ pub fn read_file_string(path: &str, max_bytes: usize) -> Result<String, isize> {
 }
 
 pub fn getpid() -> isize {
-    1
+    process::current_pid() as isize
+}
+
+pub fn execve(path: &str) -> Result<(), isize> {
+    let absolute = resolve_absolute_from_current_cwd(path).map_err(errno_from_fs)?;
+    let request = crate::process::binfmt::ExecRequest::from_path(absolute.clone());
+    let action = crate::process::binfmt::probe_path(&request).map_err(|err| match err {
+        crate::process::binfmt::BinfmtError::Io(errno) => errno,
+        crate::process::binfmt::BinfmtError::NotExecutableFormat => -8,
+        crate::process::binfmt::BinfmtError::AlreadyRegistered
+        | crate::process::binfmt::BinfmtError::NotFound => -38,
+        crate::process::binfmt::BinfmtError::InvalidFormat => -8,
+    })?;
+
+    match action {
+        crate::process::binfmt::BinaryFormatAction::Load(plan) => {
+            log::info!(
+                "execve: loading '{}' format='{}' entry=0x{:x} segments={}",
+                absolute,
+                plan.format,
+                plan.entry_point,
+                plan.segments.len(),
+            );
+
+            // Load ELF segments into memory
+            for segment in &plan.segments {
+                load_segment(&absolute, segment).map_err(|_| -5 as isize)?;
+            }
+
+            // Apply load plan to current task
+            process::with_current_task_mut(|task| {
+                task.apply_load_plan(&plan, request.argv.clone());
+                log::info!("execve: applied load plan, entry=0x{:x}, argv={:?}", plan.entry_point, task.argv);
+            }).ok_or(-1 as isize)?;
+
+            Ok(())
+        }
+        crate::process::binfmt::BinaryFormatAction::Redirect(next) => {
+            log::info!(
+                "execve: redirecting '{}' → '{}' with argv={:?}",
+                absolute,
+                next.path,
+                next.argv,
+            );
+            // Recursively execute the interpreter with updated arguments
+            execve(&next.path)
+        }
+    }
+}
+
+/// Load a single ELF segment from file into memory
+fn load_segment(path: &str, segment: &crate::process::binfmt::LoadSegment) -> Result<(), ()> {
+    let data = read_file(path, segment.file_offset + segment.file_size)
+        .map_err(|_| ())?;
+
+    if data.len() < segment.file_offset + segment.file_size {
+        return Err(());
+    }
+
+    let segment_data = &data[segment.file_offset..segment.file_offset + segment.file_size];
+    let dest = segment.virtual_address as *mut u8;
+
+    unsafe {
+        // Copy file content into memory
+        core::ptr::copy_nonoverlapping(
+            segment_data.as_ptr(),
+            dest,
+            segment_data.len(),
+        );
+
+        // Zero-fill the remainder (BSS)
+        if segment.memory_size > segment.file_size {
+            let zero_start = dest.add(segment.file_size);
+            let zero_len = segment.memory_size - segment.file_size;
+            core::ptr::write_bytes(zero_start, 0, zero_len);
+        }
+    }
+
+    Ok(())
 }
 
 pub fn times() -> u64 {

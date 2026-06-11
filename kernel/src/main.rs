@@ -29,6 +29,7 @@ use bootloader_api::info::Optional;
 use bootloader_api::{BootInfo, BootloaderConfig, entry_point};
 use core::panic::PanicInfo;
 use log::info;
+use log::debug;
 
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
@@ -162,6 +163,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(feature = "fs")]
     {
         let _ = crate::fs::register_mount("/", "ramfs", crate::fs::MountDevice::None);
+        #[cfg(feature = "drivers")]
+        let _ = crate::fs::register_mount(
+            "/bin",
+            "fatfs",
+            crate::fs::MountDevice::device_path("/dev/sda"),
+        );
         #[cfg(feature = "process")]
         let _ = crate::fs::register_mount("/proc", "proc", crate::fs::MountDevice::None);
         #[cfg(feature = "drivers")]
@@ -229,7 +236,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
 
         let reason = shell::run();
-        info!("shell exited: {:?}", reason);
+        debug!("shell exited: {:?}", reason);
 
         #[cfg(feature = "process")]
         {

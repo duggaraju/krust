@@ -15,16 +15,41 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use self::ramfs::RamFs;
-use self::vfs::{FileSystem, FileType, FsError};
+use self::vfs::{FileSystem, FileType, FsError, Inode};
 #[cfg(feature = "drivers")]
 use crate::drivers::traits::BlockDevice;
 use crate::module::traits::KernelRegistry;
 use spin::{Mutex, Once};
 
+#[cfg(feature = "drivers")]
+pub type MountBlockDevice = Arc<dyn BlockDevice>;
+#[cfg(not(feature = "drivers"))]
+pub type MountBlockDevice = ();
+
+pub trait FileSystemFactory: Send + Sync {
+    fn mount(
+        &self,
+        mountpoint: Arc<dyn Inode>,
+        device: Option<MountBlockDevice>,
+    ) -> Result<Arc<dyn FileSystem>, FsError>;
+
+    fn unmount(
+        &self,
+        mountpoint: Arc<dyn Inode>,
+        device: Option<MountBlockDevice>,
+    ) -> Result<(), FsError>;
+}
+
 pub fn init() {
     let ramfs: Arc<dyn FileSystem> = Arc::new(RamFs::new());
     let _ = register_filesystem(ramfs);
     log::info!("registered ramfs filesystem");
+
+    #[cfg(feature = "drivers")]
+    {
+        let _ = register_filesystem_factory("fatfs", Arc::new(fat::FatFsFactory));
+        log::info!("registered fatfs filesystem factory");
+    }
 }
 
 pub fn register_modules(registry: &dyn KernelRegistry) {
@@ -38,8 +63,28 @@ pub fn register_modules(registry: &dyn KernelRegistry) {
 #[derive(Clone)]
 pub enum MountDevice {
     None,
+    DevicePath(String),
     #[cfg(feature = "drivers")]
     Block(Arc<dyn BlockDevice>),
+}
+
+impl MountDevice {
+    pub fn device_path(path: &str) -> Self {
+        Self::DevicePath(path.to_string())
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct MountOptions {
+    pub create_mountpoint_if_missing: bool,
+}
+
+impl Default for MountOptions {
+    fn default() -> Self {
+        Self {
+            create_mountpoint_if_missing: true,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -47,11 +92,13 @@ struct MountSpec {
     path: String,
     filesystem: String,
     device: MountDevice,
+    options: MountOptions,
 }
 
 #[derive(Default)]
 struct FilesystemTable {
     filesystems: BTreeMap<String, Arc<dyn FileSystem>>,
+    filesystem_factories: BTreeMap<String, Arc<dyn FileSystemFactory>>,
     registration_counts: BTreeMap<String, usize>,
     active_mounts: BTreeMap<String, usize>,
 }
@@ -96,6 +143,53 @@ pub fn filesystem(name: &str) -> Result<Arc<dyn FileSystem>, FsError> {
         .ok_or(FsError::NotFound)
 }
 
+pub fn register_filesystem_factory(
+    name: &str,
+    factory: Arc<dyn FileSystemFactory>,
+) -> Result<(), FsError> {
+    let normalized = name.trim();
+    if normalized.is_empty() {
+        return Err(FsError::NotSupported);
+    }
+
+    let mut table = filesystem_table().lock();
+    if table.filesystem_factories.contains_key(normalized) {
+        return Err(FsError::AlreadyExists);
+    }
+
+    table
+        .filesystem_factories
+        .insert(normalized.to_string(), factory);
+    Ok(())
+}
+
+pub fn unregister_filesystem_factory(name: &str) -> Result<(), FsError> {
+    let normalized = name.trim();
+    if normalized.is_empty() {
+        return Err(FsError::NotSupported);
+    }
+
+    let mut table = filesystem_table().lock();
+    if table.filesystem_factories.remove(normalized).is_none() {
+        return Err(FsError::NotFound);
+    }
+    Ok(())
+}
+
+fn filesystem_from_factory(
+    name: &str,
+    mountpoint: Arc<dyn Inode>,
+    device: Option<MountBlockDevice>,
+) -> Result<Arc<dyn FileSystem>, FsError> {
+    let factory = {
+        let table = filesystem_table().lock();
+        table.filesystem_factories.get(name).cloned()
+    }
+    .ok_or(FsError::NotFound)?;
+
+    factory.mount(mountpoint, device)
+}
+
 pub fn unregister_filesystem(name: &str) -> Result<(), FsError> {
     let mut table = filesystem_table().lock();
     if table.active_mounts.get(name).copied().unwrap_or(0) > 0 {
@@ -123,6 +217,15 @@ pub fn unregister_filesystem(name: &str) -> Result<(), FsError> {
 }
 
 pub fn register_mount(path: &str, filesystem: &str, device: MountDevice) -> Result<(), FsError> {
+    register_mount_with_options(path, filesystem, device, MountOptions::default())
+}
+
+pub fn register_mount_with_options(
+    path: &str,
+    filesystem: &str,
+    device: MountDevice,
+    options: MountOptions,
+) -> Result<(), FsError> {
     let normalized = self::vfs::normalize_absolute_path(path)?;
     let mut table = mount_table().lock();
 
@@ -134,6 +237,7 @@ pub fn register_mount(path: &str, filesystem: &str, device: MountDevice) -> Resu
         path: normalized,
         filesystem: filesystem.to_string(),
         device,
+        options,
     });
     Ok(())
 }
@@ -145,18 +249,96 @@ pub fn mount_registered_filesystems() -> Result<(), FsError> {
     };
 
     for entry in pending {
-        let _ = &entry.device;
-        let fs = filesystem(entry.filesystem.as_str())?;
+        log::info!(
+            "mount: attempting filesystem '{}' on '{}'",
+            entry.filesystem,
+            entry.path
+        );
+
+        if matches!(entry.device, MountDevice::None) {
+            log::trace!("mount: '{}' requested without explicit device binding", entry.path);
+        }
+
+        if entry.path != "/" && entry.options.create_mountpoint_if_missing {
+            ensure_directory_path(&entry.path)?;
+        }
+
+        let mountpoint = if entry.path == "/" {
+            match self::vfs::root_inode() {
+                Ok(inode) => Some(inode),
+                Err(_) => None,
+            }
+        } else {
+            Some(self::vfs::lookup_path(entry.path.as_str())?)
+        };
+
+        let fs = match filesystem(entry.filesystem.as_str()) {
+            Ok(fs) => fs,
+            Err(FsError::NotFound) => match filesystem_from_factory(
+                entry.filesystem.as_str(),
+                mountpoint.clone().ok_or(FsError::NotFound)?,
+                resolve_mount_block_device(&entry.device)?,
+            ) {
+                Ok(fs) => fs,
+                Err(FsError::NotFound) => {
+                    log::warn!(
+                        "mount: skipping '{}' -> '{}' (filesystem or device not present)",
+                        entry.path,
+                        entry.filesystem
+                    );
+                    continue;
+                }
+                Err(err) => {
+                    log::warn!(
+                        "mount: skipping '{}' -> '{}' (mount failed: {:?})",
+                        entry.path,
+                        entry.filesystem,
+                        err
+                    );
+                    continue;
+                }
+            },
+            Err(err) => return Err(err),
+        };
         if entry.path == "/" {
             self::vfs::mount_root(fs)?;
         } else {
-            ensure_directory_path(&entry.path)?;
             self::vfs::mount(entry.path.as_str(), fs)?;
         }
         track_active_mount(entry.filesystem.as_str());
+        log::info!(
+            "mount: mounted filesystem '{}' on '{}'",
+            entry.filesystem,
+            entry.path
+        );
     }
 
     Ok(())
+}
+
+fn resolve_mount_block_device(device: &MountDevice) -> Result<Option<MountBlockDevice>, FsError> {
+    match device {
+        MountDevice::None => Ok(None),
+        MountDevice::DevicePath(path) => {
+            #[cfg(feature = "drivers")]
+            {
+                use crate::drivers::registry as driver_registry;
+
+                let name = path.strip_prefix("/dev/").unwrap_or(path.as_str());
+                return driver_registry::get_block(name)
+                    .map(Some)
+                    .ok_or(FsError::NotFound);
+            }
+
+            #[cfg(not(feature = "drivers"))]
+            {
+                let _ = path;
+                Err(FsError::NotSupported)
+            }
+        }
+        #[cfg(feature = "drivers")]
+        MountDevice::Block(dev) => Ok(Some(Arc::clone(dev))),
+    }
 }
 
 fn track_active_mount(name: &str) {

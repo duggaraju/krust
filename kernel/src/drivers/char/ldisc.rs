@@ -189,7 +189,7 @@ impl EchoBytes {
         match self {
             EchoBytes::None => {}
             EchoBytes::One(b) => sink(&[b]),
-            EchoBytes::Erase => sink(b"\x08 \x08"),
+            EchoBytes::Erase => sink(b"\x1b[D \x1b[D"),
             EchoBytes::CtrlC => sink(b"^C\n"),
             EchoBytes::KillLine => sink(b"^U\n"),
         }

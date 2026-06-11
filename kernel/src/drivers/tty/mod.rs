@@ -15,15 +15,19 @@ use x86_64::instructions::port::Port;
 
 use crate::drivers::registry;
 use crate::drivers::traits::{Device, DeviceError, DeviceType};
-use crate::drivers::ldisc::LineDiscipline;
+use crate::drivers::char::ldisc::LineDiscipline;
 use crate::process::task::ControllingTerminal;
 
 const PS2_STATUS_PORT: u16 = 0x64;
 const PS2_DATA_PORT: u16 = 0x60;
 const MAX_SCREEN_BYTES: usize = 16 * 1024;
 
+/// The last virtual console is reserved for kernel log output.
+/// Shell VCs start at 0; log VC is always the highest-indexed one.
+pub const LOG_VC_OFFSET_FROM_END: usize = 1;
+
 static KEYBOARD: Once<Mutex<PS2Keyboard<layouts::Us104Key, ScancodeSet1>>> = Once::new();
-static MANAGER: Once<Mutex<TtyManager>> = Once::new();
+pub static MANAGER: Once<Mutex<TtyManager>> = Once::new();
 static SERIAL_ECHO: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 static SERIAL_DEVICE: Mutex<Option<Arc<dyn Device>>> = Mutex::new(None);
 
@@ -97,7 +101,7 @@ impl VirtualConsole {
     }
 }
 
-struct TtyManager {
+pub struct TtyManager {
     vcs: Vec<VirtualConsole>,
     active: usize,
     alt_down: bool,
@@ -169,13 +173,13 @@ impl TtyManager {
             return;
         }
         self.active = index;
-        let message = format!("\n[switched to tty{}]\n", index);
+        if crate::drivers::video::is_initialized() {
+            crate::drivers::video::clear();
+            crate::drivers::video::write_str(&self.vcs[index].screen);
+        }
+        let message = format!("[tty{}]\n", index);
         if SERIAL_ECHO.load(Ordering::Relaxed) {
             write_serial_bytes(message.as_bytes());
-        }
-        if crate::drivers::video::is_initialized() {
-            crate::drivers::video::write_str(&message);
-            crate::drivers::video::write_str(&self.vcs[index].screen);
         }
     }
 
@@ -278,6 +282,28 @@ pub(crate) fn tty_read(vc_index: usize, buf: &mut [u8]) -> usize {
 
 pub(crate) fn tty_write(vc_index: usize, bytes: &[u8]) {
     manager().lock().write(vc_index, bytes);
+}
+
+/// Return the total number of virtual consoles.
+pub fn tty_vc_count() -> usize {
+    MANAGER.get().map(|m| m.lock().vcs.len()).unwrap_or(1)
+}
+
+/// Write directly to the kernel log virtual console (always the last VC).
+/// Safe to call from the logger — does not acquire any logger locks.
+pub fn tty_write_log(bytes: &[u8]) {
+    let Some(manager) = MANAGER.get() else { return };
+    let mut mgr = manager.lock();
+    let log_vc = mgr.vcs.len().saturating_sub(LOG_VC_OFFSET_FROM_END);
+    let active = mgr.active;
+    let processed = mgr.vcs[log_vc].push_raw_output(bytes);
+    mgr.vcs[log_vc].push_output(bytes);
+    // Only paint to framebuffer if the log VC is currently active
+    if log_vc == active && crate::drivers::video::is_initialized() {
+        if let Ok(text) = core::str::from_utf8(&processed) {
+            crate::drivers::video::write_str(text);
+        }
+    }
 }
 
 /// A character device representing the current task's controlling terminal.

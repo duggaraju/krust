@@ -15,12 +15,31 @@ pub trait KernelRegistry: Send + Sync {
 
     fn unregister_module(&self, name: &str) -> Result<(), ModuleError>;
 
-    fn register_filesystem(
+    fn register_filesystem_factory(
         &self,
-        fs: Arc<dyn crate::fs::vfs::FileSystem>,
+        name: &str,
+        factory: Arc<dyn crate::fs::FileSystemFactory>,
     ) -> Result<(), ModuleError>;
 
-    fn unregister_filesystem(&self, name: &str) -> Result<(), ModuleError>;
+    fn unregister_filesystem_factory(&self, name: &str) -> Result<(), ModuleError>;
+
+    #[cfg(feature = "drivers")]
+    fn register_bus(
+        &self,
+        bus: Arc<dyn crate::drivers::traits::Bus>,
+    ) -> Result<(), ModuleError>;
+
+    #[cfg(feature = "drivers")]
+    fn unregister_bus(&self, name: &str) -> Result<(), ModuleError>;
+
+    #[cfg(feature = "process")]
+    fn register_binfmt_handler(
+        &self,
+        handler: Arc<dyn crate::process::binfmt::BinaryFormatHandler>,
+    ) -> Result<(), ModuleError>;
+
+    #[cfg(feature = "process")]
+    fn unregister_binfmt_handler(&self, name: &str) -> Result<(), ModuleError>;
 
     #[cfg(feature = "drivers")]
     fn register_device(

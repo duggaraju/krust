@@ -38,14 +38,13 @@ impl KernelModule for DevFsModule {
         "Device filesystem"
     }
 
-    fn init(&self, registry: &dyn KernelRegistry) -> Result<(), ModuleError> {
-        registry.register_filesystem(Arc::new(DevFs::new()))?;
-        Ok(())
+    fn init(&self, _registry: &dyn KernelRegistry) -> Result<(), ModuleError> {
+        crate::fs::register_filesystem(Arc::new(DevFs::new()))
+            .map_err(|_| ModuleError::InitFailed)
     }
 
-    fn cleanup(&self, registry: &dyn KernelRegistry) -> Result<(), ModuleError> {
-        registry.unregister_filesystem("dev")?;
-        Ok(())
+    fn cleanup(&self, _registry: &dyn KernelRegistry) -> Result<(), ModuleError> {
+        crate::fs::unregister_filesystem("dev").map_err(|_| ModuleError::CleanupFailed)
     }
 }
 

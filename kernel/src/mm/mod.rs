@@ -5,6 +5,7 @@ pub mod stats;
 
 use bootloader_api::info::MemoryRegion;
 use log::info;
+use spin::Once;
 use x86_64::{
     VirtAddr,
     registers::control::Cr3,
@@ -13,9 +14,12 @@ use x86_64::{
 
 use self::frame_allocator::BootInfoFrameAllocator;
 
+static PHYSICAL_MEMORY_OFFSET: Once<u64> = Once::new();
+
 /// Initialize memory management from pre-extracted boot info fields.
 /// This avoids borrow conflicts with BootInfo in main.
 pub fn init_with(physical_memory_offset: u64, memory_regions: &'static [MemoryRegion]) {
+    PHYSICAL_MEMORY_OFFSET.call_once(|| physical_memory_offset);
     let phys_offset = VirtAddr::new(physical_memory_offset);
 
     let mut mapper = unsafe { init_mapper(phys_offset) };
@@ -24,6 +28,70 @@ pub fn init_with(physical_memory_offset: u64, memory_regions: &'static [MemoryRe
     stats::init(memory_regions);
     heap::init(&mut mapper, &mut frame_allocator);
     info!("memory management initialized");
+}
+
+pub fn physical_memory_offset() -> Option<u64> {
+    PHYSICAL_MEMORY_OFFSET.get().copied()
+}
+
+pub fn phys_to_virt_addr(physical_address: u64) -> Option<u64> {
+    let offset = *PHYSICAL_MEMORY_OFFSET.get()?;
+    Some(offset.saturating_add(physical_address))
+}
+
+pub fn virt_to_phys_addr(virtual_address: u64) -> Option<u64> {
+    let phys_offset = *PHYSICAL_MEMORY_OFFSET.get()?;
+    let virt = VirtAddr::new(virtual_address);
+
+    let (level_4_table_frame, _) = Cr3::read();
+    let mut table_phys = level_4_table_frame.start_address().as_u64();
+
+    let p4_index = u64::from(virt.p4_index());
+    let p3_index = u64::from(virt.p3_index());
+    let p2_index = u64::from(virt.p2_index());
+    let p1_index = u64::from(virt.p1_index());
+
+    let p4_entry = read_page_table_entry(phys_offset, table_phys, p4_index)?;
+    if p4_entry & 1 == 0 {
+        return None;
+    }
+    table_phys = p4_entry & 0x000f_ffff_ffff_f000;
+
+    let p3_entry = read_page_table_entry(phys_offset, table_phys, p3_index)?;
+    if p3_entry & 1 == 0 {
+        return None;
+    }
+    if p3_entry & (1 << 7) != 0 {
+        let frame = p3_entry & 0x000f_ffff_c000_0000;
+        let offset = virtual_address & 0x3fff_ffff;
+        return Some(frame + offset);
+    }
+    table_phys = p3_entry & 0x000f_ffff_ffff_f000;
+
+    let p2_entry = read_page_table_entry(phys_offset, table_phys, p2_index)?;
+    if p2_entry & 1 == 0 {
+        return None;
+    }
+    if p2_entry & (1 << 7) != 0 {
+        let frame = p2_entry & 0x000f_ffff_ffe0_0000;
+        let offset = virtual_address & 0x1f_ffff;
+        return Some(frame + offset);
+    }
+    table_phys = p2_entry & 0x000f_ffff_ffff_f000;
+
+    let p1_entry = read_page_table_entry(phys_offset, table_phys, p1_index)?;
+    if p1_entry & 1 == 0 {
+        return None;
+    }
+    let frame = p1_entry & 0x000f_ffff_ffff_f000;
+    Some(frame + (virtual_address & 0xfff))
+}
+
+fn read_page_table_entry(phys_offset: u64, table_phys: u64, index: u64) -> Option<u64> {
+    let entry_phys = table_phys.checked_add(index.checked_mul(8)?)?;
+    let entry_virt = phys_offset.checked_add(entry_phys)?;
+    let entry_ptr = entry_virt as *const u64;
+    Some(unsafe { core::ptr::read_volatile(entry_ptr) })
 }
 
 unsafe fn init_mapper(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static> {

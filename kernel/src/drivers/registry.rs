@@ -1,9 +1,9 @@
 extern crate alloc;
 
-use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
+use alloc::{collections::BTreeMap, string::{String, ToString}, sync::Arc, vec::Vec};
 use spin::Mutex;
 
-use super::traits::{Device, DeviceType};
+use super::traits::{BlockDevice, Bus, BusDeviceInfo, BusError, Device, DeviceType};
 
 #[derive(Clone)]
 struct DeviceEntry {
@@ -34,12 +34,23 @@ pub struct DeviceDescriptor {
 
 pub struct DeviceRegistry {
     devices: BTreeMap<String, DeviceEntry>,
+    block_devices: BTreeMap<String, Arc<dyn BlockDevice>>,
+}
+
+struct BusEntry {
+    bus: Arc<dyn Bus>,
+    devices: Vec<BusDeviceInfo>,
+}
+
+pub struct BusRegistry {
+    buses: BTreeMap<String, BusEntry>,
 }
 
 impl DeviceRegistry {
     pub const fn new() -> Self {
         Self {
             devices: BTreeMap::new(),
+            block_devices: BTreeMap::new(),
         }
     }
 
@@ -121,7 +132,24 @@ impl DeviceRegistry {
             return Err(RegistryError::Busy);
         }
         self.devices.remove(name);
+        self.block_devices.remove(name);
         Ok(())
+    }
+
+    pub fn register_block_device_alias(
+        &mut self,
+        name: &str,
+        device: Arc<dyn BlockDevice>,
+    ) -> Result<(), RegistryError> {
+        if !self.devices.contains_key(name) {
+            return Err(RegistryError::NotFound);
+        }
+        self.block_devices.insert(name.to_string(), device);
+        Ok(())
+    }
+
+    pub fn get_block(&self, name: &str) -> Option<Arc<dyn BlockDevice>> {
+        self.block_devices.get(name).cloned()
     }
 
     pub fn get_descriptor_by_number(
@@ -177,7 +205,50 @@ impl DeviceRegistry {
     }
 }
 
+impl BusRegistry {
+    pub const fn new() -> Self {
+        Self {
+            buses: BTreeMap::new(),
+        }
+    }
+
+    pub fn register(&mut self, bus: Arc<dyn Bus>) -> Result<(), BusError> {
+        let name = bus.name();
+        if name.trim().is_empty() {
+            return Err(BusError::InvalidName);
+        }
+        if self.buses.contains_key(name) {
+            return Err(BusError::AlreadyRegistered);
+        }
+
+        let devices = bus.enumerate().map_err(|_| BusError::EnumerationFailed)?;
+
+        self.buses.insert(name.to_string(), BusEntry { bus, devices });
+        Ok(())
+    }
+
+    pub fn unregister(&mut self, name: &str) -> Result<(), BusError> {
+        if !self.buses.contains_key(name) {
+            return Err(BusError::NotFound);
+        }
+        self.buses.remove(name);
+        Ok(())
+    }
+
+    pub fn list(&self) -> Vec<String> {
+        self.buses.keys().cloned().collect()
+    }
+
+    pub fn list_devices(&self, name: &str) -> Option<Vec<BusDeviceInfo>> {
+        self.buses.get(name).map(|entry| {
+            let _ = entry.bus.name();
+            entry.devices.clone()
+        })
+    }
+}
+
 static REGISTRY: Mutex<DeviceRegistry> = Mutex::new(DeviceRegistry::new());
+static BUS_REGISTRY: Mutex<BusRegistry> = Mutex::new(BusRegistry::new());
 
 pub fn register(
     name: &str,
@@ -208,6 +279,17 @@ pub fn unregister(name: &str) -> Result<(), RegistryError> {
     REGISTRY.lock().unregister(name)
 }
 
+pub fn register_block_device_alias(
+    name: &str,
+    device: Arc<dyn BlockDevice>,
+) -> Result<(), RegistryError> {
+    REGISTRY.lock().register_block_device_alias(name, device)
+}
+
+pub fn get_block(name: &str) -> Option<Arc<dyn BlockDevice>> {
+    REGISTRY.lock().get_block(name)
+}
+
 pub fn get_descriptor_by_number(
     device_type: DeviceType,
     major: u16,
@@ -228,4 +310,20 @@ pub fn list_descriptors() -> Vec<DeviceDescriptor> {
 
 pub fn list_by_prefix(prefix: &str) -> Vec<DeviceDescriptor> {
     REGISTRY.lock().list_by_prefix(prefix)
+}
+
+pub fn register_bus(bus: Arc<dyn Bus>) -> Result<(), BusError> {
+    BUS_REGISTRY.lock().register(bus)
+}
+
+pub fn unregister_bus(name: &str) -> Result<(), BusError> {
+    BUS_REGISTRY.lock().unregister(name)
+}
+
+pub fn list_buses() -> Vec<String> {
+    BUS_REGISTRY.lock().list()
+}
+
+pub fn list_bus_devices(name: &str) -> Option<Vec<BusDeviceInfo>> {
+    BUS_REGISTRY.lock().list_devices(name)
 }

@@ -1,3 +1,4 @@
+pub mod binfmt;
 pub mod context;
 pub mod scheduler;
 pub mod task;
@@ -7,7 +8,7 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use self::scheduler::SCHEDULER;
-use self::task::{ControllingTerminal, Task, TaskState};
+use self::task::{ControllingTerminal, Task, TaskMode, TaskState};
 use crate::fs::vfs::{File, FsError, Inode, OpenFile};
 use crate::fs::vfs::FileDescriptor;
 
@@ -20,6 +21,7 @@ fn dummy_entry() {}
 
 pub fn init() {
     scheduler::init();
+    binfmt::init();
 }
 
 pub fn register_boot_processes(root_cwd: Arc<dyn Inode>) {
@@ -63,6 +65,40 @@ pub fn set_current_pid(pid: u64) {
 
 pub fn current_pid() -> u64 {
     CURRENT_PID.load(Ordering::Relaxed)
+}
+
+pub fn current_task_mode() -> Option<TaskMode> {
+    let pid = current_pid();
+    let scheduler = SCHEDULER.lock();
+    scheduler
+        .as_ref()
+        .and_then(|scheduler| scheduler.task_by_pid(pid))
+        .map(|task| task.mode)
+}
+
+pub fn set_current_task_mode(mode: TaskMode) -> bool {
+    let pid = current_pid();
+    let mut scheduler = SCHEDULER.lock();
+    let Some(scheduler) = scheduler.as_mut() else {
+        return false;
+    };
+    let Some(task) = scheduler.task_by_pid_mut(pid) else {
+        return false;
+    };
+    task.set_mode(mode);
+    true
+}
+
+/// Execute a closure with mutable access to the current task
+pub fn with_current_task_mut<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&mut Task) -> R,
+{
+    let pid = current_pid();
+    let mut scheduler = SCHEDULER.lock();
+    let scheduler = scheduler.as_mut()?;
+    let task = scheduler.task_by_pid_mut(pid)?;
+    Some(f(task))
 }
 
 pub fn current_cwd() -> Option<Arc<dyn Inode>> {
