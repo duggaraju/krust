@@ -38,9 +38,16 @@ pub fn write_str(s: &str) {
 /// Clear the framebuffer (used when switching virtual consoles).
 pub fn clear() {
     if let Some(writer) = framebuffer() {
-        // FrameBufferWriter doesn't expose a clear, so overwrite with blank lines.
         let mut writer = writer.lock();
-        let _ = writer.write_str("\x1b[2J\x1b[H");
+        writer.clear();
+    }
+}
+
+pub fn render_text(s: &str) {
+    if let Some(writer) = framebuffer() {
+        let mut writer = writer.lock();
+        writer.clear();
+        let _ = writer.write_str(s);
     }
 }
 

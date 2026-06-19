@@ -28,8 +28,8 @@ use bootloader_api::config::Mapping;
 use bootloader_api::info::Optional;
 use bootloader_api::{BootInfo, BootloaderConfig, entry_point};
 use core::panic::PanicInfo;
-use log::info;
 use log::debug;
+use log::info;
 
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
@@ -150,7 +150,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // Wire the ttyS serial device into the tty echo/input layer.
     #[cfg(feature = "drivers")]
     {
-        let echo_name = if boot_config.shell_port() == 2 { "ttyS1" } else { "ttyS0" };
+        let echo_name = if boot_config.shell_port() == 2 {
+            "ttyS1"
+        } else {
+            "ttyS0"
+        };
         if let Some(dev) = crate::drivers::registry::get(echo_name) {
             crate::drivers::tty::set_serial_device(dev);
         }
@@ -163,6 +167,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(feature = "fs")]
     {
         let _ = crate::fs::register_mount("/", "ramfs", crate::fs::MountDevice::None);
+        // Keep ramfs as bootstrap root, then overlay FAT as the runtime root.
         #[cfg(feature = "drivers")]
         let _ = crate::fs::register_mount(
             "/bin",
@@ -188,8 +193,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         let root_cwd_inode = {
             #[cfg(feature = "fs")]
             {
-                crate::fs::vfs::root_inode()
-                    .expect("root inode must exist before shell startup")
+                crate::fs::vfs::root_inode().expect("root inode must exist before shell startup")
             }
             #[cfg(not(feature = "fs"))]
             {
@@ -264,5 +268,64 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 fn panic(info: &PanicInfo) -> ! {
     use log::error;
     error!("Kernel panic: {:#?}", info);
+    #[cfg(feature = "process")]
+    {
+        let current_pid = crate::process::current_pid();
+        error!("panic trace: current_pid={}", current_pid);
+
+        let scheduler = crate::process::scheduler::SCHEDULER.lock();
+        if let Some(scheduler) = scheduler.as_ref() {
+            error!(
+                "panic trace: scheduler_current_pid={:?}",
+                scheduler.current().map(|task| task.pid)
+            );
+
+            if let Some(task) = scheduler.task_by_pid(current_pid) {
+                error!(
+                    "panic trace: task pid={} ppid={} state={:?} mode={:?} priority={} userland={} exit_code={} exec_path='{}' cwd='{}' argv={:?}",
+                    task.pid,
+                    task.parent_pid,
+                    task.state,
+                    task.mode,
+                    task.priority,
+                    task.userland,
+                    task.exit_code,
+                    task.exec_path,
+                    task.cwd_path,
+                    task.argv
+                );
+                error!(
+                    "panic trace: context rip=0x{:x} rsp=0x{:x} rbp=0x{:x} user_rip=0x{:x} user_rsp=0x{:x} kernel_rsp=0x{:x} rflags=0x{:x} cr3=0x{:x} rax=0x{:x}",
+                    task.context.rip,
+                    task.context.rsp,
+                    task.context.rbp,
+                    task.context.user_rip,
+                    task.context.user_rsp,
+                    task.context.kernel_rsp,
+                    task.context.rflags,
+                    task.context.cr3,
+                    task.context.rax
+                );
+                error!(
+                    "panic trace: pending_signals={} terminated_by_signal={:?} kernel_stack_top=0x{:x} user_stack_top=0x{:x}",
+                    task.pending_signals.len(),
+                    task.terminated_by_signal,
+                    task.kernel_stack_top,
+                    task.user_stack_top
+                );
+            } else {
+                error!("panic trace: no task found for current_pid={}", current_pid);
+            }
+
+            for task in scheduler.tasks().take(8) {
+                error!(
+                    "panic trace: task_list pid={} state={:?} mode={:?} userland={} exec='{}'",
+                    task.pid, task.state, task.mode, task.userland, task.exec_path
+                );
+            }
+        } else {
+            error!("panic trace: scheduler unavailable");
+        }
+    }
     arch::shutdown(arch::ShutdownStatus::Failure);
 }

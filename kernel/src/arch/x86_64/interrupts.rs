@@ -33,6 +33,9 @@ impl Drop for KernelModeGuard {
 static IDT: LazyLock<InterruptDescriptorTable> = LazyLock::new(|| {
     let mut idt = InterruptDescriptorTable::new();
     idt.breakpoint.set_handler_fn(breakpoint_handler);
+    idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
+    idt.general_protection_fault
+        .set_handler_fn(general_protection_fault_handler);
     unsafe {
         idt.double_fault
             .set_handler_fn(double_fault_handler)
@@ -92,6 +95,85 @@ extern "x86-interrupt" fn double_fault_handler(
     halt_loop()
 }
 
+extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFrame) {
+    #[cfg(feature = "process")]
+    let _kernel_mode = KernelModeGuard::enter();
+    log::error!("EXCEPTION: INVALID OPCODE\n{stack_frame:#?}");
+    #[cfg(feature = "process")]
+    if matches!(crate::process::current_task_mode(), Some(crate::process::task::TaskMode::User)) {
+        let pid = crate::process::current_pid();
+        log::error!("invalid opcode in user task pid={} - terminating task", pid);
+        let switch_plan = {
+            let mut scheduler = crate::process::scheduler::SCHEDULER.lock();
+            let Some(scheduler) = scheduler.as_mut() else {
+                halt_loop()
+            };
+            let mut parent_pid = None;
+            if let Some(task) = scheduler.task_by_pid_mut(pid) {
+                parent_pid = Some(task.parent_pid);
+                task.set_exit_code(132);
+                task.state = crate::process::task::TaskState::Zombie;
+            }
+            if let Some(ppid) = parent_pid {
+                scheduler
+                    .switch_to_pid(ppid)
+                    .or_else(|| scheduler.preempt_and_switch())
+            } else {
+                scheduler.preempt_and_switch()
+            }
+        };
+
+        if let Some(plan) = switch_plan {
+            unsafe {
+                #[cfg(target_arch = "x86_64")]
+                crate::arch::x86_64::context::switch(plan.old_ctx, plan.new_ctx);
+            }
+        }
+    }
+    halt_loop()
+}
+
+extern "x86-interrupt" fn general_protection_fault_handler(
+    stack_frame: InterruptStackFrame,
+    error_code: u64,
+) {
+    #[cfg(feature = "process")]
+    let _kernel_mode = KernelModeGuard::enter();
+    log::error!("EXCEPTION: GENERAL PROTECTION ({error_code:#x})\n{stack_frame:#?}");
+    #[cfg(feature = "process")]
+    if matches!(crate::process::current_task_mode(), Some(crate::process::task::TaskMode::User)) {
+        let pid = crate::process::current_pid();
+        log::error!("general protection fault in user task pid={} - terminating task", pid);
+        let switch_plan = {
+            let mut scheduler = crate::process::scheduler::SCHEDULER.lock();
+            let Some(scheduler) = scheduler.as_mut() else {
+                halt_loop()
+            };
+            let mut parent_pid = None;
+            if let Some(task) = scheduler.task_by_pid_mut(pid) {
+                parent_pid = Some(task.parent_pid);
+                task.set_exit_code(128);
+                task.state = crate::process::task::TaskState::Zombie;
+            }
+            if let Some(ppid) = parent_pid {
+                scheduler
+                    .switch_to_pid(ppid)
+                    .or_else(|| scheduler.preempt_and_switch())
+            } else {
+                scheduler.preempt_and_switch()
+            }
+        };
+
+        if let Some(plan) = switch_plan {
+            unsafe {
+                #[cfg(target_arch = "x86_64")]
+                crate::arch::x86_64::context::switch(plan.old_ctx, plan.new_ctx);
+            }
+        }
+    }
+    halt_loop()
+}
+
 extern "x86-interrupt" fn page_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
@@ -102,6 +184,38 @@ extern "x86-interrupt" fn page_fault_handler(
     log::error!("Accessed Address: {:?}", Cr2::read());
     log::error!("Error Code: {:?}", error_code);
     log::error!("{stack_frame:#?}");
+
+    #[cfg(feature = "process")]
+    if error_code.contains(PageFaultErrorCode::USER_MODE) {
+        let pid = crate::process::current_pid();
+        log::error!("page fault in user task pid={} - terminating task", pid);
+        let switch_plan = {
+            let mut scheduler = crate::process::scheduler::SCHEDULER.lock();
+            let Some(scheduler) = scheduler.as_mut() else {
+                halt_loop()
+            };
+            let mut parent_pid = None;
+            if let Some(task) = scheduler.task_by_pid_mut(pid) {
+                parent_pid = Some(task.parent_pid);
+                task.set_exit_code(139); // conventional SIGSEGV exit status
+                task.state = crate::process::task::TaskState::Zombie;
+            }
+            if let Some(ppid) = parent_pid {
+                scheduler
+                    .switch_to_pid(ppid)
+                    .or_else(|| scheduler.preempt_and_switch())
+            } else {
+                scheduler.preempt_and_switch()
+            }
+        };
+
+        if let Some(plan) = switch_plan {
+            unsafe {
+                #[cfg(target_arch = "x86_64")]
+                crate::arch::x86_64::context::switch(plan.old_ctx, plan.new_ctx);
+            }
+        }
+    }
     halt_loop()
 }
 
@@ -115,7 +229,25 @@ macro_rules! define_irq_handler {
     };
 }
 
-define_irq_handler!(irq0_handler, IRQ_BASE_VECTOR + 0);
+extern "x86-interrupt" fn irq0_handler(_stack_frame: InterruptStackFrame) {
+    #[cfg(feature = "process")]
+    let _kernel_mode = KernelModeGuard::enter();
+
+    #[cfg(feature = "process")]
+    {
+        use crate::process::scheduler::UPTIME_MS;
+
+        // Update system uptime
+        let mut uptime = UPTIME_MS.lock();
+        *uptime += 10; // PIT fires every 10ms
+        drop(uptime);
+    }
+
+    #[cfg(not(feature = "process"))]
+    {
+        log::warn!("INTERRUPT: vector {}", IRQ_BASE_VECTOR + 0);
+    }
+}
 define_irq_handler!(irq1_handler, IRQ_BASE_VECTOR + 1);
 define_irq_handler!(irq2_handler, IRQ_BASE_VECTOR + 2);
 define_irq_handler!(irq3_handler, IRQ_BASE_VECTOR + 3);

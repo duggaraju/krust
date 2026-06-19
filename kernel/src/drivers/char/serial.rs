@@ -1,11 +1,13 @@
 extern crate alloc;
 
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use spin::Mutex;
 use uart_16550::backend::PioBackend;
 use uart_16550::{Config, Uart16550};
 
+use crate::drivers::char::ldisc::LineDiscipline;
 use crate::drivers::traits::{Device, DeviceError, DeviceType};
+use crate::process::task::Signal;
 
 /// Standard x86 COM port addresses.
 const COM_PORTS: [u16; 2] = [0x3F8, 0x2F8];
@@ -61,6 +63,93 @@ impl Device for SerialPortDevice {
         }
         Ok(buf.len())
     }
+}
+
+/// Serial console with line discipline and signal handling.
+/// Wraps a SerialPortDevice with input processing (canonical mode, Ctrl-C → SIGTERM).
+pub struct SerialConsoleDevice {
+    name: String,
+    device: SerialPortDevice,
+    ldisc: Mutex<LineDiscipline>,
+}
+
+impl SerialConsoleDevice {
+    fn new(device: SerialPortDevice) -> Self {
+        let name = device.name.to_string();
+        Self {
+            name,
+            device,
+            ldisc: Mutex::new(LineDiscipline::new()),
+        }
+    }
+
+    /// Deliver a signal to the current task
+    fn deliver_signal(signal: Signal) {
+        let _ = crate::process::with_current_task_mut(|task| {
+            task.deliver_signal(signal);
+        });
+    }
+}
+
+impl Device for SerialConsoleDevice {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn device_type(&self) -> DeviceType {
+        DeviceType::Char
+    }
+
+    /// Read from the serial console with line discipline processing.
+    /// Processes raw bytes through the line discipline (canonical mode, echo, signals).
+    fn read(&self, _offset: usize, buf: &mut [u8]) -> Result<usize, DeviceError> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        // Read raw bytes from the serial port
+        let mut raw_buf = [0u8; 64];
+        let n = self.device.read(0, &mut raw_buf)?;
+
+        let mut ldisc = self.ldisc.lock();
+        let mut signal_to_deliver: Option<Signal> = None;
+
+        // Process each byte through the line discipline
+        for &byte in &raw_buf[..n] {
+            let echo = ldisc.process_input(byte);
+
+            // Check if a signal was generated and queue it
+            if let Some(ldisc_signal) = echo.signal() {
+                signal_to_deliver = Some(ldisc_signal.to_kernel_signal());
+            }
+
+            // Echo the byte back to the console (optional, like a real terminal)
+            echo.emit(|echo_bytes| {
+                let _ = self.device.write(0, echo_bytes);
+            });
+        }
+
+        // Deliver signal to current task if one was generated
+        if let Some(signal) = signal_to_deliver {
+            Self::deliver_signal(signal);
+        }
+
+        // Read cooked bytes from the line discipline
+        let bytes_read = ldisc.read(buf);
+        Ok(bytes_read)
+    }
+
+    /// Write bytes to the serial console.
+    fn write(&self, _offset: usize, buf: &[u8]) -> Result<usize, DeviceError> {
+        self.device.write(_offset, buf)
+    }
+}
+
+/// Create and initialise a `SerialConsoleDevice` for the given COM port number
+/// (1-based: `1` → COM1 / `ttyS0`, `2` → COM2 / `ttyS1`).
+/// Returns `None` if the port number is out of range or UART init fails.
+pub fn make_console(port_num: u8) -> Option<SerialConsoleDevice> {
+    make(port_num).map(SerialConsoleDevice::new)
 }
 
 /// Create and initialise a `SerialPortDevice` for the given COM port number

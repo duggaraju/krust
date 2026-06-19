@@ -74,14 +74,20 @@ impl Device for PtyManagerDevice {
         // echo bytes take priority
         while n < buf.len() {
             match shared.echo_to_mgr.pop_front() {
-                Some(b) => { buf[n] = b; n += 1; }
+                Some(b) => {
+                    buf[n] = b;
+                    n += 1;
+                }
                 None => break,
             }
         }
         // then application output
         while n < buf.len() {
             match shared.sub_to_mgr.pop_front() {
-                Some(b) => { buf[n] = b; n += 1; }
+                Some(b) => {
+                    buf[n] = b;
+                    n += 1;
+                }
                 None => break,
             }
         }

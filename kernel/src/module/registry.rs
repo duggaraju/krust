@@ -44,7 +44,10 @@ impl ModuleRegistry {
         // Clear any previous failure so callers can retry a failed module by
         // submitting a fresh Arc (e.g. after fixing a device state).
         if self.failed_modules.remove(name) {
-            info!("module '{}' previously failed; clearing failure state for retry", name);
+            info!(
+                "module '{}' previously failed; clearing failure state for retry",
+                name
+            );
         }
 
         self.known_modules

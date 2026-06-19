@@ -7,7 +7,8 @@
 //!   - ICANON: accumulate bytes into a line buffer; flush to the read queue on `\n`.
 //!   - ERASE:  backspace (0x08) / DEL (0x7f) removes the last character from the line buffer.
 //!   - ECHO:   each accepted byte is echoed; ERASE emits `\x08 \x08`.
-//!   - ISIG:   Ctrl-C (0x03) discards the current line buffer and echoes `^C\n`.
+//!   - ISIG:   Ctrl-C (0x03) sends SIGTERM to the current task.
+//!   - Ctrl-P/Ctrl-N pass through immediately (used for shell history up/down).
 //!
 //! Output processing (`process_output`):
 //!   - ONLCR:  map `\n` → `\r\n` before sending downstream.
@@ -35,7 +36,7 @@ pub struct LineDiscipline {
     pub onlcr: bool,
     /// Input: translate `\r` → `\n`.
     pub icrnl: bool,
-    /// Input: Ctrl-C sends interrupt (discard line, echo `^C`).
+    /// Input: Ctrl-C sends signal (discard line, echo `^C`).
     pub isig: bool,
 
     // ── buffers ───────────────────────────────────────────────────────────────
@@ -67,7 +68,11 @@ impl LineDiscipline {
     /// (e.g. the screen or the PTY manager's read channel).  The caller is
     /// responsible for delivering any echo bytes to the appropriate sink.
     pub fn process_input(&mut self, byte: u8) -> EchoBytes {
-        let byte = if self.icrnl && byte == b'\r' { b'\n' } else { byte };
+        let byte = if self.icrnl && byte == b'\r' {
+            b'\n'
+        } else {
+            byte
+        };
 
         if !self.canonical {
             self.read_queue.push_back(byte);
@@ -79,6 +84,13 @@ impl LineDiscipline {
 
         // ── Canonical mode ────────────────────────────────────────────────────
         match byte {
+            // Shell history navigation controls (Ctrl-P / Ctrl-N) are queued
+            // immediately so interactive line editors can react before newline.
+            0x10 | 0x0e => {
+                self.read_queue.push_back(byte);
+                return EchoBytes::None;
+            }
+
             // ERASE — backspace / DEL
             0x08 | 0x7f => {
                 if self.canon_buf.pop().is_some() && self.echo {
@@ -87,7 +99,7 @@ impl LineDiscipline {
                 return EchoBytes::None;
             }
 
-            // INTR — Ctrl-C
+            // INTR — Ctrl-C: send SIGTERM
             0x03 if self.isig => {
                 self.canon_buf.clear();
                 if self.echo {
@@ -166,6 +178,25 @@ impl Default for LineDiscipline {
     }
 }
 
+// ── Signal response ───────────────────────────────────────────────────────────
+
+/// Signal detected during input processing.
+/// Maps to kernel Signal enum via `to_kernel_signal()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Signal {
+    /// SIGTERM from Ctrl-C (user interrupt)
+    Sigterm,
+}
+
+impl Signal {
+    /// Convert to kernel signal type
+    pub fn to_kernel_signal(&self) -> crate::process::task::Signal {
+        match self {
+            Signal::Sigterm => crate::process::task::Signal::Sigterm,
+        }
+    }
+}
+
 // ── Echo response ─────────────────────────────────────────────────────────────
 
 /// What the caller should echo back after a single `process_input` call.
@@ -192,6 +223,14 @@ impl EchoBytes {
             EchoBytes::Erase => sink(b"\x1b[D \x1b[D"),
             EchoBytes::CtrlC => sink(b"^C\n"),
             EchoBytes::KillLine => sink(b"^U\n"),
+        }
+    }
+
+    /// Extract signal from echo bytes if one was generated.
+    pub fn signal(&self) -> Option<Signal> {
+        match self {
+            EchoBytes::CtrlC => Some(Signal::Sigterm),
+            _ => None,
         }
     }
 }

@@ -24,10 +24,7 @@ pub trait KernelRegistry: Send + Sync {
     fn unregister_filesystem_factory(&self, name: &str) -> Result<(), ModuleError>;
 
     #[cfg(feature = "drivers")]
-    fn register_bus(
-        &self,
-        bus: Arc<dyn crate::drivers::traits::Bus>,
-    ) -> Result<(), ModuleError>;
+    fn register_bus(&self, bus: Arc<dyn crate::drivers::traits::Bus>) -> Result<(), ModuleError>;
 
     #[cfg(feature = "drivers")]
     fn unregister_bus(&self, name: &str) -> Result<(), ModuleError>;

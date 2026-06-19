@@ -6,6 +6,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 use core::str;
 
 #[cfg(feature = "drivers")]
@@ -42,6 +43,7 @@ impl FileOpenMode {
 
 #[derive(Debug, Clone, Copy)]
 pub struct FileDescriptor {
+    pub fs_id: u64,
     pub major: u16,
     pub minor: u16,
     pub inode: u64,
@@ -104,6 +106,9 @@ impl<'a> DirEntry<'a> {
 pub trait FileSystem: Send + Sync {
     fn name(&self) -> &str;
     fn root_inode(&self) -> Arc<dyn Inode>;
+    fn fs_id(&self) -> u64 {
+        0
+    }
     fn ioctl(&self, _request: usize, _arg: usize) -> Result<usize, FsError> {
         Err(FsError::NotSupported)
     }
@@ -130,6 +135,23 @@ pub trait Inode: Send + Sync {
     fn create(&self, name: &str, file_type: FileType) -> Result<Arc<dyn Inode>, FsError>;
     fn file_type(&self) -> FileType;
     fn size(&self) -> usize;
+    fn uid(&self) -> u32 {
+        0
+    }
+    fn gid(&self) -> u32 {
+        0
+    }
+    fn mode(&self) -> u16 {
+        match self.file_type() {
+            FileType::Directory => 0o755,
+            FileType::CharDevice | FileType::BlockDevice => 0o660,
+            FileType::Symlink => 0o777,
+            FileType::Regular => 0o644,
+        }
+    }
+    fn fs_id(&self) -> u64 {
+        0
+    }
     fn filesystem_name(&self) -> &'static str {
         "unknown"
     }
@@ -161,9 +183,10 @@ pub trait File: Send + Sync {
 
 static FILESYSTEM_MANAGER: Once<Mutex<FileSystemManager>> = Once::new();
 pub const DEFAULT_SYMLINK_RESOLUTION_LIMIT: usize = 10;
-type InodeTuple = (u16, u16, u64);
+type InodeTuple = (u64, u16, u16, u64);
 static INODE_TUPLE_INDEX: Once<Mutex<BTreeMap<InodeTuple, Arc<dyn Inode>>>> = Once::new();
 static INODE_REF_COUNTS: Once<Mutex<BTreeMap<InodeTuple, usize>>> = Once::new();
+static NEXT_FILESYSTEM_ID: AtomicU64 = AtomicU64::new(1);
 
 fn filesystem_manager() -> &'static Mutex<FileSystemManager> {
     FILESYSTEM_MANAGER.call_once(|| Mutex::new(FileSystemManager::new()))
@@ -191,6 +214,10 @@ pub fn root_fs() -> Result<Arc<dyn FileSystem>, FsError> {
     filesystem_manager().lock().root_fs()
 }
 
+pub fn filesystem_by_id(fs_id: u64) -> Result<Arc<dyn FileSystem>, FsError> {
+    filesystem_manager().lock().filesystem_by_id(fs_id)
+}
+
 pub fn root_inode() -> Result<Arc<dyn Inode>, FsError> {
     filesystem_manager().lock().root_inode()
 }
@@ -207,6 +234,78 @@ pub fn unmount(path: &str) -> Result<(), FsError> {
 
 pub fn lookup_path(path: &str) -> Result<Arc<dyn Inode>, FsError> {
     lookup_path_with_options(path, false)
+}
+
+/// Resolve all symlinks in `path` and return the canonical absolute path string.
+///
+/// Unlike `lookup_path_with_options`, this returns the *path* rather than the inode,
+/// which lets callers (e.g. `execve`) use the resolved path for loading while
+/// keeping the original path for user-visible purposes (argv, AT_EXECFN).
+pub fn resolve_symlink_path(path: &str) -> Result<String, FsError> {
+    let normalized = normalize_absolute_path(path)?;
+    let mut followed_symlinks = 0usize;
+    let max_follows = DEFAULT_SYMLINK_RESOLUTION_LIMIT;
+    let mut current_path = normalized;
+
+    loop {
+        let segments: Vec<&str> = split_segments(current_path.as_str()).collect();
+        let mut restarted = false;
+
+        for index in 0..segments.len() {
+            let prefix = join_absolute_segments(&segments[..=index]);
+            let inode = lookup_path_without_symlink_resolution(prefix.as_str())?;
+            if inode.file_type() != FileType::Symlink {
+                continue;
+            }
+
+            if followed_symlinks >= max_follows {
+                return Err(FsError::NotSupported);
+            }
+            followed_symlinks = followed_symlinks.saturating_add(1);
+
+            let target = read_symlink_target(inode.as_ref())?;
+            let parent = if index == 0 {
+                String::from("/")
+            } else {
+                join_absolute_segments(&segments[..index])
+            };
+            let suffix = if index + 1 < segments.len() {
+                join_relative_segments(&segments[index + 1..])
+            } else {
+                String::new()
+            };
+
+            let mut expanded = if target.starts_with('/') {
+                target
+            } else if parent == "/" {
+                let mut combined = String::from("/");
+                combined.push_str(target.as_str());
+                combined
+            } else {
+                let mut combined = parent;
+                if !combined.ends_with('/') {
+                    combined.push('/');
+                }
+                combined.push_str(target.as_str());
+                combined
+            };
+
+            if !suffix.is_empty() {
+                if !expanded.ends_with('/') {
+                    expanded.push('/');
+                }
+                expanded.push_str(suffix.as_str());
+            }
+
+            current_path = normalize_absolute_path(expanded.as_str())?;
+            restarted = true;
+            break;
+        }
+
+        if !restarted {
+            return Ok(current_path);
+        }
+    }
 }
 
 pub fn lookup_path_with_options(
@@ -371,19 +470,28 @@ pub fn write_u64_decimal_into<'a>(value: u64, name_buf: &'a mut [u8]) -> Result<
     str::from_utf8(&name_buf[..len]).map_err(|_| FsError::IoError)
 }
 
-pub fn lookup_inode_by_tuple(major: u16, minor: u16, ino: u64) -> Option<Arc<dyn Inode>> {
-    inode_tuple_index().lock().get(&(major, minor, ino)).cloned()
+pub fn lookup_inode_by_tuple(fs_id: u64, major: u16, minor: u16, ino: u64) -> Option<Arc<dyn Inode>> {
+    inode_tuple_index()
+        .lock()
+        .get(&(fs_id, major, minor, ino))
+        .cloned()
 }
 
 pub fn open_by_descriptor(descriptor: FileDescriptor) -> Result<OpenFile, FsError> {
-    let inode = lookup_inode_by_tuple(descriptor.major, descriptor.minor, descriptor.inode)
-        .ok_or(FsError::NotFound)?;
+    let inode = lookup_inode_by_tuple(
+        descriptor.fs_id,
+        descriptor.major,
+        descriptor.minor,
+        descriptor.inode,
+    )
+    .ok_or(FsError::NotFound)?;
     OpenFile::new(inode, None)
 }
 
 fn tuple_for_inode(inode: &dyn Inode) -> InodeTuple {
+    let fs_id = inode.fs_id();
     let (major, minor) = inode.device_numbers().unwrap_or((0, 0));
-    (major, minor, inode.ino())
+    (fs_id, major, minor, inode.ino())
 }
 
 struct ResolvedInode {
@@ -405,15 +513,28 @@ impl FileSystemManager {
     }
 
     fn mount_root(&mut self, fs: Arc<dyn FileSystem>) -> Result<(), FsError> {
-        if self.root.is_some() {
-            return Err(FsError::AlreadyExists);
-        }
+        // Allow replacing the bootstrap root (e.g. ramfs) with a runtime root
+        // filesystem (e.g. FAT/ext4) during late mount registration.
         self.root = Some(fs);
         Ok(())
     }
 
     fn root_fs(&self) -> Result<Arc<dyn FileSystem>, FsError> {
         self.root.as_ref().cloned().ok_or(FsError::NotFound)
+    }
+
+    fn filesystem_by_id(&self, fs_id: u64) -> Result<Arc<dyn FileSystem>, FsError> {
+        if let Some(root) = self.root.as_ref() {
+            if root.fs_id() == fs_id {
+                return Ok(Arc::clone(root));
+            }
+        }
+        for mount in &self.mounts {
+            if mount.fs.fs_id() == fs_id {
+                return Ok(Arc::clone(&mount.fs));
+            }
+        }
+        Err(FsError::NotFound)
     }
 
     fn root_inode(&self) -> Result<Arc<dyn Inode>, FsError> {
@@ -637,7 +758,11 @@ pub struct OpenFile {
 impl OpenFile {
     pub fn new(inode: Arc<dyn Inode>, mount_path: Option<String>) -> Result<Self, FsError> {
         let key = tuple_for_inode(inode.as_ref());
-        let filesystem = crate::fs::filesystem(inode.filesystem_name())?;
+        let filesystem = match inode.fs_id() {
+            0 => crate::fs::filesystem(inode.filesystem_name())?,
+            fs_id => filesystem_by_id(fs_id)
+                .or_else(|_| crate::fs::filesystem(inode.filesystem_name()))?,
+        };
         let mut file = Self {
             inode,
             cursor: 0,
@@ -692,6 +817,7 @@ impl OpenFile {
     pub fn descriptor(&self, mode: FileOpenMode) -> FileDescriptor {
         let (major, minor) = self.inode.device_numbers().unwrap_or((0, 0));
         FileDescriptor {
+            fs_id: self.inode.fs_id(),
             major,
             minor,
             inode: self.inode.ino(),
@@ -860,6 +986,10 @@ fn apply_signed_offset(base: usize, delta: isize) -> Result<usize, FsError> {
         base.checked_sub(delta.unsigned_abs())
             .ok_or(FsError::IoError)
     }
+}
+
+pub fn allocate_filesystem_id() -> u64 {
+    NEXT_FILESYSTEM_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 #[cfg(feature = "drivers")]

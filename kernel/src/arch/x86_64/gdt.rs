@@ -22,6 +22,8 @@ static TSS: LazyLock<TaskStateSegment> = LazyLock::new(|| {
 struct Selectors {
     code_selector: SegmentSelector,
     data_selector: SegmentSelector,
+    user_data_selector: SegmentSelector,
+    user_code_selector: SegmentSelector,
     tss_selector: SegmentSelector,
 }
 
@@ -29,6 +31,8 @@ static GDT: LazyLock<(GlobalDescriptorTable, Selectors)> = LazyLock::new(|| {
     let mut gdt = GlobalDescriptorTable::new();
     let code_selector = gdt.append(Descriptor::kernel_code_segment());
     let data_selector = gdt.append(Descriptor::kernel_data_segment());
+    let user_data_selector = gdt.append(Descriptor::user_data_segment());
+    let user_code_selector = gdt.append(Descriptor::user_code_segment());
     let tss_selector = gdt.append(Descriptor::tss_segment(&TSS));
 
     (
@@ -36,6 +40,8 @@ static GDT: LazyLock<(GlobalDescriptorTable, Selectors)> = LazyLock::new(|| {
         Selectors {
             code_selector,
             data_selector,
+            user_data_selector,
+            user_code_selector,
             tss_selector,
         },
     )
@@ -52,5 +58,28 @@ pub fn init() {
         ES::set_reg(selectors.data_selector);
         SS::set_reg(selectors.data_selector);
         load_tss(selectors.tss_selector);
+    }
+}
+
+pub fn user_code_selector() -> SegmentSelector {
+    GDT.1.user_code_selector
+}
+
+pub fn user_data_selector() -> SegmentSelector {
+    GDT.1.user_data_selector
+}
+
+pub fn kernel_code_selector() -> SegmentSelector {
+    GDT.1.code_selector
+}
+
+pub fn kernel_data_selector() -> SegmentSelector {
+    GDT.1.data_selector
+}
+
+pub fn set_tss_rsp0(rsp: u64) {
+    unsafe {
+        let tss = &*TSS as *const TaskStateSegment as *mut TaskStateSegment;
+        (*tss).privilege_stack_table[0] = VirtAddr::new(rsp);
     }
 }

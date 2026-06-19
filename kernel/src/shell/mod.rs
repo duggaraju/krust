@@ -25,9 +25,10 @@ pub fn run() -> ShellExitReason {
     console.write_str(PROMPT);
 
     loop {
-        let line = console.read_line();
+        let line = console.read_line(PROMPT);
         debug!("shell: received line len={} value={:?}", line.len(), line);
         if !line.is_empty() {
+            console.push_history(&line);
             debug!("shell: dispatching command {:?}", line);
             let keep_running = commands::dispatch(&line, &mut console);
             debug!("shell: command completed");

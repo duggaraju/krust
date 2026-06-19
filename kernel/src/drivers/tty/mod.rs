@@ -6,6 +6,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
+use ansi_parser::{AnsiParser, Output};
 use log::info;
 use pc_keyboard::{
     DecodedKey, HandleControl, KeyCode, KeyState, PS2Keyboard, ScancodeSet1, layouts,
@@ -13,14 +14,15 @@ use pc_keyboard::{
 use spin::{Mutex, Once};
 use x86_64::instructions::port::Port;
 
+use crate::drivers::char::ldisc::LineDiscipline;
 use crate::drivers::registry;
 use crate::drivers::traits::{Device, DeviceError, DeviceType};
-use crate::drivers::char::ldisc::LineDiscipline;
 use crate::process::task::ControllingTerminal;
 
 const PS2_STATUS_PORT: u16 = 0x64;
 const PS2_DATA_PORT: u16 = 0x60;
 const MAX_SCREEN_BYTES: usize = 16 * 1024;
+const VISIBLE_LINES: usize = 25;
 
 /// The last virtual console is reserved for kernel log output.
 /// Shell VCs start at 0; log VC is always the highest-indexed one.
@@ -65,6 +67,7 @@ fn manager() -> &'static Mutex<TtyManager> {
 struct VirtualConsole {
     ldisc: LineDiscipline,
     screen: String,
+    pending_output: Vec<u8>,
 }
 
 impl VirtualConsole {
@@ -72,6 +75,7 @@ impl VirtualConsole {
         Self {
             ldisc: LineDiscipline::new(),
             screen: String::new(),
+            pending_output: Vec::new(),
         }
     }
 
@@ -80,18 +84,8 @@ impl VirtualConsole {
         // the screen buffer for framebuffer rendering.
         let mut processed = alloc::vec::Vec::new();
         self.ldisc.process_output(bytes, &mut processed);
-        for &byte in &processed {
-            match byte {
-                b'\r' => {}
-                b'\n' => self.screen.push('\n'),
-                0x08 | 0x7f => { let _ = self.screen.pop(); }
-                _ => self.screen.push(byte as char),
-            }
-        }
-        if self.screen.len() > MAX_SCREEN_BYTES {
-            let trim = self.screen.len() - MAX_SCREEN_BYTES;
-            self.screen.drain(..trim);
-        }
+        self.pending_output.extend_from_slice(&processed);
+        self.consume_pending_output();
     }
 
     fn push_raw_output(&self, bytes: &[u8]) -> alloc::vec::Vec<u8> {
@@ -99,11 +93,143 @@ impl VirtualConsole {
         self.ldisc.process_output(bytes, &mut processed);
         processed
     }
+
+    fn consume_pending_output(&mut self) {
+        const CLEAR_SCREEN: &[u8] = b"\x1b[2J";
+        const CURSOR_HOME: &[u8] = b"\x1b[H";
+        const ERASE_LEFT: &[u8] = b"\x1b[D \x1b[D";
+
+        let mut consumed = 0usize;
+        while consumed < self.pending_output.len() {
+            let remaining = &self.pending_output[consumed..];
+
+            if remaining.starts_with(CLEAR_SCREEN) {
+                self.screen.clear();
+                consumed += CLEAR_SCREEN.len();
+                continue;
+            } else if CLEAR_SCREEN.starts_with(remaining) {
+                break;
+            }
+
+            if remaining.starts_with(CURSOR_HOME) {
+                consumed += CURSOR_HOME.len();
+                continue;
+            } else if CURSOR_HOME.starts_with(remaining) {
+                break;
+            }
+
+            if remaining.starts_with(ERASE_LEFT) {
+                let _ = self.screen.pop();
+                consumed += ERASE_LEFT.len();
+                continue;
+            } else if ERASE_LEFT.starts_with(remaining) {
+                break;
+            }
+
+            let parse_len = complete_terminal_prefix_len(remaining);
+            if parse_len == 0 {
+                break;
+            }
+            let parse_slice = &remaining[..parse_len];
+            if let Ok(text) = core::str::from_utf8(parse_slice) {
+                for block in text.ansi_parse() {
+                    if let Output::TextBlock(text) = block {
+                        for byte in text.bytes() {
+                            match byte {
+                                b'\n' => self.screen.push('\n'),
+                                b'\r' => {}
+                                0x08 | 0x7f => {
+                                    let _ = self.screen.pop();
+                                }
+                                byte => self.screen.push(byte as char),
+                            }
+                        }
+                    }
+                }
+                consumed += parse_len;
+            } else {
+                // Keep non-UTF8 output visible rather than stalling parsing.
+                self.screen.push(remaining[0] as char);
+                consumed += 1;
+            }
+        }
+
+        if consumed > 0 {
+            self.pending_output.drain(..consumed);
+        }
+
+        if self.screen.len() > MAX_SCREEN_BYTES {
+            let trim = self.screen.len() - MAX_SCREEN_BYTES;
+            self.screen.drain(..trim);
+        }
+    }
+
+    fn redraw(&self) {
+        if crate::drivers::video::is_initialized() {
+            crate::drivers::video::render_text(&self.visible_text());
+        }
+    }
+
+    fn visible_text(&self) -> String {
+        let mut lines: Vec<&str> = self.screen.lines().collect();
+        if lines.is_empty() {
+            return String::new();
+        }
+
+        let start = lines.len().saturating_sub(VISIBLE_LINES);
+        lines.drain(..start);
+        lines.join("\n")
+    }
+
+    fn should_use_viewport(&self) -> bool {
+        self.screen.lines().count() > VISIBLE_LINES
+    }
+
+    fn needs_full_redraw(processed: &[u8]) -> bool {
+        processed
+            .iter()
+            .any(|byte| matches!(byte, 0x08 | 0x7f | 0x1b))
+    }
+}
+
+fn complete_terminal_prefix_len(bytes: &[u8]) -> usize {
+    let Some(esc_idx) = bytes.iter().rposition(|&byte| byte == 0x1b) else {
+        return bytes.len();
+    };
+
+    if esc_idx + 1 >= bytes.len() {
+        return esc_idx;
+    }
+
+    match bytes[esc_idx + 1] {
+        b'[' => {
+            for &byte in &bytes[esc_idx + 2..] {
+                if (b'@'..=b'~').contains(&byte) {
+                    return bytes.len();
+                }
+            }
+            esc_idx
+        }
+        b']' | b'P' | b'^' | b'_' => {
+            let mut i = esc_idx + 2;
+            while i < bytes.len() {
+                match bytes[i] {
+                    0x07 => return bytes.len(),
+                    0x1b if i + 1 < bytes.len() && bytes[i + 1] == b'\\' => return bytes.len(),
+                    _ => {}
+                }
+                i += 1;
+            }
+            esc_idx
+        }
+        _ => bytes.len(),
+    }
 }
 
 pub struct TtyManager {
     vcs: Vec<VirtualConsole>,
     active: usize,
+    ctrl_down: bool,
     alt_down: bool,
 }
 
@@ -116,6 +242,7 @@ impl TtyManager {
         Self {
             vcs,
             active: 0,
+            ctrl_down: false,
             alt_down: false,
         }
     }
@@ -138,10 +265,16 @@ impl TtyManager {
             if SERIAL_ECHO.load(Ordering::Relaxed) {
                 write_serial_bytes(&processed);
             }
-            if crate::drivers::video::is_initialized() {
-                if let Ok(text) = core::str::from_utf8(&processed) {
-                    crate::drivers::video::write_str(text);
-                }
+            if !crate::drivers::video::is_initialized() {
+                log::debug!("tty: framebuffer not initialized; skipping paint");
+            } else if self.vcs[index].should_use_viewport()
+                || VirtualConsole::needs_full_redraw(&processed)
+            {
+                self.vcs[index].redraw();
+            } else if let Ok(text) = core::str::from_utf8(&processed) {
+                crate::drivers::video::write_str(text);
+            } else {
+                self.vcs[index].redraw();
             }
         }
     }
@@ -149,6 +282,12 @@ impl TtyManager {
     fn queue_input_for_active(&mut self, byte: u8) {
         let echo = self.vcs[self.active].ldisc.process_input(byte);
         let active = self.active;
+
+        // Check if a signal was generated (e.g., Ctrl-C)
+        if let Some(ldisc_signal) = echo.signal() {
+            Self::deliver_signal(ldisc_signal.to_kernel_signal());
+        }
+
         // Deliver echo to the active VC's own output sink.
         echo.emit(|bytes| {
             let processed = self.vcs[active].push_raw_output(bytes);
@@ -156,11 +295,24 @@ impl TtyManager {
             if SERIAL_ECHO.load(Ordering::Relaxed) {
                 write_serial_bytes(&processed);
             }
-            if crate::drivers::video::is_initialized() {
-                if let Ok(text) = core::str::from_utf8(&processed) {
-                    crate::drivers::video::write_str(text);
-                }
+            if !crate::drivers::video::is_initialized() {
+                return;
             }
+            if self.vcs[active].should_use_viewport()
+                || VirtualConsole::needs_full_redraw(&processed)
+            {
+                self.vcs[active].redraw();
+            } else if let Ok(text) = core::str::from_utf8(&processed) {
+                crate::drivers::video::write_str(text);
+            } else {
+                self.vcs[active].redraw();
+            }
+        });
+    }
+
+    fn deliver_signal(signal: crate::process::task::Signal) {
+        let _ = crate::process::with_current_task_mut(|task| {
+            task.deliver_signal(signal);
         });
     }
 
@@ -168,15 +320,16 @@ impl TtyManager {
         self.alt_down = down;
     }
 
+    fn set_ctrl_key(&mut self, down: bool) {
+        self.ctrl_down = down;
+    }
+
     fn switch_to(&mut self, index: usize) {
         if index >= self.vcs.len() || index == self.active {
             return;
         }
         self.active = index;
-        if crate::drivers::video::is_initialized() {
-            crate::drivers::video::clear();
-            crate::drivers::video::write_str(&self.vcs[index].screen);
-        }
+        self.vcs[index].redraw();
         let message = format!("[tty{}]\n", index);
         if SERIAL_ECHO.load(Ordering::Relaxed) {
             write_serial_bytes(message.as_bytes());
@@ -184,7 +337,7 @@ impl TtyManager {
     }
 
     fn maybe_switch_from_key(&mut self, code: KeyCode, state: KeyState) -> bool {
-        if !is_key_press(state) || !self.alt_down {
+        if !is_key_press(state) || !self.ctrl_down || !self.alt_down {
             return false;
         }
 
@@ -241,6 +394,9 @@ fn poll_input() {
         if let Ok(Some(key_event)) = keyboard.add_byte(scancode) {
             let code = key_event.code;
             let state = key_event.state;
+            if matches!(code, KeyCode::LControl | KeyCode::RControl) {
+                mgr.set_ctrl_key(is_key_press(state));
+            }
             if matches!(code, KeyCode::LAlt | KeyCode::RAltGr) {
                 mgr.set_alt_key(is_key_press(state));
             }
@@ -254,10 +410,11 @@ fn poll_input() {
                         mgr.queue_input_for_active(ch as u8);
                     }
                     DecodedKey::RawKey(KeyCode::Return)
-                    | DecodedKey::RawKey(KeyCode::NumpadEnter) => {
-                        mgr.queue_input_for_active(b'\n')
-                    }
+                    | DecodedKey::RawKey(KeyCode::NumpadEnter) => mgr.queue_input_for_active(b'\n'),
                     DecodedKey::RawKey(KeyCode::Backspace) => mgr.queue_input_for_active(0x08),
+                    // Shell line editor history navigation (Ctrl-P / Ctrl-N).
+                    DecodedKey::RawKey(KeyCode::ArrowUp) => mgr.queue_input_for_active(0x10),
+                    DecodedKey::RawKey(KeyCode::ArrowDown) => mgr.queue_input_for_active(0x0e),
                     _ => {}
                 }
             }
@@ -300,8 +457,12 @@ pub fn tty_write_log(bytes: &[u8]) {
     mgr.vcs[log_vc].push_output(bytes);
     // Only paint to framebuffer if the log VC is currently active
     if log_vc == active && crate::drivers::video::is_initialized() {
-        if let Ok(text) = core::str::from_utf8(&processed) {
+        if mgr.vcs[log_vc].should_use_viewport() || VirtualConsole::needs_full_redraw(&processed) {
+            mgr.vcs[log_vc].redraw();
+        } else if let Ok(text) = core::str::from_utf8(&processed) {
             crate::drivers::video::write_str(text);
+        } else {
+            mgr.vcs[log_vc].redraw();
         }
     }
 }
@@ -372,11 +533,7 @@ impl Device for TtyDevice {
         }
     }
 
-    fn seek(
-        &self,
-        _current: usize,
-        _pos: crate::fs::vfs::SeekFrom,
-    ) -> Result<usize, DeviceError> {
+    fn seek(&self, _current: usize, _pos: crate::fs::vfs::SeekFrom) -> Result<usize, DeviceError> {
         Err(DeviceError::NotSupported)
     }
 }
@@ -399,11 +556,7 @@ impl Device for VirtualConsoleDevice {
         Ok(buf.len())
     }
 
-    fn seek(
-        &self,
-        _current: usize,
-        _pos: crate::fs::vfs::SeekFrom,
-    ) -> Result<usize, DeviceError> {
+    fn seek(&self, _current: usize, _pos: crate::fs::vfs::SeekFrom) -> Result<usize, DeviceError> {
         Err(DeviceError::NotSupported)
     }
 }

@@ -2,6 +2,8 @@ extern crate alloc;
 
 #[cfg(feature = "drivers")]
 pub mod devfs;
+#[cfg(feature = "fs-ext4")]
+pub mod ext4fs;
 pub mod fat;
 pub mod initrd;
 #[cfg(feature = "process")]
@@ -31,6 +33,7 @@ pub trait FileSystemFactory: Send + Sync {
         &self,
         mountpoint: Arc<dyn Inode>,
         device: Option<MountBlockDevice>,
+        options: &MountOptions,
     ) -> Result<Arc<dyn FileSystem>, FsError>;
 
     fn unmount(
@@ -49,6 +52,12 @@ pub fn init() {
     {
         let _ = register_filesystem_factory("fatfs", Arc::new(fat::FatFsFactory));
         log::info!("registered fatfs filesystem factory");
+    }
+
+    #[cfg(all(feature = "fs-ext4", feature = "drivers"))]
+    {
+        let _ = register_filesystem_factory("ext4", Arc::new(ext4fs::Ext4FsFactory));
+        log::info!("registered ext4 filesystem factory");
     }
 }
 
@@ -77,13 +86,64 @@ impl MountDevice {
 #[derive(Clone, Copy)]
 pub struct MountOptions {
     pub create_mountpoint_if_missing: bool,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+#[derive(Clone, Default)]
+pub struct MountOptionPairs {
+    values: BTreeMap<String, String>,
+}
+
+impl MountOptionPairs {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set(mut self, name: &str, value: &str) -> Self {
+        self.values.insert(name.to_string(), value.to_string());
+        self
+    }
+
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.values.get(name).map(|value| value.as_str())
+    }
+
+    pub fn get_u32(&self, name: &str) -> Option<u32> {
+        self.get(name)?.parse::<u32>().ok()
+    }
+
+    pub fn get_bool(&self, name: &str) -> Option<bool> {
+        match self.get(name)? {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        }
+    }
 }
 
 impl Default for MountOptions {
     fn default() -> Self {
         Self {
             create_mountpoint_if_missing: true,
+            uid: 0,
+            gid: 0,
         }
+    }
+}
+
+impl MountOptions {
+    pub fn with_pairs(mut self, pairs: &MountOptionPairs) -> Self {
+        if let Some(create_mountpoint_if_missing) = pairs.get_bool("create_mountpoint_if_missing") {
+            self.create_mountpoint_if_missing = create_mountpoint_if_missing;
+        }
+        if let Some(uid) = pairs.get_u32("uid") {
+            self.uid = uid;
+        }
+        if let Some(gid) = pairs.get_u32("gid") {
+            self.gid = gid;
+        }
+        self
     }
 }
 
@@ -180,6 +240,7 @@ fn filesystem_from_factory(
     name: &str,
     mountpoint: Arc<dyn Inode>,
     device: Option<MountBlockDevice>,
+    options: &MountOptions,
 ) -> Result<Arc<dyn FileSystem>, FsError> {
     let factory = {
         let table = filesystem_table().lock();
@@ -187,7 +248,7 @@ fn filesystem_from_factory(
     }
     .ok_or(FsError::NotFound)?;
 
-    factory.mount(mountpoint, device)
+    factory.mount(mountpoint, device, options)
 }
 
 pub fn unregister_filesystem(name: &str) -> Result<(), FsError> {
@@ -217,19 +278,19 @@ pub fn unregister_filesystem(name: &str) -> Result<(), FsError> {
 }
 
 pub fn register_mount(path: &str, filesystem: &str, device: MountDevice) -> Result<(), FsError> {
-    register_mount_with_options(path, filesystem, device, MountOptions::default())
+    register_mount_with_options(path, filesystem, device, MountOptionPairs::default())
 }
 
 pub fn register_mount_with_options(
     path: &str,
     filesystem: &str,
     device: MountDevice,
-    options: MountOptions,
+    option_pairs: MountOptionPairs,
 ) -> Result<(), FsError> {
     let normalized = self::vfs::normalize_absolute_path(path)?;
     let mut table = mount_table().lock();
 
-    if table.pending.iter().any(|entry| entry.path == normalized) {
+    if normalized != "/" && table.pending.iter().any(|entry| entry.path == normalized) {
         return Err(FsError::AlreadyExists);
     }
 
@@ -237,7 +298,7 @@ pub fn register_mount_with_options(
         path: normalized,
         filesystem: filesystem.to_string(),
         device,
-        options,
+        options: MountOptions::default().with_pairs(&option_pairs),
     });
     Ok(())
 }
@@ -256,11 +317,21 @@ pub fn mount_registered_filesystems() -> Result<(), FsError> {
         );
 
         if matches!(entry.device, MountDevice::None) {
-            log::trace!("mount: '{}' requested without explicit device binding", entry.path);
+            log::trace!(
+                "mount: '{}' requested without explicit device binding",
+                entry.path
+            );
         }
 
         if entry.path != "/" && entry.options.create_mountpoint_if_missing {
-            ensure_directory_path(&entry.path)?;
+            if let Err(err) = ensure_directory_path(&entry.path) {
+                log::warn!(
+                    "mount: failed to create mountpoint '{}': {:?}",
+                    entry.path,
+                    err
+                );
+                continue;
+            }
         }
 
         let mountpoint = if entry.path == "/" {
@@ -269,48 +340,101 @@ pub fn mount_registered_filesystems() -> Result<(), FsError> {
                 Err(_) => None,
             }
         } else {
-            Some(self::vfs::lookup_path(entry.path.as_str())?)
-        };
-
-        let fs = match filesystem(entry.filesystem.as_str()) {
-            Ok(fs) => fs,
-            Err(FsError::NotFound) => match filesystem_from_factory(
-                entry.filesystem.as_str(),
-                mountpoint.clone().ok_or(FsError::NotFound)?,
-                resolve_mount_block_device(&entry.device)?,
-            ) {
-                Ok(fs) => fs,
-                Err(FsError::NotFound) => {
-                    log::warn!(
-                        "mount: skipping '{}' -> '{}' (filesystem or device not present)",
-                        entry.path,
-                        entry.filesystem
-                    );
-                    continue;
-                }
+            match self::vfs::lookup_path(entry.path.as_str()) {
+                Ok(inode) => Some(inode),
                 Err(err) => {
                     log::warn!(
-                        "mount: skipping '{}' -> '{}' (mount failed: {:?})",
+                        "mount: failed to lookup mountpoint '{}': {:?}",
                         entry.path,
-                        entry.filesystem,
                         err
                     );
                     continue;
                 }
-            },
-            Err(err) => return Err(err),
+            }
         };
-        if entry.path == "/" {
-            self::vfs::mount_root(fs)?;
+
+        let fs = match filesystem(entry.filesystem.as_str()) {
+            Ok(fs) => fs,
+            Err(FsError::NotFound) => {
+                // Try to create filesystem from factory
+                let mountpoint = mountpoint.ok_or(FsError::NotFound);
+                let block_device = resolve_mount_block_device(&entry.device);
+
+                match (mountpoint, block_device) {
+                    (Ok(mp), Ok(bd)) => {
+                        match filesystem_from_factory(
+                            entry.filesystem.as_str(),
+                            mp,
+                            bd,
+                            &entry.options,
+                        ) {
+                            Ok(fs) => fs,
+                            Err(FsError::NotFound) => {
+                                log::warn!(
+                                    "mount: skipping '{}' -> '{}' (filesystem or device not present)",
+                                    entry.path,
+                                    entry.filesystem
+                                );
+                                continue;
+                            }
+                            Err(err) => {
+                                log::warn!(
+                                    "mount: skipping '{}' -> '{}' (mount failed: {:?})",
+                                    entry.path,
+                                    entry.filesystem,
+                                    err
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                    _ => {
+                        log::warn!(
+                            "mount: skipping '{}' -> '{}' (failed to resolve mountpoint or device)",
+                            entry.path,
+                            entry.filesystem
+                        );
+                        continue;
+                    }
+                }
+            }
+            Err(err) => {
+                log::warn!(
+                    "mount: skipping '{}' -> '{}' (filesystem not found: {:?})",
+                    entry.path,
+                    entry.filesystem,
+                    err
+                );
+                continue;
+            }
+        };
+
+        // Attempt to mount the filesystem, but log and continue on failure
+        let mount_result = if entry.path == "/" {
+            self::vfs::mount_root(fs)
         } else {
-            self::vfs::mount(entry.path.as_str(), fs)?;
+            self::vfs::mount(entry.path.as_str(), fs)
+        };
+
+        match mount_result {
+            Ok(()) => {
+                track_active_mount(entry.filesystem.as_str());
+                log::info!(
+                    "mount: mounted filesystem '{}' on '{}'",
+                    entry.filesystem,
+                    entry.path
+                );
+            }
+            Err(err) => {
+                log::warn!(
+                    "mount: failed to mount '{}' -> '{}': {:?}",
+                    entry.filesystem,
+                    entry.path,
+                    err
+                );
+                // Continue with next mount instead of failing
+            }
         }
-        track_active_mount(entry.filesystem.as_str());
-        log::info!(
-            "mount: mounted filesystem '{}' on '{}'",
-            entry.filesystem,
-            entry.path
-        );
     }
 
     Ok(())

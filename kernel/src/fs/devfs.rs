@@ -39,8 +39,7 @@ impl KernelModule for DevFsModule {
     }
 
     fn init(&self, _registry: &dyn KernelRegistry) -> Result<(), ModuleError> {
-        crate::fs::register_filesystem(Arc::new(DevFs::new()))
-            .map_err(|_| ModuleError::InitFailed)
+        crate::fs::register_filesystem(Arc::new(DevFs::new())).map_err(|_| ModuleError::InitFailed)
     }
 
     fn cleanup(&self, _registry: &dyn KernelRegistry) -> Result<(), ModuleError> {
@@ -324,15 +323,23 @@ impl Inode for DevPtsNodeInode {
     }
 
     fn read(&self, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
-        let descriptor = registry::get_descriptor_by_number(DeviceType::Char, self.major, self.minor)
-            .ok_or(FsError::NotFound)?;
-        descriptor.device.read(offset, buf).map_err(fs_error_from_device)
+        let descriptor =
+            registry::get_descriptor_by_number(DeviceType::Char, self.major, self.minor)
+                .ok_or(FsError::NotFound)?;
+        descriptor
+            .device
+            .read(offset, buf)
+            .map_err(fs_error_from_device)
     }
 
     fn write(&self, offset: usize, buf: &[u8]) -> Result<usize, FsError> {
-        let descriptor = registry::get_descriptor_by_number(DeviceType::Char, self.major, self.minor)
-            .ok_or(FsError::NotFound)?;
-        descriptor.device.write(offset, buf).map_err(fs_error_from_device)
+        let descriptor =
+            registry::get_descriptor_by_number(DeviceType::Char, self.major, self.minor)
+                .ok_or(FsError::NotFound)?;
+        descriptor
+            .device
+            .write(offset, buf)
+            .map_err(fs_error_from_device)
     }
 
     fn lookup(&self, _name: &str) -> Result<Arc<dyn Inode>, FsError> {

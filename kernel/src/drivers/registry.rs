@@ -1,6 +1,11 @@
 extern crate alloc;
 
-use alloc::{collections::BTreeMap, string::{String, ToString}, sync::Arc, vec::Vec};
+use alloc::{
+    collections::BTreeMap,
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
+};
 use spin::Mutex;
 
 use super::traits::{BlockDevice, Bus, BusDeviceInfo, BusError, Device, DeviceType};
@@ -223,7 +228,8 @@ impl BusRegistry {
 
         let devices = bus.enumerate().map_err(|_| BusError::EnumerationFailed)?;
 
-        self.buses.insert(name.to_string(), BusEntry { bus, devices });
+        self.buses
+            .insert(name.to_string(), BusEntry { bus, devices });
         Ok(())
     }
 

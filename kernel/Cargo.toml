@@ -22,9 +22,10 @@ fs-core = []
 fs-ramfs = ["fs-core"]
 fs-initrd = ["fs-core"]
 fs-fat32 = ["fs-core", "device"]
+fs-ext4 = ["fs-core", "device", "dep:ext4_rs"]
 fs-dev = ["fs-core", "device"]
 fs-proc = ["fs-core", "process"]
-fs = ["fs-core", "fs-ramfs", "fs-initrd", "fs-fat32", "fs-dev", "fs-proc"]
+fs = ["fs-core", "fs-ramfs", "fs-initrd", "fs-fat32", "fs-ext4", "fs-dev", "fs-proc"]
 
 modules = ["fs"]
 shell = []
@@ -41,4 +42,6 @@ vga = "0.2.9"
 spin = "0.12"
 linked_list_allocator = "0.10"
 bitflags = "2"
+ext4_rs = { version = "1.3.3", optional = true }
 xmas-elf = { version = "0.10", default-features = false }
+ansi-parser = { version = "0.9.1", default-features = false }

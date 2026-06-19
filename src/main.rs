@@ -7,8 +7,6 @@ use std::process::Command;
 
 mod disk;
 
-
-
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 enum BootMode {
     Uefi,
@@ -46,6 +44,23 @@ struct RunArgs {
 
     #[arg(long = "no-vhd")]
     no_vhd: bool,
+
+    /// Extra raw arguments passed directly to qemu-system-x86_64.
+    /// Usage: krust run <mode> [options] -- <qemu args...>
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "QEMU_ARGS"
+    )]
+    qemu_args: Vec<String>,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum DiskFormat {
+    /// FAT32 filesystem (QEMU VHD, default)
+    Fat,
+    /// ext4 filesystem — requires mkfs.ext4 on the host
+    Ext4,
 }
 
 #[derive(Parser, Debug)]
@@ -65,6 +80,10 @@ struct MkdiskArgs {
     /// Comma-separated list of directory names to exclude
     #[arg(long, default_value = "")]
     exclude: String,
+
+    /// Filesystem format to use
+    #[arg(long, value_enum, default_value = "fat")]
+    format: DiskFormat,
 }
 
 fn main() {
@@ -86,18 +105,36 @@ fn cmd_mkdisk(args: MkdiskArgs) {
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .collect();
+    let format_name = match args.format {
+        DiskFormat::Fat => "FAT32",
+        DiskFormat::Ext4 => "ext4",
+    };
     eprintln!(
-        "creating {}MiB VHD from '{}' → '{}' (exclude: {:?})",
+        "creating {}MiB {} VHD from '{}' → '{}' (exclude: {:?})",
         args.size_mib,
+        format_name,
         args.source_dir.display(),
         args.output.display(),
         exclude_dirs
     );
-    disk::create_vhd_from_dir(&args.source_dir, &args.output, args.size_mib, exclude_dirs)
-        .unwrap_or_else(|err| {
-            eprintln!("error: {}", err);
-            std::process::exit(1);
-        });
+    let result = match args.format {
+        DiskFormat::Fat => disk::create_fat_vhd_from_dir(
+            &args.source_dir,
+            &args.output,
+            args.size_mib,
+            exclude_dirs,
+        ),
+        DiskFormat::Ext4 => disk::create_ext4_vhd_from_dir(
+            &args.source_dir,
+            &args.output,
+            args.size_mib,
+            exclude_dirs,
+        ),
+    };
+    result.unwrap_or_else(|err| {
+        eprintln!("error: {}", err);
+        std::process::exit(1);
+    });
     eprintln!("done: {}", args.output.display());
 }
 
@@ -109,14 +146,21 @@ fn cmd_run(cli: RunArgs) {
     let bios_path = env!("BIOS_PATH");
 
     let mode_uefi = matches!(cli.mode, BootMode::Uefi);
-    let uefi = if cli.headless || cli.pty { true } else { mode_uefi };
+    let uefi = if cli.headless || cli.pty {
+        true
+    } else {
+        mode_uefi
+    };
 
     let sata_vhd = if cli.no_vhd {
         None
     } else if let Some(path) = cli.vhd {
         if !path.exists() {
             eprintln!("error: VHD not found: {}", path.display());
-            eprintln!("hint:  cargo run -Z bindeps -- mkdisk <rootfs_dir> {}", path.display());
+            eprintln!(
+                "hint:  cargo run -Z bindeps -- mkdisk <rootfs_dir> {} [--format fat|ext4]",
+                path.display()
+            );
             std::process::exit(1);
         }
         Some(path)
@@ -154,7 +198,8 @@ fn cmd_run(cli: RunArgs) {
             "if=none,id=krust_disk,format=vpc,file={}",
             path.display()
         ));
-        cmd.arg("-device").arg("ide-hd,drive=krust_disk,bus=ahci0.0");
+        cmd.arg("-device")
+            .arg("ide-hd,drive=krust_disk,bus=ahci0.0");
         eprintln!("attached SATA VHD: {}", path.display());
     }
 
@@ -184,6 +229,11 @@ fn cmd_run(cli: RunArgs) {
     } else {
         cmd.arg("-drive")
             .arg(format!("format=raw,file={bios_path}"));
+    }
+
+    if !cli.qemu_args.is_empty() {
+        eprintln!("extra qemu args: {:?}", cli.qemu_args);
+        cmd.args(&cli.qemu_args);
     }
 
     let mut child = cmd.spawn().expect("failed to start qemu-system-x86_64");

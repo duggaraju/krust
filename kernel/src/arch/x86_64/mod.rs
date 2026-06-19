@@ -3,9 +3,12 @@ use x86_64::instructions::port::{PortGeneric, ReadWriteAccess};
 
 use crate::arch::{ArchContext, ArchInterrupts, ArchPaging};
 
+pub mod context;
 pub mod gdt;
 pub mod interrupts;
 pub mod paging;
+pub mod pit;
+pub mod syscall;
 
 pub fn shutdown(status: crate::arch::ShutdownStatus) -> ! {
     use x86_64::instructions::port::Port;
@@ -28,6 +31,8 @@ pub fn shutdown(status: crate::arch::ShutdownStatus) -> ! {
 pub fn init() {
     gdt::init();
     interrupts::init();
+    pit::init();
+    syscall::init();
 }
 
 pub struct Interrupts;

@@ -1,10 +1,10 @@
 extern crate alloc;
 
+use crate::fs::vfs::SeekFrom;
 use alloc::string::String;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
-use crate::fs::vfs::SeekFrom;
 use alloc::vec;
+use alloc::vec::Vec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceType {

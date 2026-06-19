@@ -12,8 +12,8 @@ use crate::process::scheduler::SCHEDULER;
 use crate::process::task::{Pid, TaskMode, TaskState};
 
 use super::vfs::{
-    copy_name_into, write_u64_decimal_into, DirCursor, DirEntry, FileSystem, FileType, FsError,
-    Inode,
+    DirCursor, DirEntry, FileSystem, FileType, FsError, Inode, copy_name_into,
+    write_u64_decimal_into,
 };
 
 pub struct ProcFs;
@@ -48,8 +48,7 @@ impl KernelModule for ProcFsModule {
     }
 
     fn init(&self, _registry: &dyn KernelRegistry) -> Result<(), ModuleError> {
-        crate::fs::register_filesystem(Arc::new(ProcFs::new()))
-            .map_err(|_| ModuleError::InitFailed)
+        crate::fs::register_filesystem(Arc::new(ProcFs::new())).map_err(|_| ModuleError::InitFailed)
     }
 
     fn cleanup(&self, _registry: &dyn KernelRegistry) -> Result<(), ModuleError> {
@@ -183,9 +182,9 @@ impl Inode for ProcRootInode {
     ) -> Result<usize, FsError> {
         let task_pids: Vec<Pid> = {
             let scheduler = SCHEDULER.lock();
-            scheduler
-                .as_ref()
-                .map_or(Vec::new(), |sched| sched.tasks().map(|task| task.pid).collect())
+            scheduler.as_ref().map_or(Vec::new(), |sched| {
+                sched.tasks().map(|task| task.pid).collect()
+            })
         };
         let mut emitted = 0usize;
         let mut index = cursor.offset as usize;
@@ -364,8 +363,11 @@ impl Inode for ProcModulesDirInode {
             let mut index = cursor.offset as usize;
             while index < modules.len() {
                 let name = copy_name_into(modules[index], name_buf)?;
-                let entry =
-                    DirEntry::new(name, FileType::Regular, PROC_MODULE_BASE_INO + hash_name(modules[index]));
+                let entry = DirEntry::new(
+                    name,
+                    FileType::Regular,
+                    PROC_MODULE_BASE_INO + hash_name(modules[index]),
+                );
                 emitted += 1;
                 index += 1;
                 if !visit(entry) {
@@ -505,11 +507,27 @@ impl Inode for ProcTaskDirInode {
         ensure_task_exists(self.pid)?;
 
         let entries = [
-            ("status", FileType::Regular, PROC_TASK_STATUS_BASE_INO + self.pid),
-            ("cmdline", FileType::Regular, PROC_TASK_CMDLINE_BASE_INO + self.pid),
+            (
+                "status",
+                FileType::Regular,
+                PROC_TASK_STATUS_BASE_INO + self.pid,
+            ),
+            (
+                "cmdline",
+                FileType::Regular,
+                PROC_TASK_CMDLINE_BASE_INO + self.pid,
+            ),
             ("cwd", FileType::Symlink, PROC_TASK_CWD_BASE_INO + self.pid),
-            ("stat", FileType::Regular, PROC_TASK_STAT_BASE_INO + self.pid),
-            ("fd", FileType::Directory, PROC_TASK_FD_DIR_BASE_INO + self.pid),
+            (
+                "stat",
+                FileType::Regular,
+                PROC_TASK_STAT_BASE_INO + self.pid,
+            ),
+            (
+                "fd",
+                FileType::Directory,
+                PROC_TASK_FD_DIR_BASE_INO + self.pid,
+            ),
         ];
 
         let mut emitted = 0usize;
@@ -893,9 +911,7 @@ fn task_stat_content(pid: Pid) -> Result<String, FsError> {
     Ok(content)
 }
 
-fn task_fd_entries(
-    pid: Pid,
-) -> Result<Vec<(usize, crate::fs::vfs::FileDescriptor)>, FsError> {
+fn task_fd_entries(pid: Pid) -> Result<Vec<(usize, crate::fs::vfs::FileDescriptor)>, FsError> {
     let scheduler = SCHEDULER.lock();
     let Some(scheduler) = scheduler.as_ref() else {
         return Err(FsError::NotFound);
@@ -913,10 +929,11 @@ fn task_fd_target(pid: Pid, fd: usize) -> Result<String, FsError> {
         return Err(FsError::NotFound);
     };
 
-    if super::vfs::lookup_inode_by_tuple(desc.major, desc.minor, desc.inode).is_some() {
+    if super::vfs::lookup_inode_by_tuple(desc.fs_id, desc.major, desc.minor, desc.inode).is_some()
+    {
         Ok(format!(
-            "inode:{}:{}:{}",
-            desc.major, desc.minor, desc.inode
+            "inode:{}:{}:{}:{}",
+            desc.fs_id, desc.major, desc.minor, desc.inode
         ))
     } else {
         Err(FsError::NotFound)

@@ -9,13 +9,16 @@ use spin::Mutex;
 use super::vfs::{DirCursor, DirEntry, FileSystem, FileType, FsError, Inode};
 
 pub struct RamFs {
+    fs_id: u64,
     root: Arc<RamInode>,
 }
 
 impl RamFs {
     pub fn new() -> Self {
+        let fs_id = super::vfs::allocate_filesystem_id();
         Self {
-            root: Arc::new(RamInode::directory()),
+            fs_id,
+            root: Arc::new(RamInode::directory(fs_id)),
         }
     }
 }
@@ -34,9 +37,14 @@ impl FileSystem for RamFs {
     fn root_inode(&self) -> Arc<dyn Inode> {
         self.root.clone()
     }
+
+    fn fs_id(&self) -> u64 {
+        self.fs_id
+    }
 }
 
 pub struct RamInode {
+    fs_id: u64,
     ino: u64,
     file_type: FileType,
     inner: Mutex<RamInodeData>,
@@ -48,7 +56,7 @@ enum RamInodeData {
 }
 
 impl RamInode {
-    pub fn new(file_type: FileType) -> Self {
+    pub fn new(file_type: FileType, fs_id: u64) -> Self {
         let ino = next_inode_number();
         let inner = match file_type {
             FileType::Directory => RamInodeData::Directory(Vec::new()),
@@ -56,14 +64,15 @@ impl RamInode {
         };
 
         Self {
+            fs_id,
             ino,
             file_type,
             inner: Mutex::new(inner),
         }
     }
 
-    pub fn directory() -> Self {
-        Self::new(FileType::Directory)
+    pub fn directory(fs_id: u64) -> Self {
+        Self::new(FileType::Directory, fs_id)
     }
 }
 
@@ -139,7 +148,7 @@ impl Inode for RamInode {
                     return Err(FsError::AlreadyExists);
                 }
 
-                let inode = Arc::new(RamInode::new(file_type));
+                let inode = Arc::new(RamInode::new(file_type, self.fs_id));
                 entries.push((String::from(name), inode.clone()));
                 Ok(inode)
             }
@@ -162,6 +171,10 @@ impl Inode for RamInode {
 
     fn filesystem_name(&self) -> &'static str {
         "ramfs"
+    }
+
+    fn fs_id(&self) -> u64 {
+        self.fs_id
     }
 
     fn readdir(

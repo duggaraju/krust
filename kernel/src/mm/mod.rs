@@ -1,20 +1,22 @@
 pub mod address;
+pub mod address_space;
 pub mod frame_allocator;
 pub mod heap;
 pub mod stats;
 
 use bootloader_api::info::MemoryRegion;
 use log::info;
-use spin::Once;
+use spin::{Mutex, Once};
 use x86_64::{
     VirtAddr,
     registers::control::Cr3,
-    structures::paging::{OffsetPageTable, PageTable},
+    structures::paging::{OffsetPageTable, PageTable, PhysFrame, Size4KiB},
 };
 
 use self::frame_allocator::BootInfoFrameAllocator;
 
 static PHYSICAL_MEMORY_OFFSET: Once<u64> = Once::new();
+static FRAME_ALLOCATOR: Mutex<Option<BootInfoFrameAllocator>> = Mutex::new(None);
 
 /// Initialize memory management from pre-extracted boot info fields.
 /// This avoids borrow conflicts with BootInfo in main.
@@ -27,6 +29,7 @@ pub fn init_with(physical_memory_offset: u64, memory_regions: &'static [MemoryRe
 
     stats::init(memory_regions);
     heap::init(&mut mapper, &mut frame_allocator);
+    *FRAME_ALLOCATOR.lock() = Some(frame_allocator);
     info!("memory management initialized");
 }
 
@@ -85,6 +88,20 @@ pub fn virt_to_phys_addr(virtual_address: u64) -> Option<u64> {
     }
     let frame = p1_entry & 0x000f_ffff_ffff_f000;
     Some(frame + (virtual_address & 0xfff))
+}
+
+pub fn with_frame_allocator<R>(f: impl FnOnce(&mut BootInfoFrameAllocator) -> R) -> Option<R> {
+    let mut allocator = FRAME_ALLOCATOR.lock();
+    let allocator = allocator.as_mut()?;
+    Some(f(allocator))
+}
+
+pub fn allocate_frame() -> Option<PhysFrame<Size4KiB>> {
+    with_frame_allocator(|allocator| allocator.allocate_frame()).flatten()
+}
+
+pub fn deallocate_frame(frame: PhysFrame<Size4KiB>) {
+    let _ = with_frame_allocator(|allocator| allocator.deallocate_frame(frame));
 }
 
 fn read_page_table_entry(phys_offset: u64, table_phys: u64, index: u64) -> Option<u64> {

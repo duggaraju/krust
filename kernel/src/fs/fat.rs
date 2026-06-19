@@ -53,6 +53,7 @@ struct FatInodeState {
     size: u32,
     dir_entry_offset: Option<usize>,
     storage: InodeStorage,
+    read_cluster_cache: Option<(usize, u32)>,
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +79,7 @@ struct FatFsInner {
 }
 
 pub struct FatFs {
+    fs_id: u64,
     inner: Arc<Mutex<FatFsInner>>,
     root: Arc<FatInode>,
 }
@@ -99,13 +101,20 @@ impl FatFsModule {
 }
 
 pub struct FatInode {
+    fs_id: u64,
     fs: Arc<Mutex<FatFsInner>>,
     file_type: FileType,
+    uid: u32,
+    gid: u32,
     state: Mutex<FatInodeState>,
 }
 
 impl FatFs {
-    pub fn mount(device: Arc<dyn BlockDevice>) -> Result<Self, FsError> {
+    pub fn mount(
+        device: Arc<dyn BlockDevice>,
+        options: &super::MountOptions,
+    ) -> Result<Self, FsError> {
+        let fs_id = super::vfs::allocate_filesystem_id();
         let sector_size = device.sector_size();
         if sector_size < 512 {
             return Err(FsError::IoError);
@@ -154,6 +163,7 @@ impl FatFs {
             } else {
                 InodeStorage::FixedRoot
             },
+            read_cluster_cache: None,
         };
 
         let inner = Arc::new(Mutex::new(FatFsInner {
@@ -170,12 +180,15 @@ impl FatFs {
         }));
 
         let root = Arc::new(FatInode {
+            fs_id,
             fs: inner.clone(),
             file_type: FileType::Directory,
+            uid: options.uid,
+            gid: options.gid,
             state: Mutex::new(root_state),
         });
 
-        Ok(Self { inner, root })
+        Ok(Self { fs_id, inner, root })
     }
 
     pub fn read_fat_entry(&self, cluster: u32) -> u32 {
@@ -191,6 +204,10 @@ impl FileSystem for FatFs {
     fn root_inode(&self) -> Arc<dyn Inode> {
         self.root.clone()
     }
+
+    fn fs_id(&self) -> u64 {
+        self.fs_id
+    }
 }
 
 #[cfg(feature = "drivers")]
@@ -202,10 +219,11 @@ impl super::FileSystemFactory for FatFsFactory {
         &self,
         mountpoint: Arc<dyn Inode>,
         device: Option<super::MountBlockDevice>,
+        options: &super::MountOptions,
     ) -> Result<Arc<dyn FileSystem>, FsError> {
         let _ = mountpoint;
         let block = device.ok_or(FsError::NotFound)?;
-        let fs = FatFs::mount(block)?;
+        let fs = FatFs::mount(block, options)?;
         Ok(Arc::new(fs))
     }
 
@@ -235,7 +253,8 @@ impl KernelModule for FatFsModule {
     }
 
     fn init(&self, _registry: &dyn KernelRegistry) -> Result<(), ModuleError> {
-        let fs = FatFs::mount(Arc::clone(&self.device)).map_err(|_| ModuleError::InitFailed)?;
+        let fs = FatFs::mount(Arc::clone(&self.device), &super::MountOptions::default())
+            .map_err(|_| ModuleError::InitFailed)?;
         crate::fs::register_filesystem(Arc::new(fs)).map_err(|_| ModuleError::InitFailed)
     }
 
@@ -256,27 +275,39 @@ pub fn register_module(
 
 impl FatInode {
     fn new(
+        fs_id: u64,
         fs: Arc<Mutex<FatFsInner>>,
         file_type: FileType,
+        uid: u32,
+        gid: u32,
         first_cluster: u32,
         size: u32,
         dir_entry_offset: Option<usize>,
         storage: InodeStorage,
     ) -> Self {
         Self {
+            fs_id,
             fs,
             file_type,
+            uid,
+            gid,
             state: Mutex::new(FatInodeState {
                 first_cluster,
                 size,
                 dir_entry_offset,
                 storage,
+                read_cluster_cache: None,
             }),
         }
     }
 
     fn snapshot(&self) -> FatInodeState {
         *self.state.lock()
+    }
+
+    fn with_state_mut<R>(&self, f: impl FnOnce(&mut FatInodeState) -> R) -> Option<R> {
+        let mut state = self.state.lock();
+        Some(f(&mut state))
     }
 }
 
@@ -290,29 +321,68 @@ impl Inode for FatInode {
         if offset >= state.size as usize || buf.is_empty() {
             return Ok(0);
         }
-
-        let inner = self.fs.lock();
-        let chain = inner.collect_chain(state.first_cluster)?;
-        if chain.is_empty() {
+        if state.first_cluster < 2 {
             return Ok(0);
         }
 
+        let inner = self.fs.lock();
         let cluster_size = inner.cluster_size();
         let mut copied = 0;
         let limit = min(buf.len(), state.size as usize - offset);
-        let mut cluster_index = offset / cluster_size;
+        let target_cluster_index = offset / cluster_size;
+        let mut cluster = state.first_cluster;
+        let mut cluster_index = 0usize;
         let mut cluster_offset = offset % cluster_size;
+        let mut clusters_to_skip = target_cluster_index;
 
-        while copied < limit && cluster_index < chain.len() {
-            let cluster = chain[cluster_index];
-            let image_offset = inner.cluster_to_offset(cluster);
-            let chunk = min(limit - copied, cluster_size - cluster_offset);
-            let mut chunk_buf = vec![0u8; chunk];
-            inner.read_bytes(image_offset + cluster_offset, &mut chunk_buf)?;
-            buf[copied..copied + chunk].copy_from_slice(&chunk_buf);
-            copied += chunk;
+        if let Some((cached_index, cached_cluster)) = state.read_cluster_cache {
+            if cached_index <= target_cluster_index && cached_cluster >= 2 {
+                cluster = cached_cluster;
+                cluster_index = cached_index;
+                clusters_to_skip = target_cluster_index - cached_index;
+            }
+        }
+
+        while clusters_to_skip > 0 {
+            let next = inner.read_fat_entry(cluster);
+            if next < 2 || inner.is_eoc(next) {
+                return Ok(copied);
+            }
+            cluster = next;
             cluster_index += 1;
+            clusters_to_skip -= 1;
+        }
+
+        let start_cluster = cluster;
+        let start_cluster_index = cluster_index;
+
+        while copied < limit {
+            let image_offset = inner.cluster_to_offset(cluster)?;
+            let chunk = min(limit - copied, cluster_size - cluster_offset);
+            inner.read_bytes(
+                image_offset + cluster_offset,
+                &mut buf[copied..copied + chunk],
+            )?;
+            copied += chunk;
             cluster_offset = 0;
+
+            if copied >= limit {
+                break;
+            }
+
+            let next = inner.read_fat_entry(cluster);
+            if next < 2 || inner.is_eoc(next) {
+                break;
+            }
+            cluster = next;
+        }
+
+        if let Some(()) = self.with_state_mut(|inode_state| {
+            if inode_state.first_cluster == state.first_cluster {
+                inode_state.read_cluster_cache = Some((start_cluster_index, start_cluster));
+            }
+        }) {
+            // cache updated
         }
 
         Ok(copied)
@@ -342,7 +412,7 @@ impl Inode for FatInode {
 
             while written < buf.len() && cluster_index < chain.len() {
                 let cluster = chain[cluster_index];
-                let image_offset = inner.cluster_to_offset(cluster);
+                let image_offset = inner.cluster_to_offset(cluster)?;
                 let chunk = min(buf.len() - written, cluster_size - cluster_offset);
                 inner.write_bytes(
                     image_offset + cluster_offset,
@@ -355,6 +425,7 @@ impl Inode for FatInode {
 
             state.first_cluster = first_cluster;
             state.size = state.size.max(usize_to_u32(end)?);
+            state.read_cluster_cache = None;
             if let Some(entry_offset) = state.dir_entry_offset {
                 update_dir_entry_metadata(
                     &mut inner,
@@ -384,8 +455,11 @@ impl Inode for FatInode {
             .ok_or(FsError::NotFound)?;
 
         let inode: Arc<dyn Inode> = Arc::new(FatInode::new(
+            self.fs_id,
             self.fs.clone(),
             entry.file_type,
+            self.uid,
+            self.gid,
             entry.first_cluster,
             entry.size,
             Some(entry.entry_offset),
@@ -409,6 +483,7 @@ impl Inode for FatInode {
             size: 0,
             dir_entry_offset: None,
             storage: InodeStorage::ClusterChain,
+            read_cluster_cache: None,
         };
 
         {
@@ -452,8 +527,11 @@ impl Inode for FatInode {
         }
 
         let inode: Arc<dyn Inode> = Arc::new(FatInode::new(
+            self.fs_id,
             self.fs.clone(),
             file_type,
+            self.uid,
+            self.gid,
             child_state.first_cluster,
             child_state.size,
             child_state.dir_entry_offset,
@@ -483,8 +561,24 @@ impl Inode for FatInode {
         }
     }
 
+    fn uid(&self) -> u32 {
+        self.uid
+    }
+
+    fn gid(&self) -> u32 {
+        self.gid
+    }
+
+    fn mode(&self) -> u16 {
+        0o755
+    }
+
     fn filesystem_name(&self) -> &'static str {
         "fat"
+    }
+
+    fn fs_id(&self) -> u64 {
+        self.fs_id
     }
 
     fn readdir(
@@ -509,7 +603,9 @@ impl Inode for FatInode {
         while index < entries.len() {
             let entry = &entries[index];
             let name = copy_name_into(entry.name.as_str(), name_buf)?;
-            let out = DirEntry::new(name, entry.file_type, entry.entry_offset as u64);
+            let mut out = DirEntry::new(name, entry.file_type, entry.entry_offset as u64);
+            out.uid = self.uid();
+            out.gid = self.gid();
             emitted += 1;
             index += 1;
             if !visit(out) {
@@ -666,15 +762,25 @@ impl FatFsInner {
     }
 
     fn zero_cluster(&mut self, cluster: u32) -> Result<(), FsError> {
-        let offset = self.cluster_to_offset(cluster);
+        let offset = self.cluster_to_offset(cluster)?;
         self.write_bytes(offset, &vec![0u8; self.cluster_size()])?;
         Ok(())
     }
 
-    fn cluster_to_offset(&self, cluster: u32) -> usize {
-        let sector =
-            self.first_data_sector + (cluster - 2) * u32::from(self.bpb.sectors_per_cluster);
-        sector as usize * self.sector_size
+    fn cluster_to_offset(&self, cluster: u32) -> Result<usize, FsError> {
+        let cluster_index = cluster.checked_sub(2).ok_or(FsError::IoError)?;
+        let sectors_per_cluster = u32::from(self.bpb.sectors_per_cluster);
+        let data_sectors = cluster_index
+            .checked_mul(sectors_per_cluster)
+            .ok_or(FsError::IoError)?;
+        let sector = self
+            .first_data_sector
+            .checked_add(data_sectors)
+            .ok_or(FsError::IoError)?;
+        let offset = (sector as u64)
+            .checked_mul(self.sector_size as u64)
+            .ok_or(FsError::IoError)?;
+        usize::try_from(offset).map_err(|_| FsError::IoError)
     }
 
     fn collect_chain(&self, start_cluster: u32) -> Result<Vec<u32>, FsError> {
@@ -884,14 +990,14 @@ fn parse_lfn_entry(entry: &[u8]) -> Option<String> {
     if entry.len() != DIR_ENTRY_SIZE {
         return None;
     }
-    
+
     // LFN entries store 13 characters in UTF-16LE across 3 regions
     // Offset 1: chars 0-4 (bytes 1-10)
     // Offset 14: chars 5-10 (bytes 14-25)
     // Offset 28: chars 11-12 (bytes 28-31)
-    
+
     let mut chars = Vec::new();
-    
+
     // First region: bytes 1-10 (5 chars)
     for i in (1..=9).step_by(2) {
         let low = entry[i];
@@ -906,7 +1012,7 @@ fn parse_lfn_entry(entry: &[u8]) -> Option<String> {
             chars.push(ch);
         }
     }
-    
+
     // Second region: bytes 14-25 (6 chars)
     for i in (14..=23).step_by(2) {
         let low = entry[i];
@@ -921,7 +1027,7 @@ fn parse_lfn_entry(entry: &[u8]) -> Option<String> {
             chars.push(ch);
         }
     }
-    
+
     // Third region: bytes 28-31 (2 chars)
     for i in (28..=29).step_by(2) {
         let low = entry[i];
@@ -936,7 +1042,7 @@ fn parse_lfn_entry(entry: &[u8]) -> Option<String> {
             chars.push(ch);
         }
     }
-    
+
     if chars.is_empty() {
         None
     } else {
@@ -956,7 +1062,7 @@ fn directory_regions(
         InodeStorage::ClusterChain => {
             let mut regions = Vec::new();
             for cluster in inner.collect_chain(state.first_cluster)? {
-                regions.push((inner.cluster_to_offset(cluster), inner.cluster_size()));
+                regions.push((inner.cluster_to_offset(cluster)?, inner.cluster_size()));
             }
             Ok(regions)
         }
@@ -990,7 +1096,7 @@ fn find_free_dir_entry(inner: &mut FatFsInner, state: FatInodeState) -> Result<u
     let new_cluster = inner.allocate_cluster()?;
     inner.write_fat_entry(last, new_cluster);
     inner.write_fat_entry(new_cluster, inner.eoc_marker());
-    Ok(inner.cluster_to_offset(new_cluster))
+    inner.cluster_to_offset(new_cluster)
 }
 
 fn write_raw_dir_entry(
@@ -1037,7 +1143,7 @@ fn initialize_directory_cluster(
     self_cluster: u32,
     parent_cluster: u32,
 ) -> Result<(), FsError> {
-    let offset = inner.cluster_to_offset(self_cluster);
+    let offset = inner.cluster_to_offset(self_cluster)?;
     let end = offset
         .checked_add(inner.cluster_size())
         .ok_or(FsError::IoError)?;

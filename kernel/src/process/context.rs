@@ -1,5 +1,3 @@
-use core::sync::atomic::{Ordering, compiler_fence};
-
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CpuContext {
@@ -19,15 +17,22 @@ pub struct CpuContext {
     pub r15: u64,
     #[cfg(target_arch = "x86_64")]
     pub rip: u64,
+    #[cfg(target_arch = "x86_64")]
+    pub user_rip: u64,
+    #[cfg(target_arch = "x86_64")]
+    pub user_rsp: u64,
+    #[cfg(target_arch = "x86_64")]
+    pub kernel_rsp: u64,
+    #[cfg(target_arch = "x86_64")]
+    pub rflags: u64,
+    #[cfg(target_arch = "x86_64")]
+    pub cr3: u64,
+    #[cfg(target_arch = "x86_64")]
+    pub rax: u64,
 }
 
 impl CpuContext {
     pub fn new() -> Self {
         Self::default()
     }
-}
-
-pub unsafe fn switch(old: *mut CpuContext, new: *const CpuContext) {
-    let _ = (old, new);
-    compiler_fence(Ordering::SeqCst);
 }

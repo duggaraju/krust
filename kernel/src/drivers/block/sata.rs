@@ -8,7 +8,9 @@ use core::hint::spin_loop;
 use spin::Mutex;
 
 use crate::drivers::registry;
-use crate::drivers::traits::{BlockDevice, BusDeviceInfo, BusType, Device, DeviceError, DeviceType, Driver, DriverError};
+use crate::drivers::traits::{
+    BlockDevice, BusDeviceInfo, BusType, Device, DeviceError, DeviceType, Driver, DriverError,
+};
 use crate::module::traits::{KernelModule, KernelRegistry, ModuleError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,8 +132,7 @@ impl SataBlockDevice {
         identify.copy_from_slice(&dma_buffer.0);
 
         let sectors_28 =
-            u32::from_le_bytes([identify[120], identify[121], identify[122], identify[123]])
-                as u64;
+            u32::from_le_bytes([identify[120], identify[121], identify[122], identify[123]]) as u64;
         let sectors_48 = u64::from_le_bytes([
             identify[200],
             identify[201],
@@ -440,7 +441,15 @@ fn ahci_rw(
 ) -> Result<(), DeviceError> {
     let _ = bytes;
     let _ = dma_buffer;
-    build_command_fis(command_list, command_table, dma_phys, write, command, lba, count);
+    build_command_fis(
+        command_list,
+        command_table,
+        dma_phys,
+        write,
+        command,
+        lba,
+        count,
+    );
 
     if !wait_port_ready(abar_virt, port_base) {
         return Err(DeviceError::Busy);
@@ -612,12 +621,18 @@ fn parse_mbr_partitions(block: &dyn BlockDevice) -> Vec<MbrPartition> {
         if part_type == 0x00 {
             continue;
         }
-        let lba_start = u32::from_le_bytes([mbr[off+8], mbr[off+9], mbr[off+10], mbr[off+11]]) as u64;
-        let sector_count = u32::from_le_bytes([mbr[off+12], mbr[off+13], mbr[off+14], mbr[off+15]]) as u64;
+        let lba_start =
+            u32::from_le_bytes([mbr[off + 8], mbr[off + 9], mbr[off + 10], mbr[off + 11]]) as u64;
+        let sector_count =
+            u32::from_le_bytes([mbr[off + 12], mbr[off + 13], mbr[off + 14], mbr[off + 15]]) as u64;
         if lba_start == 0 || sector_count == 0 {
             continue;
         }
-        parts.push(MbrPartition { part_type, lba_start, sector_count });
+        parts.push(MbrPartition {
+            part_type,
+            lba_start,
+            sector_count,
+        });
     }
     parts
 }
@@ -634,13 +649,13 @@ pub struct PartitionBlockDevice {
 }
 
 impl PartitionBlockDevice {
-    fn new(
-        name: String,
-        inner: Arc<dyn BlockDevice>,
-        lba_start: u64,
-        sector_count: u64,
-    ) -> Self {
-        Self { name, inner, lba_start, sector_count }
+    fn new(name: String, inner: Arc<dyn BlockDevice>, lba_start: u64, sector_count: u64) -> Self {
+        Self {
+            name,
+            inner,
+            lba_start,
+            sector_count,
+        }
     }
 }
 
@@ -730,10 +745,18 @@ impl SataDeviceModule {
         let mut fs_modules = Vec::new();
 
         for (index, info) in controllers.into_iter().enumerate() {
-            let Some(bus) = info.pci_bus else { continue; };
-            let Some(device) = info.pci_device else { continue; };
-            let Some(function) = info.pci_function else { continue; };
-            let Some(bar5) = info.bar5 else { continue; };
+            let Some(bus) = info.pci_bus else {
+                continue;
+            };
+            let Some(device) = info.pci_device else {
+                continue;
+            };
+            let Some(function) = info.pci_function else {
+                continue;
+            };
+            let Some(bar5) = info.bar5 else {
+                continue;
+            };
 
             // Assign Linux-style sd* name: sda, sdb, …
             let drive_name = drive_letter_name(index);
@@ -743,15 +766,23 @@ impl SataDeviceModule {
 
             let sata: Arc<SataBlockDevice> = Arc::new(SataBlockDevice::new(
                 drive_name.clone(),
-                SataControllerLocation { bus, device, function, bar5 },
+                SataControllerLocation {
+                    bus,
+                    device,
+                    function,
+                    bar5,
+                },
             ));
 
             // Register the whole drive (e.g. sda, major 8 minor 0/16/32…).
             let dev: Arc<dyn Device> = Arc::clone(&sata) as Arc<dyn Device>;
             registry::register(&drive_name, dev, 8, minor_base)
                 .map_err(|_| ModuleError::InitFailed)?;
-            registry::register_block_device_alias(&drive_name, Arc::clone(&sata) as Arc<dyn BlockDevice>)
-                .map_err(|_| ModuleError::InitFailed)?;
+            registry::register_block_device_alias(
+                &drive_name,
+                Arc::clone(&sata) as Arc<dyn BlockDevice>,
+            )
+            .map_err(|_| ModuleError::InitFailed)?;
             names.push(drive_name.clone());
 
             // Probe for MBR partitions.
@@ -760,11 +791,18 @@ impl SataDeviceModule {
 
             if partitions.is_empty() {
                 // No partition table — treat whole drive as a mountable volume.
-                log::info!("sata: {} has no MBR partition table, using whole drive", drive_name);
+                log::info!(
+                    "sata: {} has no MBR partition table, using whole drive",
+                    drive_name
+                );
                 #[cfg(feature = "fs")]
                 {
                     let module_name = alloc::format!("fatfs-{}", drive_name);
-                    crate::fs::fat::register_module(registry_api, module_name.clone(), Arc::clone(&sata_block));
+                    crate::fs::fat::register_module(
+                        registry_api,
+                        module_name.clone(),
+                        Arc::clone(&sata_block),
+                    );
                     fs_modules.push(module_name);
                 }
             } else {
@@ -776,8 +814,11 @@ impl SataDeviceModule {
 
                     log::info!(
                         "sata: {}: partition {} type=0x{:02x} lba={}+{}",
-                        drive_name, part_num, partition.part_type,
-                        partition.lba_start, partition.sector_count
+                        drive_name,
+                        part_num,
+                        partition.part_type,
+                        partition.lba_start,
+                        partition.sector_count
                     );
 
                     let part_dev = Arc::new(PartitionBlockDevice::new(
@@ -798,7 +839,11 @@ impl SataDeviceModule {
                         {
                             let block: Arc<dyn BlockDevice> = part_dev;
                             let module_name = alloc::format!("fatfs-{}", part_name);
-                            crate::fs::fat::register_module(registry_api, module_name.clone(), block);
+                            crate::fs::fat::register_module(
+                                registry_api,
+                                module_name.clone(),
+                                block,
+                            );
                             fs_modules.push(module_name);
                         }
                     } else {

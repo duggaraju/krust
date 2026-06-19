@@ -18,7 +18,11 @@ pub(crate) fn kernel_services() -> KernelServices {
 }
 
 impl KernelServices {
-    fn load_module_recursive(&self, name: &str, stack: &mut Vec<String>) -> Result<(), traits::ModuleError> {
+    fn load_module_recursive(
+        &self,
+        name: &str,
+        stack: &mut Vec<String>,
+    ) -> Result<(), traits::ModuleError> {
         let module = {
             let mut registry = registry::MODULE_REGISTRY.lock();
 
@@ -32,13 +36,18 @@ impl KernelServices {
             }
 
             if registry.is_loading(name) {
-                error!("circular module dependency detected while loading '{}'", name);
+                error!(
+                    "circular module dependency detected while loading '{}'",
+                    name
+                );
                 return Err(traits::ModuleError::InitFailed);
             }
 
             let Some(module) = registry.known(name) else {
                 error!("missing dependency module '{}'", name);
-                return Err(traits::ModuleError::DependencyMissing(leak_dependency_name(name)));
+                return Err(traits::ModuleError::DependencyMissing(
+                    leak_dependency_name(name),
+                ));
             };
 
             registry.mark_loading(name);

@@ -6,10 +6,10 @@ use alloc::vec;
 use alloc::vec::Vec;
 use bitflags::bitflags;
 use spin::Mutex;
-use xmas_elf::program::{SegmentData, Type as ProgramType};
 use xmas_elf::ElfFile;
+use xmas_elf::program::{SegmentData, Type as ProgramType};
 
-const PROBE_READ_LIMIT: usize = 512;
+const PROBE_READ_LIMIT: usize = 2 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct ExecRequest {
@@ -40,6 +40,9 @@ pub struct LoadPlan {
     pub format: &'static str,
     pub entry_point: usize,
     pub segments: Vec<LoadSegment>,
+    pub phdr_addr: usize,
+    pub phent_size: usize,
+    pub phnum: usize,
     pub interpreter: Option<String>,
 }
 
@@ -85,7 +88,9 @@ struct HandlerRegistry {
 
 impl HandlerRegistry {
     const fn new() -> Self {
-        Self { handlers: Vec::new() }
+        Self {
+            handlers: Vec::new(),
+        }
     }
 
     fn register(&mut self, handler: Arc<dyn BinaryFormatHandler>) -> Result<(), BinfmtError> {
@@ -101,7 +106,11 @@ impl HandlerRegistry {
     }
 
     fn unregister(&mut self, name: &str) -> Result<(), BinfmtError> {
-        let Some(index) = self.handlers.iter().position(|handler| handler.name() == name) else {
+        let Some(index) = self
+            .handlers
+            .iter()
+            .position(|handler| handler.name() == name)
+        else {
             return Err(BinfmtError::NotFound);
         };
         self.handlers.remove(index);
@@ -148,8 +157,11 @@ pub fn unregister_handler(name: &str) -> Result<(), BinfmtError> {
 }
 
 pub fn probe_path(request: &ExecRequest) -> Result<BinaryFormatAction, BinfmtError> {
-    let bytes = crate::syscall::impls::read_file(request.path.as_str(), PROBE_READ_LIMIT)
-        .map_err(BinfmtError::Io)?;
+    let fd = crate::syscall::impls::open(request.path.as_str(), 0).map_err(BinfmtError::Io)?;
+    let mut probe = [0u8; PROBE_READ_LIMIT];
+    let read = crate::syscall::impls::read(fd, &mut probe).map_err(BinfmtError::Io);
+    let _ = crate::syscall::impls::close(fd);
+    let bytes = &probe[..read?];
     let registry = BINFMT_HANDLERS.lock();
     for handler in &registry.handlers {
         if let Some(result) = handler.inspect(request, &bytes)? {
@@ -179,7 +191,10 @@ impl BinaryFormatHandler for ShebangHandler {
             return Ok(None);
         }
 
-        let line_end = data.iter().position(|byte| *byte == b'\n').unwrap_or(data.len());
+        let line_end = data
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .unwrap_or(data.len());
         let line = core::str::from_utf8(&data[2..line_end])
             .map_err(|_| BinfmtError::InvalidFormat)?
             .trim();
@@ -230,9 +245,26 @@ impl BinaryFormatHandler for ElfHandler {
             Err(_) => return Ok(None),
         };
 
+        let ph_offset = elf.header.pt2.ph_offset() as usize;
+        let ph_entry_size = elf.header.pt2.ph_entry_size() as usize;
+        let ph_count = elf.header.pt2.ph_count() as usize;
+        if ph_entry_size == 0 && ph_count > 0 {
+            return Err(BinfmtError::InvalidFormat);
+        }
+        let ph_table_size = ph_entry_size
+            .checked_mul(ph_count)
+            .ok_or(BinfmtError::InvalidFormat)?;
+        let ph_end = ph_offset
+            .checked_add(ph_table_size)
+            .ok_or(BinfmtError::InvalidFormat)?;
+        if ph_end > data.len() {
+            return Err(BinfmtError::InvalidFormat);
+        }
+
         let entry_point = elf.header.pt2.entry_point() as usize;
         let mut segments = Vec::new();
         let mut interpreter = None;
+        let mut phdr_addr = None;
 
         for program_header in elf.program_iter() {
             match program_header.get_type() {
@@ -256,7 +288,27 @@ impl BinaryFormatHandler for ElfHandler {
                         _ => None,
                     };
                 }
+                Ok(ProgramType::Phdr) => {
+                    phdr_addr = Some(program_header.virtual_addr() as usize);
+                }
                 _ => {}
+            }
+        }
+
+        if phdr_addr.is_none() {
+            for program_header in elf.program_iter() {
+                if !matches!(program_header.get_type(), Ok(ProgramType::Load)) {
+                    continue;
+                }
+
+                let seg_file_off = program_header.offset() as usize;
+                let seg_file_size = program_header.file_size() as usize;
+                let seg_file_end = seg_file_off.saturating_add(seg_file_size);
+                if ph_offset >= seg_file_off && ph_offset < seg_file_end {
+                    let delta = ph_offset - seg_file_off;
+                    phdr_addr = Some(program_header.virtual_addr() as usize + delta);
+                    break;
+                }
             }
         }
 
@@ -264,6 +316,9 @@ impl BinaryFormatHandler for ElfHandler {
             format: Self::NAME,
             entry_point,
             segments,
+            phdr_addr: phdr_addr.unwrap_or(0),
+            phent_size: ph_entry_size,
+            phnum: ph_count,
             interpreter,
         })))
     }

@@ -13,6 +13,7 @@ const PS2_DATA_PORT: u16 = 0x60;
 
 pub struct Ps2Input {
     keyboard: Mutex<PS2Keyboard<layouts::Us104Key, ScancodeSet1>>,
+    ctrl_down: Mutex<bool>,
     alt_down: Mutex<bool>,
 }
 
@@ -30,6 +31,7 @@ impl Ps2Input {
                 layouts::Us104Key,
                 HandleControl::MapLettersToUnicode,
             )),
+            ctrl_down: Mutex::new(false),
             alt_down: Mutex::new(false),
         }
     }
@@ -46,11 +48,14 @@ impl Ps2Input {
                 let code = key_event.code;
                 let state = key_event.state;
 
+                if matches!(code, KeyCode::LControl | KeyCode::RControl) {
+                    *self.ctrl_down.lock() = is_key_press(state);
+                }
                 if matches!(code, KeyCode::LAlt | KeyCode::RAltGr) {
                     *self.alt_down.lock() = is_key_press(state);
                 }
 
-                if *self.alt_down.lock() {
+                if *self.ctrl_down.lock() && *self.alt_down.lock() {
                     if let Some(index) = function_key_to_vt(code, state) {
                         out.push(Ps2Event::SwitchVirtualConsole(index));
                         continue;

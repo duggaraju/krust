@@ -27,8 +27,15 @@ struct FmtBuf {
 }
 
 impl FmtBuf {
-    fn new() -> Self { Self { buf: [0u8; 512], len: 0 } }
-    fn as_bytes(&self) -> &[u8] { &self.buf[..self.len] }
+    fn new() -> Self {
+        Self {
+            buf: [0u8; 512],
+            len: 0,
+        }
+    }
+    fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
 }
 
 impl core::fmt::Write for FmtBuf {
@@ -60,7 +67,10 @@ pub fn init(
                 .expect("failed to initialize logger serial port");
             Mutex::new(uart)
         });
-        KernelLogger { framebuffer, serial }
+        KernelLogger {
+            framebuffer,
+            serial,
+        }
     });
 
     log::set_logger(logger).expect("logger already set");
@@ -78,35 +88,15 @@ impl log::Log for KernelLogger {
         let _ = writeln!(buf, "{:5}: {}", record.level(), record.args());
         let bytes = buf.as_bytes();
 
-        // Route to tty log VC when the tty manager is alive; fall back to raw framebuffer.
-        #[cfg(feature = "drivers")]
-        {
-            if crate::drivers::tty::MANAGER.get().is_some() {
-                crate::drivers::tty::tty_write_log(bytes);
-            } else if let Some(fb) = &self.framebuffer {
-                if let Ok(s) = core::str::from_utf8(bytes) {
-                    let mut fb = fb.lock();
-                    let _ = fb.write_str(s);
-                }
-            }
-        }
-        #[cfg(not(feature = "drivers"))]
-        if let Some(fb) = &self.framebuffer {
-            if let Ok(s) = core::str::from_utf8(bytes) {
-                let mut fb = fb.lock();
-                let _ = fb.write_str(s);
-            }
-        }
-
         // Always write to serial
         if let Some(serial) = &self.serial {
             let mut serial = serial.lock();
-            let _ = UartWriter(&mut serial).write_str(
-                core::str::from_utf8(bytes).unwrap_or("(invalid utf8)\n")
-            );
+            let _ = UartWriter(&mut serial)
+                .write_str(core::str::from_utf8(bytes).unwrap_or("(invalid utf8)\n"));
         }
+
+        let _ = &self.framebuffer;
     }
 
     fn flush(&self) {}
 }
-

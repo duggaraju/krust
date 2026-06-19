@@ -1,3 +1,6 @@
+extern crate alloc;
+
+use alloc::vec::Vec;
 use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
 use x86_64::{
     PhysAddr,
@@ -8,6 +11,7 @@ use x86_64::{
 pub struct BootInfoFrameAllocator {
     memory_regions: &'static [MemoryRegion],
     next: usize,
+    recycled: Vec<PhysFrame>,
 }
 
 impl BootInfoFrameAllocator {
@@ -15,10 +19,14 @@ impl BootInfoFrameAllocator {
         Self {
             memory_regions,
             next: 0,
+            recycled: Vec::new(),
         }
     }
 
     pub fn allocate_frame(&mut self) -> Option<PhysFrame> {
+        if let Some(frame) = self.recycled.pop() {
+            return Some(frame);
+        }
         let frame = self.usable_frames().nth(self.next);
         if frame.is_some() {
             self.next += 1;
@@ -26,7 +34,9 @@ impl BootInfoFrameAllocator {
         frame
     }
 
-    pub fn deallocate_frame(&mut self, _frame: PhysFrame) {}
+    pub fn deallocate_frame(&mut self, frame: PhysFrame) {
+        self.recycled.push(frame);
+    }
 
     fn usable_frames(&self) -> impl Iterator<Item = PhysFrame> + '_ {
         self.memory_regions
