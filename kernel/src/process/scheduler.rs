@@ -51,10 +51,10 @@ impl Scheduler {
 
     fn validate_switch_target(task: &Task) -> bool {
         let (stack_base, stack_top) = task.kernel_stack_range();
-        let rsp = task.context.rsp as usize;
-        let rip = task.context.rip;
+        let rsp = task.context.kernel_stack_pointer() as usize;
+        let rip = task.context.kernel_entry_point();
         let rsp_in_range = rsp >= stack_base && rsp <= stack_top;
-        let rsp_canonical = Self::is_canonical_address(task.context.rsp);
+        let rsp_canonical = Self::is_canonical_address(task.context.kernel_stack_pointer());
         let rip_canonical = Self::is_canonical_address(rip);
         let rip_nonzero = rip != 0;
         let rsp_ok = match task.mode {
@@ -64,13 +64,10 @@ impl Scheduler {
 
         if !rsp_ok || !rip_canonical || !rip_nonzero {
             log::error!(
-                "sched: refusing switch to pid={} invalid context rip=0x{:x} rsp=0x{:x} rbp=0x{:x} cr3=0x{:x} mode={:?} stack=[0x{:x}..0x{:x}] rsp_in_range={} rsp_canonical={} rip_canonical={} rip_nonzero={}",
+                "sched: refusing switch to invalid target pid={} mode={:?} context={:?} stack=[0x{:x}..0x{:x}] checks: rsp_in_range={} rsp_canonical={} rip_canonical={} rip_nonzero={}",
                 task.pid,
-                rip,
-                task.context.rsp,
-                task.context.rbp,
-                task.context.cr3,
                 task.mode,
+                task.context,
                 stack_base,
                 stack_top,
                 rsp_in_range,
@@ -85,8 +82,8 @@ impl Scheduler {
 
     fn normalize_switch_target(task: &mut Task) {
         let (stack_base, stack_top) = task.kernel_stack_range();
-        let rsp = task.context.rsp as usize;
-        let kernel_rsp = task.context.kernel_rsp as usize;
+        let rsp = task.context.kernel_stack_pointer() as usize;
+        let kernel_rsp = task.context.kernel_stack_top() as usize;
         let rsp_in_range = rsp >= stack_base && rsp <= stack_top;
         let kernel_rsp_in_range = kernel_rsp >= stack_base && kernel_rsp <= stack_top;
 
@@ -98,23 +95,28 @@ impl Scheduler {
             TaskMode::Kernel => {}
             TaskMode::User => {
                 // User tasks must still run on a kernel stack while in kernel context;
-                // user_rsp/user_rip are consumed by enter_usermode/sysret paths.
+                // user_stack_pointer/user_entry_point are consumed by enter_usermode/sysret paths.
                 if !rsp_in_range {
-                    task.context.rsp = task.context.kernel_rsp;
-                    if task.context.rbp == 0 {
-                        task.context.rbp = task.context.kernel_rsp;
+                    task.context
+                        .set_kernel_stack_pointer(task.context.kernel_stack_top());
+                    if task.context.frame_pointer() == 0 {
+                        task.context
+                            .set_frame_pointer(task.context.kernel_stack_top());
                     }
                     log::warn!(
-                        "sched: repaired user task pid={} kernel-context rsp from kernel_rsp=0x{:x}",
+                        "sched: repaired user task pid={} mode={:?} context={:?}",
                         task.pid,
-                        task.context.kernel_rsp
+                        task.mode,
+                        task.context
                     );
                 }
-                if task.context.user_rsp == 0 && task.user_stack_top != 0 {
-                    task.context.user_rsp = task.user_stack_top as u64;
+                if task.context.user_stack_pointer() == 0 && task.user_stack_top != 0 {
+                    task.context
+                        .set_user_stack_pointer(task.user_stack_top as u64);
                 }
-                if task.context.user_rip == 0 && task.context.rip != 0 {
-                    task.context.user_rip = task.context.rip;
+                if task.context.user_entry_point() == 0 && task.context.kernel_entry_point() != 0 {
+                    task.context
+                        .set_user_entry_point(task.context.kernel_entry_point());
                 }
             }
         }
@@ -230,12 +232,7 @@ impl Scheduler {
             .expect("task index just checked");
         task.state = TaskState::Running;
         task.activate_address_space();
-        #[cfg(target_arch = "x86_64")]
-        {
-            crate::arch::x86_64::gdt::set_tss_rsp0(task.kernel_stack_top as u64);
-            crate::arch::x86_64::syscall::set_kernel_stack_top(task.kernel_stack_top as u64);
-            crate::arch::x86_64::syscall::set_user_bases(task.fs_base, task.gs_base);
-        }
+        crate::arch::activate_task_runtime_state(task);
         Some(task)
     }
 
@@ -333,13 +330,9 @@ impl Scheduler {
             task.activate_address_space();
             task.kernel_stack_top
         };
-        #[cfg(target_arch = "x86_64")]
-        {
-            crate::arch::x86_64::gdt::set_tss_rsp0(kernel_stack_top as u64);
-            crate::arch::x86_64::syscall::set_kernel_stack_top(kernel_stack_top as u64);
-            if let Some(task) = self.tasks.get(target_idx) {
-                crate::arch::x86_64::syscall::set_user_bases(task.fs_base, task.gs_base);
-            }
+        if let Some(task) = self.tasks.get(target_idx) {
+            let _ = kernel_stack_top;
+            crate::arch::activate_task_runtime_state(task);
         }
 
         let old_ctx_ptr = &mut self.tasks[old_idx].context as *mut _;
@@ -431,13 +424,9 @@ impl Scheduler {
             task.activate_address_space();
             task.kernel_stack_top
         };
-        #[cfg(target_arch = "x86_64")]
-        {
-            crate::arch::x86_64::gdt::set_tss_rsp0(kernel_stack_top as u64);
-            crate::arch::x86_64::syscall::set_kernel_stack_top(kernel_stack_top as u64);
-            if let Some(task) = self.tasks.get(next_index) {
-                crate::arch::x86_64::syscall::set_user_bases(task.fs_base, task.gs_base);
-            }
+        if let Some(task) = self.tasks.get(next_index) {
+            let _ = kernel_stack_top;
+            crate::arch::activate_task_runtime_state(task);
         }
 
         log::debug!(

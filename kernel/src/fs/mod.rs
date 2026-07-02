@@ -6,7 +6,7 @@ pub mod devfs;
 pub mod ext4fs;
 pub mod fat;
 pub mod initrd;
-#[cfg(feature = "process")]
+
 pub mod procfs;
 pub mod ramfs;
 pub mod vfs;
@@ -62,7 +62,6 @@ pub fn init() {
 }
 
 pub fn register_modules(registry: &dyn KernelRegistry) {
-    #[cfg(feature = "process")]
     procfs::register_module(registry);
 
     #[cfg(feature = "drivers")]

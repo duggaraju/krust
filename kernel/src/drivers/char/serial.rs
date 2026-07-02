@@ -107,36 +107,43 @@ impl Device for SerialConsoleDevice {
             return Ok(0);
         }
 
-        // Read raw bytes from the serial port
-        let mut raw_buf = [0u8; 64];
-        let n = self.device.read(0, &mut raw_buf)?;
+        loop {
+            // Read raw bytes from the serial port
+            let mut raw_buf = [0u8; 64];
+            let n = self.device.read(0, &mut raw_buf)?;
 
-        let mut ldisc = self.ldisc.lock();
-        let mut signal_to_deliver: Option<Signal> = None;
+            let mut ldisc = self.ldisc.lock();
+            let mut signal_to_deliver: Option<Signal> = None;
 
-        // Process each byte through the line discipline
-        for &byte in &raw_buf[..n] {
-            let echo = ldisc.process_input(byte);
+            // Process each byte through the line discipline
+            for &byte in &raw_buf[..n] {
+                let echo = ldisc.process_input(byte);
 
-            // Check if a signal was generated and queue it
-            if let Some(ldisc_signal) = echo.signal() {
-                signal_to_deliver = Some(ldisc_signal.to_kernel_signal());
+                // Check if a signal was generated and queue it
+                if let Some(ldisc_signal) = echo.signal() {
+                    signal_to_deliver = Some(ldisc_signal.to_kernel_signal());
+                }
+
+                // Echo the byte back to the console (optional, like a real terminal)
+                echo.emit(|echo_bytes| {
+                    let _ = self.device.write(0, echo_bytes);
+                });
             }
 
-            // Echo the byte back to the console (optional, like a real terminal)
-            echo.emit(|echo_bytes| {
-                let _ = self.device.write(0, echo_bytes);
-            });
-        }
+            // Deliver signal to current task if one was generated
+            if let Some(signal) = signal_to_deliver {
+                Self::deliver_signal(signal);
+            }
 
-        // Deliver signal to current task if one was generated
-        if let Some(signal) = signal_to_deliver {
-            Self::deliver_signal(signal);
-        }
+            // Read cooked bytes from the line discipline
+            let bytes_read = ldisc.read(buf);
+            if bytes_read != 0 {
+                return Ok(bytes_read);
+            }
 
-        // Read cooked bytes from the line discipline
-        let bytes_read = ldisc.read(buf);
-        Ok(bytes_read)
+            drop(ldisc);
+            core::hint::spin_loop();
+        }
     }
 
     /// Write bytes to the serial console.

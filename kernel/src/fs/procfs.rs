@@ -18,7 +18,6 @@ use super::vfs::{
 
 pub struct ProcFs;
 
-#[cfg(feature = "process")]
 pub struct ProcFsModule;
 
 impl ProcFs {
@@ -33,7 +32,6 @@ impl Default for ProcFs {
     }
 }
 
-#[cfg(feature = "process")]
 impl KernelModule for ProcFsModule {
     fn name(&self) -> &str {
         "procfs"
@@ -56,7 +54,6 @@ impl KernelModule for ProcFsModule {
     }
 }
 
-#[cfg(feature = "process")]
 pub fn register_module(registry: &dyn KernelRegistry) {
     let module: Arc<dyn KernelModule> = Arc::new(ProcFsModule);
     let _ = registry.register_module(module);
@@ -801,7 +798,7 @@ fn state_name(state: TaskState) -> &'static str {
     match state {
         TaskState::Ready => "Ready",
         TaskState::Running => "Running",
-        TaskState::Blocked => "Blocked",
+        TaskState::Waiting => "Waiting",
         TaskState::Zombie => "Zombie",
     }
 }
@@ -929,8 +926,7 @@ fn task_fd_target(pid: Pid, fd: usize) -> Result<String, FsError> {
         return Err(FsError::NotFound);
     };
 
-    if super::vfs::lookup_inode_by_tuple(desc.fs_id, desc.major, desc.minor, desc.inode).is_some()
-    {
+    if super::vfs::lookup_inode_by_tuple(desc.fs_id, desc.major, desc.minor, desc.inode).is_some() {
         Ok(format!(
             "inode:{}:{}:{}:{}",
             desc.fs_id, desc.major, desc.minor, desc.inode

@@ -130,12 +130,11 @@ fn cmd_env(console: &mut Console) {
 
 fn cmd_clear(console: &mut Console) {
     // ANSI escape: clear screen and move cursor home
-    console.write_str("\x1b[2J\x1b[H");
+    console.write_bytes(b"\x1b[2J\x1b[H");
 }
 
 // --- Memory subsystem commands ---
 
-#[cfg(feature = "mm")]
 fn cmd_mem(console: &mut Console) {
     use crate::syscall::impls;
 
@@ -155,14 +154,8 @@ fn cmd_mem(console: &mut Console) {
     }
 }
 
-#[cfg(not(feature = "mm"))]
-fn cmd_mem(console: &mut Console) {
-    console.write_str("memory management not enabled (feature 'mm' disabled)\n");
-}
-
 // --- Process subsystem commands ---
 
-#[cfg(feature = "process")]
 fn cmd_ps(console: &mut Console) {
     use crate::syscall::impls;
 
@@ -227,11 +220,6 @@ fn cmd_ps(console: &mut Console) {
     }
 }
 
-#[cfg(not(feature = "process"))]
-fn cmd_ps(console: &mut Console) {
-    console.write_str("process management not enabled (feature 'process' disabled)\n");
-}
-
 // --- Filesystem commands ---
 
 #[cfg(feature = "fs")]
@@ -262,47 +250,48 @@ fn cmd_ls(args: &str, console: &mut Console) {
             return;
         }
     };
+    let result = read_dirents(fd, show_all);
+    let _ = impls::close(fd);
 
-    let mut cursor = crate::fs::vfs::DirCursor::default();
-    let mut name_buf = [0u8; 128];
-    let mut seen = 0usize;
-    let mut visit = |entry: crate::fs::vfs::DirEntry<'_>| {
-        seen += 1;
-        if !show_all && (entry.name == "." || entry.name == "..") {
-            return true;
+    let (seen, entries) = match result {
+        Ok(result) if result.0 == 0 => {
+            console.write_str("(empty directory)\n");
+            return;
         }
+        Ok(result) => result,
+        Err(e) => {
+            console.write_str(&format!("ls: errno {}\n", e));
+            return;
+        }
+    };
+
+    if seen == 0 {
+        console.write_str("(empty directory)\n");
+        return;
+    }
+
+    for (name, dirent_type) in entries {
         if show_long {
-            let entry_path = join_path(path, entry.name);
+            let entry_path = join_path(path, name.as_str());
             match impls::stat(&entry_path) {
                 Ok(entry_stat) => {
                     console.write_str(&format!(
                         "{}\n",
                         format_stat_entry(
-                            entry.name,
+                            name.as_str(),
                             &entry_stat,
-                            entry_type_indicator(entry.file_type)
+                            entry_type_indicator(dirent_type)
                         )
                     ));
                 }
                 Err(errno) => {
-                    console.write_str(&format!("  {}: errno {}\n", entry.name, errno));
+                    console.write_str(&format!("  {}: errno {}\n", name, errno));
                 }
             }
         } else {
-            let type_indicator = entry_type_indicator(entry.file_type);
-            console.write_str(&format!("  {}{}\n", entry.name, type_indicator));
+            let type_indicator = entry_type_indicator(dirent_type);
+            console.write_str(&format!("  {}{}\n", name, type_indicator));
         }
-        true
-    };
-    let result = impls::readdir(fd, &mut cursor, &mut name_buf, &mut visit);
-    let _ = impls::close(fd);
-
-    match result {
-        Ok(_) if seen == 0 => {
-            console.write_str("(empty directory)\n");
-        }
-        Ok(_) => {}
-        Err(e) => console.write_str(&format!("ls: {:?}\n", e)),
     }
 }
 
@@ -597,20 +586,10 @@ fn launch_external_command(line: &str, console: &mut Console) -> bool {
         return true;
     };
     let mut argv = argv;
-    if argv
-        .first()
-        .is_some_and(|value| value.contains('/'))
-    {
+    if argv.first().is_some_and(|value| value.contains('/')) {
         argv[0] = basename(exec_path.as_str());
     }
-    log::debug!(
-        "shell: launching external command='{}' exec_path='{}' argv={:?}",
-        command,
-        exec_path,
-        argv
-    );
-
-    let child_pid = match crate::process::fork_current_task() {
+    let child_pid = match crate::syscall::impls::fork_execve(exec_path.clone(), argv) {
         Ok(pid) => pid,
         Err(errno) => {
             console.write_str(&format!("fork: errno {}\n", errno));
@@ -618,49 +597,11 @@ fn launch_external_command(line: &str, console: &mut Console) -> bool {
         }
     };
 
-    let configured = crate::process::with_task_mut(child_pid, |task| {
-        task.exec_path = exec_path.clone();
-        task.set_argv(argv.clone());
-        task.context.rip = external_command_entry as *const () as usize as u64;
-        task.context.rsp = task.kernel_stack_top as u64;
-        task.context.rbp = task.kernel_stack_top as u64;
-        task.context.kernel_rsp = task.kernel_stack_top as u64;
-        task.userland = false;
-        task.mode = crate::process::task::TaskMode::Kernel;
-    });
-
-    if configured.is_none() {
-        console.write_str("failed to configure child process\n");
-        return true;
-    }
     log::info!(
-        "shell: child configured pid={} exec='{}' argv={:?}",
+        "shell: forked child pid={} for command='{}'",
         child_pid,
-        exec_path,
-        argv
+        command
     );
-
-    log::info!(
-        "shell: sched_yield after fork parent_pid={} child_pid={}",
-        crate::process::current_pid(),
-        child_pid
-    );
-    let switch_plan = crate::process::yield_to_task(child_pid);
-
-    if let Some(plan) = switch_plan {
-        log::info!(
-            "shell: switching context to forked child pid={} for command='{}'",
-            plan.new_pid,
-            command
-        );
-        unsafe {
-            #[cfg(target_arch = "x86_64")]
-            crate::arch::x86_64::context::switch(plan.old_ctx, plan.new_ctx);
-        }
-    } else {
-        console.write_str("sched_yield: failed to switch to child task\n");
-        return true;
-    }
 
     match crate::process::wait_for_child(Some(child_pid)) {
         Ok((_pid, status)) => {
@@ -674,33 +615,6 @@ fn launch_external_command(line: &str, console: &mut Console) -> bool {
     }
 
     true
-}
-
-fn external_command_entry() {
-    let Some((exec_path, argv)) = crate::process::with_current_task_mut(|task| {
-        (
-            core::mem::take(&mut task.exec_path),
-            core::mem::take(&mut task.argv),
-        )
-    }) else {
-        log::error!("shell: child external entry missing current task state");
-        exit_current_process(127);
-    };
-
-    log::info!(
-        "shell: child external entry pid={} exec='{}' argc={}",
-        crate::process::current_pid(),
-        exec_path,
-        argv.len()
-    );
-
-    // Avoid pre-exec heap churn in the child path while debugging fork/exec stability.
-    if let Err(errno) =
-        crate::syscall::impls::execve_with_args(exec_path.as_str(), argv, Vec::new())
-    {
-        log::warn!("shell: execve failed for '{}' errno={}", exec_path, errno);
-        exit_current_process(127);
-    }
 }
 
 fn resolve_exec_path(command: &str) -> Result<String, ()> {
@@ -750,21 +664,6 @@ fn basename(path: &str) -> String {
     String::from(path.rsplit_once('/').map(|(_, name)| name).unwrap_or(path))
 }
 
-fn exit_current_process(status: usize) -> ! {
-    let _ = crate::syscall::handlers::sys_exit(&crate::syscall::dispatch::SyscallArgs {
-        number: crate::syscall::numbers::SYS_EXIT,
-        arg0: status,
-        arg1: 0,
-        arg2: 0,
-        arg3: 0,
-        arg4: 0,
-        arg5: 0,
-    });
-    loop {
-        x86_64::instructions::hlt();
-    }
-}
-
 fn tokenize(line: &str) -> Vec<String> {
     line.split_whitespace().map(String::from).collect()
 }
@@ -789,14 +688,57 @@ fn parse_ls_args(args: &str) -> (bool, bool, &str) {
 }
 
 #[cfg(feature = "fs")]
-fn entry_type_indicator(file_type: crate::fs::vfs::FileType) -> &'static str {
-    match file_type {
-        crate::fs::vfs::FileType::Directory => "/",
-        crate::fs::vfs::FileType::Symlink => "@",
-        crate::fs::vfs::FileType::CharDevice => "%",
-        crate::fs::vfs::FileType::BlockDevice => "#",
+fn entry_type_indicator(dirent_type: u8) -> &'static str {
+    match dirent_type {
+        4 => "/",  // DT_DIR
+        10 => "@", // DT_LNK
+        2 => "%",  // DT_CHR
+        6 => "#",  // DT_BLK
         _ => "",
     }
+}
+
+#[cfg(feature = "fs")]
+fn read_dirents(fd: usize, show_all: bool) -> Result<(usize, Vec<(String, u8)>), isize> {
+    use crate::syscall::impls;
+
+    const D_NAME_OFFSET: usize = 19;
+    const BUF_SIZE: usize = 1024;
+
+    let mut seen = 0usize;
+    let mut out = Vec::new();
+    let mut buf = [0u8; BUF_SIZE];
+
+    loop {
+        let n = impls::getdents64(fd, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+
+        let mut pos = 0usize;
+        while pos + D_NAME_OFFSET <= n {
+            let reclen = u16::from_ne_bytes([buf[pos + 16], buf[pos + 17]]) as usize;
+            if reclen < D_NAME_OFFSET || pos + reclen > n {
+                return Err(-5);
+            }
+            let dirent_type = buf[pos + 18];
+            let name_bytes = &buf[pos + D_NAME_OFFSET..pos + reclen];
+            let name_len = name_bytes
+                .iter()
+                .position(|b| *b == 0)
+                .unwrap_or(name_bytes.len());
+            let name = String::from_utf8_lossy(&name_bytes[..name_len]);
+
+            seen += 1;
+            if show_all || (name != "." && name != "..") {
+                out.push((name.into_owned(), dirent_type));
+            }
+
+            pos += reclen;
+        }
+    }
+
+    Ok((seen, out))
 }
 
 #[cfg(feature = "fs")]
@@ -829,14 +771,18 @@ fn format_stat_entry(
 fn mode_to_permissions(mode: u32) -> alloc::string::String {
     let bits = mode & 0o777;
     let mut out = alloc::string::String::with_capacity(9);
-    for (shift, read, write, exec) in [
-        (6, 'r', 'w', 'x'),
-        (3, 'r', 'w', 'x'),
-        (0, 'r', 'w', 'x'),
-    ] {
+    for (shift, read, write, exec) in [(6, 'r', 'w', 'x'), (3, 'r', 'w', 'x'), (0, 'r', 'w', 'x')] {
         out.push(if bits & (1 << shift) != 0 { read } else { '-' });
-        out.push(if bits & (1 << (shift + 1)) != 0 { write } else { '-' });
-        out.push(if bits & (1 << (shift + 2)) != 0 { exec } else { '-' });
+        out.push(if bits & (1 << (shift + 1)) != 0 {
+            write
+        } else {
+            '-'
+        });
+        out.push(if bits & (1 << (shift + 2)) != 0 {
+            exec
+        } else {
+            '-'
+        });
     }
     out
 }

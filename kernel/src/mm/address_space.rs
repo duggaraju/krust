@@ -11,7 +11,7 @@ use x86_64::{
     },
 };
 
-use super::{allocate_frame, deallocate_frame, physical_memory_offset, with_frame_allocator};
+use super::{allocate_frame, deallocate_frame, with_frame_allocator};
 use crate::process::binfmt::{LoadSegment, SegmentPermissions};
 
 const PAGE_SIZE: usize = Size4KiB::SIZE as usize;
@@ -52,13 +52,39 @@ impl Drop for AddressSpace {
 }
 
 impl AddressSpace {
+    fn copy_kernel_root_entries(
+        dst_root: PhysFrame<Size4KiB>,
+        phys_offset: u64,
+        kernel_root: PhysFrame<Size4KiB>,
+    ) {
+        let kernel_ptr =
+            VirtAddr::new(phys_offset + kernel_root.start_address().as_u64()).as_ptr::<PageTable>();
+        let dst_ptr = VirtAddr::new(phys_offset + dst_root.start_address().as_u64())
+            .as_mut_ptr::<PageTable>();
+
+        // Copy full root table from the stable kernel root. This preserves all kernel mappings
+        // regardless of which canonical half they currently live in.
+        unsafe {
+            ptr::copy_nonoverlapping(kernel_ptr as *const u8, dst_ptr as *mut u8, 512 * 8);
+        }
+    }
+
+    /// Create new AddressSpace with kernel half copied from stable root.
+    /// Each process gets its own root frame with kernel entries copied.
+    /// Mappings Vec is pre-allocated to avoid allocation panic on fork.
     pub fn kernel() -> Result<Self, MmError> {
-        let root_frame = allocate_frame().ok_or(MmError::OutOfFrames)?;
-        zero_frame(root_frame);
-        copy_kernel_half_from_active(root_frame)?;
+        let new_root = allocate_frame().ok_or(MmError::OutOfFrames)?;
+        zero_frame(new_root);
+
+        // Copy root entries from the stable kernel root.
+        let phys_offset = crate::arch::physical_memory_offset().ok_or(MmError::InvalidAddress)?;
+        let kernel_root = crate::mm::kernel_root_frame().ok_or(MmError::InvalidAddress)?;
+
+        Self::copy_kernel_root_entries(new_root, phys_offset, kernel_root);
+
         Ok(Self {
-            root_frame,
-            mappings: Vec::new(),
+            root_frame: new_root,
+            mappings: Vec::with_capacity(512),
         })
     }
 
@@ -72,14 +98,40 @@ impl AddressSpace {
         }
     }
 
+    pub fn clear(&mut self) -> Result<(), MmError> {
+        // Deallocate all user mappings but keep the root frame and Vec capacity.
+        for mapping in self.mappings.drain(..) {
+            deallocate_frame(mapping.frame);
+        }
+        // Restore root entries from the stable kernel root to preserve kernel mappings.
+        zero_frame(self.root_frame);
+        let phys_offset = crate::arch::physical_memory_offset().ok_or(MmError::InvalidAddress)?;
+        let kernel_root = crate::mm::kernel_root_frame().ok_or(MmError::InvalidAddress)?;
+        Self::copy_kernel_root_entries(self.root_frame, phys_offset, kernel_root);
+        Ok(())
+    }
+
     pub fn clone_for_fork(&self) -> Result<Self, MmError> {
         let mut cloned = Self::kernel()?;
+        log::info!(
+            "clone_for_fork: cloned kernel space, now copying {} user mappings",
+            self.mappings.len()
+        );
 
-        for mapping in &self.mappings {
+        for (idx, mapping) in self.mappings.iter().enumerate() {
             let page = mapping.page;
+            // Copy all pages (stack, heap, code - everything).
             let frame = cloned.map_page(page, mapping.flags)?;
             copy_frame_contents(mapping.frame, frame)?;
+            if idx % 100 == 0 {
+                log::debug!(
+                    "clone_for_fork: progress {}/{} mappings",
+                    idx,
+                    self.mappings.len()
+                );
+            }
         }
+        log::info!("clone_for_fork: completed copying all user mappings");
 
         Ok(cloned)
     }
@@ -124,7 +176,8 @@ impl AddressSpace {
             page_buf.fill(0);
             if file_len > 0 {
                 let range = &mut page_buf[page_offset..page_offset + file_len];
-                let read = match read_chunk(segment.file_offset.saturating_add(file_offset), range) {
+                let read = match read_chunk(segment.file_offset.saturating_add(file_offset), range)
+                {
                     Ok(read) => read,
                     Err(err) => {
                         log::warn!(
@@ -183,20 +236,7 @@ impl AddressSpace {
         Ok(first_page)
     }
 
-    pub fn write_bytes(&self, vaddr: usize, bytes: &[u8]) -> Result<(), MmError> {
-        let mut written = 0usize;
-        let mut cursor = vaddr;
-        while written < bytes.len() {
-            let (frame, offset) = self.translate(cursor).ok_or(MmError::InvalidAddress)?;
-            let chunk = core::cmp::min(PAGE_SIZE - offset, bytes.len() - written);
-            write_frame_bytes(frame, offset, &bytes[written..written + chunk])?;
-            written += chunk;
-            cursor += chunk;
-        }
-        Ok(())
-    }
-
-    pub fn translate(&self, vaddr: usize) -> Option<(PhysFrame<Size4KiB>, usize)> {
+    pub fn write_bytes(&mut self, vaddr: usize, bytes: &[u8]) -> Result<(), MmError> {
         let page = Page::containing_address(VirtAddr::new(vaddr as u64));
         self.mappings
             .iter()
@@ -207,6 +247,8 @@ impl AddressSpace {
                     vaddr - page.start_address().as_u64() as usize,
                 )
             })
+            .ok_or(MmError::InvalidAddress)
+            .and_then(|(frame, offset)| write_frame_bytes(frame, offset, bytes))
     }
 
     pub fn mappings(&self) -> impl Iterator<Item = (usize, usize, PageTableFlags)> + '_ {
@@ -252,23 +294,8 @@ impl AddressSpace {
     }
 }
 
-fn copy_kernel_half_from_active(root_frame: PhysFrame<Size4KiB>) -> Result<(), MmError> {
-    let phys_offset = physical_memory_offset().ok_or(MmError::InvalidAddress)?;
-    let (active_root, _) = Cr3::read();
-    let active_ptr =
-        VirtAddr::new(phys_offset + active_root.start_address().as_u64()).as_ptr::<PageTable>();
-    let new_ptr =
-        VirtAddr::new(phys_offset + root_frame.start_address().as_u64()).as_mut_ptr::<PageTable>();
-
-    unsafe {
-        ptr::copy_nonoverlapping(active_ptr as *const u8, new_ptr as *mut u8, PAGE_SIZE);
-    }
-
-    Ok(())
-}
-
 fn copy_frame_contents(src: PhysFrame<Size4KiB>, dst: PhysFrame<Size4KiB>) -> Result<(), MmError> {
-    let phys_offset = physical_memory_offset().ok_or(MmError::InvalidAddress)?;
+    let phys_offset = crate::arch::physical_memory_offset().ok_or(MmError::InvalidAddress)?;
     let src_ptr = (phys_offset + src.start_address().as_u64()) as *const u8;
     let dst_ptr = (phys_offset + dst.start_address().as_u64()) as *mut u8;
 
@@ -291,7 +318,7 @@ fn write_frame_bytes(
     offset: usize,
     bytes: &[u8],
 ) -> Result<(), MmError> {
-    let phys_offset = physical_memory_offset().ok_or(MmError::InvalidAddress)?;
+    let phys_offset = crate::arch::physical_memory_offset().ok_or(MmError::InvalidAddress)?;
     let ptr = (phys_offset + frame.start_address().as_u64()) as *mut u8;
     unsafe {
         ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.add(offset), bytes.len());
@@ -300,7 +327,7 @@ fn write_frame_bytes(
 }
 
 fn zero_frame(frame: PhysFrame<Size4KiB>) {
-    if let Some(phys_offset) = physical_memory_offset() {
+    if let Some(phys_offset) = crate::arch::physical_memory_offset() {
         let ptr = (phys_offset + frame.start_address().as_u64()) as *mut u8;
         unsafe {
             ptr::write_bytes(ptr, 0, PAGE_SIZE);
@@ -309,7 +336,8 @@ fn zero_frame(frame: PhysFrame<Size4KiB>) {
 }
 
 unsafe fn mapper_for_frame(root_frame: PhysFrame<Size4KiB>) -> OffsetPageTable<'static> {
-    let phys_offset = VirtAddr::new(physical_memory_offset().expect("mm not initialised"));
+    let phys_offset =
+        VirtAddr::new(crate::arch::physical_memory_offset().expect("mm not initialised"));
     let root = (phys_offset + root_frame.start_address().as_u64()).as_mut_ptr();
     unsafe { OffsetPageTable::new(&mut *root, phys_offset) }
 }

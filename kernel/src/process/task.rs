@@ -1,6 +1,6 @@
 extern crate alloc;
 
-use super::context::CpuContext;
+use crate::arch::CpuContext;
 use crate::fs::vfs::{File, FileDescriptor, FileOpenMode, Inode, OpenFile, SeekFrom};
 use crate::mm::address_space::AddressSpace;
 use alloc::boxed::Box;
@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 pub type EnvMap = BTreeMap<String, String>;
 
 #[cfg(feature = "drivers")]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ControllingTerminal {
     VirtualConsole(usize),
     Serial(usize),
@@ -27,7 +27,7 @@ pub type Pid = u64;
 pub enum TaskState {
     Ready,
     Running,
-    Blocked,
+    Waiting,
     Zombie,
 }
 
@@ -86,6 +86,8 @@ impl Signal {
 pub struct Task {
     pub pid: Pid,
     pub parent_pid: Pid,
+    pub pgid: Pid,
+    pub sid: Pid,
     pub cwd_inode: u64,
     pub cwd_path: String,
     cwd: Arc<dyn Inode>,
@@ -98,8 +100,6 @@ pub struct Task {
     pub priority: u8,
     pub credentials: Credentials,
     pub user_stack_top: usize,
-    pub fs_base: u64,
-    pub gs_base: u64,
     pub brk_start: usize,
     pub brk_end: usize,
     pub brk_mapped_end: usize,
@@ -191,17 +191,16 @@ impl Task {
         let kernel_stack_top = (kernel_stack.as_ptr() as usize + kernel_stack.len()) & !0xf;
         let address_space = AddressSpace::kernel().expect("failed to allocate task address space");
 
-        #[cfg(target_arch = "x86_64")]
-        {
-            context.rip = entry_point as usize as u64;
-        }
-        context.kernel_rsp = kernel_stack_top as u64;
-        context.rflags = 0x202;
-        context.cr3 = address_space.root_paddr();
+        context.set_kernel_entry_point(entry_point as usize as u64);
+        context.set_kernel_stack_pointer(kernel_stack_top as u64);
+        context.set_control_flags(0x202);
+        context.set_address_space_root(address_space.root_paddr());
 
         Self {
             pid,
             parent_pid,
+            pgid: pid,
+            sid: pid,
             cwd_inode,
             cwd_path,
             cwd,
@@ -214,8 +213,6 @@ impl Task {
             priority: 20,
             credentials,
             user_stack_top: 0,
-            fs_base: 0,
-            gs_base: 0,
             brk_start: 0,
             brk_end: 0,
             brk_mapped_end: 0,
@@ -252,11 +249,18 @@ impl Task {
             #[cfg(not(feature = "drivers"))]
             None,
         );
+        // Clone parent's CPU context (registers, flags, etc.) and adjust address space
+        child.context = parent.context.clone();
+        child
+            .context
+            .set_address_space_root(child.address_space.root_paddr());
+
         // Share parent's environment map (CoW: cloned only on modification)
         child.env = Arc::clone(&parent.env);
         child.fds = parent.fds.clone();
         child.address_space = parent.address_space.clone();
-        child.context.cr3 = child.address_space.root_paddr();
+        child.pgid = parent.pgid;
+        child.sid = parent.sid;
         child.brk_start = parent.brk_start;
         child.brk_end = parent.brk_end;
         child.brk_mapped_end = parent.brk_mapped_end;
@@ -381,6 +385,12 @@ impl Task {
         self.fds.descriptor(fd)
     }
 
+    pub fn dup_fd(&mut self, old_fd: usize, min_fd: usize) -> Result<usize, isize> {
+        let source = self.fds.entry(old_fd).ok_or(-9isize)?;
+        let cloned = clone_fd_entry(source).ok_or(-5isize)?;
+        Ok(self.fds.insert_existing_from(min_fd, cloned))
+    }
+
     /// Get an environment variable (zero-copy)
     pub fn get_env(&self, key: &str) -> Option<&str> {
         self.env.get(key).map(|s| s.as_str())
@@ -399,26 +409,30 @@ impl Task {
     /// Update task's entry point for a loaded binary
     #[cfg(target_arch = "x86_64")]
     pub fn set_entry_point(&mut self, entry: usize) {
-        self.context.rip = entry as u64;
+        self.context.set_kernel_entry_point(entry as u64);
     }
 
     /// Apply a binary LoadPlan: update argv and entry point
     pub fn apply_load_plan(&mut self, plan: &crate::process::binfmt::LoadPlan, argv: Vec<String>) {
         self.set_argv(argv);
         self.set_entry_point(plan.entry_point);
-        self.context.user_rip = plan.entry_point as u64;
+        self.context.set_user_entry_point(plan.entry_point as u64);
     }
 
     pub fn prepare_user_exec(&mut self, entry: usize, stack_top: usize) {
-        self.context.user_rip = entry as u64;
-        self.context.user_rsp = stack_top as u64;
-        self.context.rip =
-            crate::arch::x86_64::context::enter_usermode as *const () as usize as u64;
-        self.context.rflags = 0x202;
-        self.context.kernel_rsp = self.kernel_stack_top as u64;
-        self.context.rsp = self.context.kernel_rsp;
-        self.context.rbp = self.context.kernel_rsp;
-        self.context.cr3 = self.address_space.root_paddr();
+        self.context.set_user_entry_point(entry as u64);
+        self.context.set_user_stack_pointer(stack_top as u64);
+        self.context
+            .set_kernel_entry_point(crate::arch::enter_usermode as *const () as usize as u64);
+        self.context.set_control_flags(0x202);
+        self.context
+            .set_kernel_stack_top(self.kernel_stack_top as u64);
+        self.context
+            .set_kernel_stack_pointer(self.context.kernel_stack_top());
+        self.context
+            .set_frame_pointer(self.context.kernel_stack_top());
+        self.context
+            .set_address_space_root(self.address_space.root_paddr());
         self.user_stack_top = stack_top;
         self.mode = TaskMode::User;
         self.userland = true;
@@ -454,8 +468,8 @@ impl Task {
     }
 
     pub fn set_user_entry(&mut self, entry: usize, stack_top: usize) {
-        self.context.user_rip = entry as u64;
-        self.context.user_rsp = stack_top as u64;
+        self.context.set_user_entry_point(entry as u64);
+        self.context.set_user_stack_pointer(stack_top as u64);
         self.user_stack_top = stack_top;
     }
 
@@ -529,13 +543,30 @@ impl Clone for Task {
         let kernel_stack = self.kernel_stack.clone();
         let new_base = kernel_stack.as_ptr() as usize;
         let kernel_stack_top = (kernel_stack.as_ptr() as usize + kernel_stack.len()) & !0xf;
-        let mut context = self.context;
-        context.rsp = rebase_stack_pointer(context.rsp, old_base, old_top, new_base);
-        context.rbp = rebase_stack_pointer(context.rbp, old_base, old_top, new_base);
-        context.kernel_rsp = rebase_stack_pointer(context.kernel_rsp, old_base, old_top, new_base);
+        let mut cpu_state = self.context;
+        cpu_state.set_kernel_stack_pointer(rebase_stack_pointer(
+            cpu_state.kernel_stack_pointer(),
+            old_base,
+            old_top,
+            new_base,
+        ));
+        cpu_state.set_frame_pointer(rebase_stack_pointer(
+            cpu_state.frame_pointer(),
+            old_base,
+            old_top,
+            new_base,
+        ));
+        cpu_state.set_kernel_stack_top(rebase_stack_pointer(
+            cpu_state.kernel_stack_top(),
+            old_base,
+            old_top,
+            new_base,
+        ));
         Self {
             pid: self.pid,
             parent_pid: self.parent_pid,
+            pgid: self.pgid,
+            sid: self.sid,
             cwd_inode: self.cwd_inode,
             cwd_path: self.cwd_path.clone(),
             cwd: Arc::clone(&self.cwd),
@@ -544,12 +575,10 @@ impl Clone for Task {
             name: self.name,
             kernel_stack_top,
             kernel_stack,
-            context,
+            context: cpu_state,
             priority: self.priority,
             credentials: self.credentials.clone(),
             user_stack_top: self.user_stack_top,
-            fs_base: self.fs_base,
-            gs_base: self.gs_base,
             brk_start: self.brk_start,
             brk_end: self.brk_end,
             brk_mapped_end: self.brk_mapped_end,
@@ -604,6 +633,26 @@ impl FdTable {
         self.slots[fd] = Some(FdEntry { descriptor, file });
     }
 
+    fn insert_existing_from(&mut self, min_fd: usize, entry: FdEntry) -> usize {
+        let start = core::cmp::max(3, min_fd);
+        if start >= self.slots.len() {
+            self.slots.resize_with(start + 1, || None);
+            self.slots[start] = Some(entry);
+            return start;
+        }
+
+        let mut pending = Some(entry);
+        for fd in start..self.slots.len() {
+            if self.slots[fd].is_none() {
+                self.slots[fd] = pending.take();
+                return fd;
+            }
+        }
+
+        self.slots.push(pending);
+        self.slots.len() - 1
+    }
+
     fn remove(&mut self, fd: usize) -> Option<OpenFile> {
         if fd >= self.slots.len() {
             return None;
@@ -622,6 +671,10 @@ impl FdTable {
         self.slots
             .get(fd)
             .and_then(|slot| slot.as_ref().map(|entry| entry.descriptor))
+    }
+
+    fn entry(&self, fd: usize) -> Option<&FdEntry> {
+        self.slots.get(fd).and_then(|slot| slot.as_ref())
     }
 }
 

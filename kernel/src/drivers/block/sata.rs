@@ -40,13 +40,12 @@ impl SataBlockDevice {
         self.location
     }
 
-    #[cfg(feature = "mm")]
     fn ensure_initialized(&self, state: &mut SataRuntime) -> Result<(), DeviceError> {
         if state.initialized {
             return Ok(());
         }
 
-        let Some(abar_virt) = crate::mm::phys_to_virt_addr(self.location.bar5) else {
+        let Some(abar_virt) = crate::arch::phys_to_virt_addr(self.location.bar5) else {
             return Err(DeviceError::NotReady);
         };
 
@@ -160,7 +159,6 @@ impl SataBlockDevice {
         Ok(())
     }
 
-    #[cfg(feature = "mm")]
     fn transfer_one_sector(
         &self,
         state: &mut SataRuntime,
@@ -243,7 +241,6 @@ impl BlockDevice for SataBlockDevice {
         512
     }
 
-    #[cfg(feature = "mm")]
     fn sector_count(&self) -> u64 {
         let mut state = self.state.lock();
         if self.ensure_initialized(&mut state).is_err() {
@@ -252,23 +249,11 @@ impl BlockDevice for SataBlockDevice {
         state.sector_count
     }
 
-    #[cfg(not(feature = "mm"))]
-    fn sector_count(&self) -> u64 {
-        0
-    }
-
-    #[cfg(feature = "mm")]
     fn read_sector(&self, sector: u64, buf: &mut [u8]) -> Result<(), DeviceError> {
         let mut state = self.state.lock();
         self.transfer_one_sector(&mut state, false, sector, buf)
     }
 
-    #[cfg(not(feature = "mm"))]
-    fn read_sector(&self, _sector: u64, _buf: &mut [u8]) -> Result<(), DeviceError> {
-        Err(DeviceError::NotSupported)
-    }
-
-    #[cfg(feature = "mm")]
     fn write_sector(&self, sector: u64, buf: &[u8]) -> Result<(), DeviceError> {
         let mut state = self.state.lock();
         let mut tmp = [0u8; 512];
@@ -277,11 +262,6 @@ impl BlockDevice for SataBlockDevice {
         }
         tmp.copy_from_slice(buf);
         self.transfer_one_sector(&mut state, true, sector, &mut tmp)
-    }
-
-    #[cfg(not(feature = "mm"))]
-    fn write_sector(&self, _sector: u64, _buf: &[u8]) -> Result<(), DeviceError> {
-        Err(DeviceError::NotSupported)
     }
 }
 
@@ -564,14 +544,8 @@ fn mmio_write32(base: u64, offset: u32, value: u32) {
     }
 }
 
-#[cfg(feature = "mm")]
 fn virt_to_phys(virtual_addr: u64) -> Result<u64, DeviceError> {
-    crate::mm::virt_to_phys_addr(virtual_addr).ok_or(DeviceError::NotReady)
-}
-
-#[cfg(not(feature = "mm"))]
-fn virt_to_phys(_virtual_addr: u64) -> Result<u64, DeviceError> {
-    Err(DeviceError::NotSupported)
+    crate::arch::virt_to_phys_addr(virtual_addr).ok_or(DeviceError::NotReady)
 }
 
 // ─── Drive name generation ──────────────────────────────────────────────────

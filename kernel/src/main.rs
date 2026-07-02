@@ -1,118 +1,88 @@
 #![no_std]
 #![no_main]
-#![feature(abi_x86_interrupt)]
+#![cfg_attr(feature = "arch-x86_64", feature(abi_x86_interrupt))]
 
-#[cfg(feature = "mm")]
 extern crate alloc;
 
 pub mod arch;
 
 pub mod boot_config;
+
 #[cfg(feature = "drivers")]
 pub mod drivers;
 #[cfg(feature = "fs")]
 pub mod fs;
 pub mod logger;
-#[cfg(feature = "mm")]
+
 pub mod mm;
 #[cfg(feature = "modules")]
 pub mod module;
-#[cfg(feature = "process")]
+
 pub mod process;
 #[cfg(feature = "shell")]
 pub mod shell;
+
 pub mod syscall;
 pub mod time;
-
-use bootloader_api::config::Mapping;
-use bootloader_api::info::Optional;
-use bootloader_api::{BootInfo, BootloaderConfig, entry_point};
 use core::panic::PanicInfo;
-use log::debug;
 use log::info;
 
+#[cfg(feature = "boot-bios")]
+use bootloader_api::config::Mapping;
+#[cfg(feature = "boot-bios")]
+use bootloader_api::{BootInfo, BootloaderConfig, entry_point};
+
+#[cfg(feature = "boot-bios")]
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
     config.mappings.physical_memory = Some(Mapping::Dynamic);
     config
 };
 
+#[cfg(feature = "boot-bios")]
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
+#[cfg(feature = "boot-bios")]
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
-    // Move framebuffer out so we don't keep borrowing `boot_info`.
-    let mut framebuffer = core::mem::replace(&mut boot_info.framebuffer, Optional::None);
+    let framebuffer = core::mem::replace(
+        &mut boot_info.framebuffer,
+        bootloader_api::info::Optional::None,
+    );
+    let mut framebuffer = match framebuffer {
+        bootloader_api::info::Optional::Some(framebuffer) => Some(framebuffer),
+        bootloader_api::info::Optional::None => None,
+    };
 
-    #[cfg(feature = "mm")]
+    let physical_memory_offset = boot_info
+        .physical_memory_offset
+        .as_ref()
+        .copied()
+        .expect("bootloader did not provide a physical memory offset");
+    let memory_regions = unsafe {
+        core::slice::from_raw_parts(
+            boot_info.memory_regions.as_ptr(),
+            boot_info.memory_regions.len(),
+        )
+    };
+
     {
-        let physical_memory_offset = boot_info
-            .physical_memory_offset
-            .as_ref()
-            .copied()
-            .expect("bootloader did not provide a physical memory offset");
-        let memory_regions = unsafe {
-            // SAFETY: bootloader memory regions live for kernel lifetime
-            core::slice::from_raw_parts(
-                boot_info.memory_regions.as_ptr(),
-                boot_info.memory_regions.len(),
-            )
-        };
         mm::init_with(physical_memory_offset, memory_regions);
     }
 
     let boot_config = boot_config::BootConfig::from_boot_info(boot_info);
-
-    let framebuffer_logger = match boot_config.shell_console() {
-        boot_config::ShellConsole::Auto => {
-            if let Optional::Some(framebuffer) = &mut framebuffer {
-                #[cfg(feature = "drivers")]
-                {
-                    let info = framebuffer.info();
-                    let buffer = framebuffer.buffer_mut();
-                    let buffer = unsafe {
-                        core::slice::from_raw_parts_mut(buffer.as_mut_ptr(), buffer.len())
-                    };
-                    Some((buffer, info))
-                }
-                #[cfg(not(feature = "drivers"))]
-                {
-                    let _ = framebuffer;
-                    None
-                }
-            } else {
-                None
-            }
-        }
-        boot_config::ShellConsole::Framebuffer => {
-            if let Optional::Some(framebuffer) = &mut framebuffer {
-                #[cfg(feature = "drivers")]
-                {
-                    let info = framebuffer.info();
-                    let buffer = framebuffer.buffer_mut();
-                    let buffer = unsafe {
-                        core::slice::from_raw_parts_mut(buffer.as_mut_ptr(), buffer.len())
-                    };
-                    Some((buffer, info))
-                }
-                #[cfg(not(feature = "drivers"))]
-                {
-                    let _ = framebuffer;
-                    None
-                }
-            } else {
-                None
-            }
-        }
-        boot_config::ShellConsole::Serial => None,
+    let use_framebuffer_console = match boot_config.shell_console() {
+        boot_config::ShellConsole::Framebuffer => framebuffer.is_some(),
+        boot_config::ShellConsole::Serial => false,
+        boot_config::ShellConsole::Auto => framebuffer.is_some(),
     };
-
+    let framebuffer_logger = None;
     let trace_serial = if matches!(
         boot_config.shell_console(),
         boot_config::ShellConsole::Serial
     ) {
         // Serial is the shell console — traces share the same port.
         Some(0x3F8)
-    } else if framebuffer_logger.is_some() {
+    } else if use_framebuffer_console {
         // Framebuffer UI is active: route kernel traces to COM1 and suppress
         // the tty layer's own serial echo so shell output stays on the screen.
         #[cfg(feature = "drivers")]
@@ -122,18 +92,19 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         Some(0x2F8)
     };
 
-    logger::init(framebuffer_logger, trace_serial, boot_config.to_log_level());
+    logger::init(framebuffer_logger, trace_serial, boot_config.log_level);
 
     info!("Starting krust kernel...");
+    #[cfg(feature = "arch-x86_64")]
     info!("Boot info version: {:?}", boot_info.api_version);
     info!("Boot log level: {:?}", boot_config.log_level);
 
     // Initialize architecture (GDT, IDT)
-    arch::x86_64::init();
+    arch::init();
     time::init();
 
     // Initialize process management
-    #[cfg(feature = "process")]
+
     process::init();
 
     // Initialize filesystem
@@ -141,7 +112,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     fs::init();
 
     // Initialize syscall interface
-    syscall::init();
+    syscall::init(boot_config.syscall_trace());
 
     // Initialize device drivers
     #[cfg(feature = "drivers")]
@@ -174,7 +145,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             "fatfs",
             crate::fs::MountDevice::device_path("/dev/sda"),
         );
-        #[cfg(feature = "process")]
+
         let _ = crate::fs::register_mount("/proc", "proc", crate::fs::MountDevice::None);
         #[cfg(feature = "drivers")]
         let _ = crate::fs::register_mount("/dev", "dev", crate::fs::MountDevice::None);
@@ -189,7 +160,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // Start the kernel shell.
     #[cfg(feature = "shell")]
     {
-        #[cfg(feature = "process")]
         let root_cwd_inode = {
             #[cfg(feature = "fs")]
             {
@@ -201,22 +171,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             }
         };
 
-        #[cfg(feature = "process")]
         process::register_boot_processes(root_cwd_inode);
-        #[cfg(feature = "process")]
-        process::set_current_pid(crate::process::SHELL_PID);
 
-        // Determine whether the shell console is framebuffer-based.
-        let use_framebuffer = match boot_config.shell_console() {
-            boot_config::ShellConsole::Framebuffer => true,
-            boot_config::ShellConsole::Serial => false,
-            boot_config::ShellConsole::Auto => matches!(framebuffer, Optional::Some(_)),
-        };
+        process::set_current_pid(crate::process::SHELL_PID);
 
         // Init framebuffer console output if needed.
         #[cfg(feature = "drivers")]
-        if use_framebuffer {
-            if let Optional::Some(framebuffer) = &mut framebuffer {
+        if use_framebuffer_console {
+            if let Some(framebuffer) = &mut framebuffer {
                 let info = framebuffer.info();
                 let buffer = framebuffer.buffer_mut();
                 let buffer =
@@ -229,7 +191,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // Framebuffer mode → tty0 (virtual console); serial mode → ttyS0.
         #[cfg(feature = "drivers")]
         {
-            let ctty = if use_framebuffer {
+            let ctty = if use_framebuffer_console {
                 crate::process::task::ControllingTerminal::VirtualConsole(0)
             } else {
                 crate::process::task::ControllingTerminal::Serial(
@@ -239,10 +201,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             process::set_controlling_terminal(crate::process::SHELL_PID, ctty);
         }
 
-        let reason = shell::run();
-        debug!("shell exited: {:?}", reason);
+        let _reason = shell::run();
 
-        #[cfg(feature = "process")]
         {
             process::mark_shell_exited();
             if process::terminate_root_process() {
@@ -268,7 +228,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 fn panic(info: &PanicInfo) -> ! {
     use log::error;
     error!("Kernel panic: {:#?}", info);
-    #[cfg(feature = "process")]
+
     {
         let current_pid = crate::process::current_pid();
         error!("panic trace: current_pid={}", current_pid);
@@ -294,18 +254,7 @@ fn panic(info: &PanicInfo) -> ! {
                     task.cwd_path,
                     task.argv
                 );
-                error!(
-                    "panic trace: context rip=0x{:x} rsp=0x{:x} rbp=0x{:x} user_rip=0x{:x} user_rsp=0x{:x} kernel_rsp=0x{:x} rflags=0x{:x} cr3=0x{:x} rax=0x{:x}",
-                    task.context.rip,
-                    task.context.rsp,
-                    task.context.rbp,
-                    task.context.user_rip,
-                    task.context.user_rsp,
-                    task.context.kernel_rsp,
-                    task.context.rflags,
-                    task.context.cr3,
-                    task.context.rax
-                );
+                error!("panic trace: context={:#?}", task.context);
                 error!(
                     "panic trace: pending_signals={} terminated_by_signal={:?} kernel_stack_top=0x{:x} user_stack_top=0x{:x}",
                     task.pending_signals.len(),

@@ -1,20 +1,32 @@
+use core::sync::atomic::{AtomicBool, Ordering};
 use log::{error, info};
 
 use crate::syscall::{
     handlers,
     numbers::{
         SYS_ARCH_PRCTL, SYS_BRK, SYS_CHDIR, SYS_CLOCK_GETTIME, SYS_CLOSE, SYS_EXECVE, SYS_EXIT,
-        SYS_EXIT_GROUP, SYS_FCNTL, SYS_FORK, SYS_FSTAT, SYS_GETCWD, SYS_GETDENTS64, SYS_GETGID,
-        SYS_GETPID,
-        SYS_GETRANDOM, SYS_GETUID, SYS_IOCTL, SYS_LSEEK, SYS_LSTAT, SYS_MMAP, SYS_MPROTECT,
-        SYS_MUNMAP, SYS_NANOSLEEP, SYS_NEWFSTATAT, SYS_OPEN, SYS_OPENAT, SYS_PRLIMIT64, SYS_READ,
+        SYS_EXIT_GROUP, SYS_FCNTL, SYS_FORK, SYS_FSTAT, SYS_GETCWD, SYS_GETDENTS64, SYS_GETEGID,
+        SYS_GETEUID, SYS_GETGID, SYS_GETPGID, SYS_GETPID, SYS_GETPPID, SYS_GETRANDOM, SYS_GETUID,
+        SYS_IOCTL, SYS_KILL, SYS_LSEEK, SYS_LSTAT, SYS_MMAP, SYS_MPROTECT, SYS_MUNMAP,
+        SYS_NANOSLEEP, SYS_NEWFSTATAT, SYS_OPEN, SYS_OPENAT, SYS_POLL, SYS_PRLIMIT64, SYS_READ,
         SYS_READLINKAT, SYS_RSEQ, SYS_RT_SIGACTION, SYS_RT_SIGPROCMASK, SYS_SCHED_YIELD,
-        SYS_SET_ROBUST_LIST, SYS_SET_TID_ADDRESS, SYS_SETGID, SYS_SETUID, SYS_SHUTDOWN, SYS_STAT,
-        SYS_TIME, SYS_TIMES, SYS_WAIT4, SYS_WRITE, SYS_WRITEV,
+        SYS_SET_ROBUST_LIST, SYS_SET_TID_ADDRESS, SYS_SETGID, SYS_SETPGID, SYS_SETUID,
+        SYS_SHUTDOWN, SYS_STAT, SYS_TIME, SYS_TIMES, SYS_UNAME, SYS_WAIT4, SYS_WRITE, SYS_WRITEV,
+        Syscall,
     },
 };
 
 pub type SyscallHandler = fn(&SyscallArgs) -> isize;
+
+static SYSCALL_TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+pub fn set_trace_enabled(enabled: bool) {
+    SYSCALL_TRACE_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub fn trace_enabled() -> bool {
+    SYSCALL_TRACE_ENABLED.load(Ordering::Relaxed)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyscallArgs {
@@ -28,18 +40,28 @@ pub struct SyscallArgs {
 }
 
 pub fn dispatch(args: &SyscallArgs) -> isize {
-    info!(
-        "syscall entry: pid={} nr={} ({}) args=[{:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}]",
-        crate::process::current_pid(),
-        args.number,
-        syscall_name(args.number),
-        args.arg0,
-        args.arg1,
-        args.arg2,
-        args.arg3,
-        args.arg4,
-        args.arg5,
-    );
+    if trace_enabled() {
+        info!(
+            "syscall entry: pid={} nr={} ({}) args=[{:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}]",
+            crate::process::current_pid(),
+            args.number,
+            syscall_name(args.number),
+            args.arg0,
+            args.arg1,
+            args.arg2,
+            args.arg3,
+            args.arg4,
+            args.arg5,
+        );
+
+        if let Some(syscall) = Syscall::from_number(args.number) {
+            info!(
+                "syscall meta: name={} argc={}",
+                syscall.name(),
+                syscall.arg_count()
+            );
+        }
+    }
 
     let handler: Option<SyscallHandler> = match args.number {
         SYS_READ => Some(handlers::sys_read),
@@ -48,14 +70,22 @@ pub fn dispatch(args: &SyscallArgs) -> isize {
         SYS_IOCTL => Some(handlers::sys_ioctl),
         SYS_OPEN => Some(handlers::sys_open),
         SYS_CLOSE => Some(handlers::sys_close),
+        SYS_POLL => Some(handlers::sys_poll),
         SYS_STAT => Some(handlers::sys_stat),
         SYS_FSTAT => Some(handlers::sys_fstat),
+        SYS_KILL => Some(handlers::sys_kill),
+        SYS_UNAME => Some(handlers::sys_uname),
         SYS_GETDENTS64 => Some(handlers::sys_getdents64),
         SYS_NEWFSTATAT => Some(handlers::sys_newfstatat),
         SYS_GETCWD => Some(handlers::sys_getcwd),
         SYS_CHDIR => Some(handlers::sys_chdir),
         SYS_GETUID => Some(handlers::sys_getuid),
+        SYS_GETEUID => Some(handlers::sys_geteuid),
         SYS_GETGID => Some(handlers::sys_getgid),
+        SYS_GETEGID => Some(handlers::sys_getegid),
+        SYS_SETPGID => Some(handlers::sys_setpgid),
+        SYS_GETPPID => Some(handlers::sys_getppid),
+        SYS_GETPGID => Some(handlers::sys_getpgid),
         SYS_SETUID => Some(handlers::sys_setuid),
         SYS_SETGID => Some(handlers::sys_setgid),
         SYS_TIMES => Some(handlers::sys_times),
@@ -92,14 +122,16 @@ pub fn dispatch(args: &SyscallArgs) -> isize {
     match handler {
         Some(handler) => {
             let result = handler(args);
-            info!(
-                "syscall exit: pid={} nr={} ({}) ret={}",
-                crate::process::current_pid(),
-                args.number,
-                syscall_name(args.number),
-                result
-            );
-            if result < 0 {
+            if trace_enabled() {
+                info!(
+                    "syscall exit: pid={} nr={} ({}) ret={}",
+                    crate::process::current_pid(),
+                    args.number,
+                    syscall_name(args.number),
+                    result
+                );
+            }
+            if result < 0 && trace_enabled() {
                 error!(
                     "syscall failed: nr={} ({}) errno={}",
                     args.number,
@@ -120,53 +152,18 @@ pub fn dispatch(args: &SyscallArgs) -> isize {
     }
 }
 
-fn syscall_name(number: usize) -> &'static str {
-    match number {
-        SYS_READ => "read",
-        SYS_WRITE => "write",
-        SYS_WRITEV => "writev",
-        SYS_IOCTL => "ioctl",
-        SYS_OPEN => "open",
-        SYS_CLOSE => "close",
-        SYS_STAT => "stat",
-        SYS_FSTAT => "fstat",
-        SYS_GETDENTS64 => "getdents64",
-        SYS_NEWFSTATAT => "newfstatat",
-        SYS_GETCWD => "getcwd",
-        SYS_CHDIR => "chdir",
-        SYS_GETUID => "getuid",
-        SYS_GETGID => "getgid",
-        SYS_SETUID => "setuid",
-        SYS_SETGID => "setgid",
-        SYS_TIMES => "times",
-        SYS_TIME => "time",
-        SYS_GETPID => "getpid",
-        SYS_FORK => "fork",
-        SYS_EXECVE => "execve",
-        SYS_EXIT => "exit",
-        SYS_EXIT_GROUP => "exit_group",
-        SYS_SHUTDOWN => "shutdown",
-        SYS_WAIT4 => "wait4",
-        SYS_SCHED_YIELD => "sched_yield",
-        SYS_MMAP => "mmap",
-        SYS_MUNMAP => "munmap",
-        SYS_MPROTECT => "mprotect",
-        SYS_BRK => "brk",
-        SYS_ARCH_PRCTL => "arch_prctl",
-        SYS_SET_TID_ADDRESS => "set_tid_address",
-        SYS_CLOCK_GETTIME => "clock_gettime",
-        SYS_READLINKAT => "readlinkat",
-        SYS_SET_ROBUST_LIST => "set_robust_list",
-        SYS_PRLIMIT64 => "prlimit64",
-        SYS_GETRANDOM => "getrandom",
-        SYS_RSEQ => "rseq",
-        SYS_LSTAT => "lstat",
-        SYS_LSEEK => "lseek",
-        SYS_FCNTL => "fcntl",
-        SYS_OPENAT => "openat",
-        SYS_RT_SIGACTION => "rt_sigaction",
-        SYS_RT_SIGPROCMASK => "rt_sigprocmask",
-        SYS_NANOSLEEP => "nanosleep",
-        _ => "unknown",
+pub fn kernel_syscall_invoke(args: &SyscallArgs) -> isize {
+    let previous = crate::process::current_task_mode();
+    let _ = crate::process::set_current_task_mode(crate::process::task::TaskMode::Kernel);
+    let result = dispatch(&args);
+    if let Some(mode) = previous {
+        let _ = crate::process::set_current_task_mode(mode);
     }
+    return result;
+}
+
+fn syscall_name(number: usize) -> &'static str {
+    Syscall::from_number(number)
+        .map(|syscall| syscall.name())
+        .unwrap_or("unknown")
 }

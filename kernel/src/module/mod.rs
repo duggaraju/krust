@@ -147,7 +147,6 @@ impl traits::KernelRegistry for KernelServices {
             .map_err(|_| traits::ModuleError::CleanupFailed)
     }
 
-    #[cfg(feature = "process")]
     fn register_binfmt_handler(
         &self,
         handler: Arc<dyn crate::process::binfmt::BinaryFormatHandler>,
@@ -156,7 +155,6 @@ impl traits::KernelRegistry for KernelServices {
             .map_err(|_| traits::ModuleError::InitFailed)
     }
 
-    #[cfg(feature = "process")]
     fn unregister_binfmt_handler(&self, name: &str) -> Result<(), traits::ModuleError> {
         crate::process::binfmt::unregister_handler(name)
             .map_err(|_| traits::ModuleError::CleanupFailed)
@@ -181,7 +179,7 @@ impl traits::KernelRegistry for KernelServices {
 
 pub fn init() {
     registry::init();
-    #[cfg(feature = "process")]
+
     crate::process::binfmt::reset_dynamic_handlers();
     let services = kernel_services();
 

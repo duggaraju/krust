@@ -29,13 +29,11 @@ pub trait KernelRegistry: Send + Sync {
     #[cfg(feature = "drivers")]
     fn unregister_bus(&self, name: &str) -> Result<(), ModuleError>;
 
-    #[cfg(feature = "process")]
     fn register_binfmt_handler(
         &self,
         handler: Arc<dyn crate::process::binfmt::BinaryFormatHandler>,
     ) -> Result<(), ModuleError>;
 
-    #[cfg(feature = "process")]
     fn unregister_binfmt_handler(&self, name: &str) -> Result<(), ModuleError>;
 
     #[cfg(feature = "drivers")]

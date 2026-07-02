@@ -7,7 +7,6 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::ptr;
 
 pub const STAT_TYPE_REGULAR: u32 = 1;
 pub const STAT_TYPE_DIRECTORY: u32 = 2;
@@ -201,7 +200,6 @@ pub fn getpid() -> isize {
 
 pub fn brk(addr: usize) -> Result<usize, isize> {
     const PAGE_SIZE: usize = 4096;
-    const USER_BRK_MAX: usize = 0x0000_7fff_0000_0000;
 
     process::with_current_task_mut(|task| {
         let current = task.brk_end;
@@ -211,7 +209,7 @@ pub fn brk(addr: usize) -> Result<usize, isize> {
         if addr == 0 {
             return Ok(current);
         }
-        if addr < task.brk_start || addr > USER_BRK_MAX {
+        if addr < task.brk_start || addr > crate::arch::user_brk_max() {
             return Ok(current);
         }
 
@@ -222,7 +220,7 @@ pub fn brk(addr: usize) -> Result<usize, isize> {
                 .map_zeroed_region(
                     task.brk_mapped_end,
                     map_size,
-                    x86_64::structures::paging::PageTableFlags::WRITABLE,
+                    crate::arch::writable_user_page_flags(),
                 )
                 .map_err(|_| -12isize)?;
             task.brk_mapped_end = mapped_target;
@@ -250,9 +248,9 @@ pub fn brk_set_end(end: usize) -> Result<(), isize> {
 
 /// Map `len` anonymous zero-filled bytes starting at `addr` into the current address space.
 pub fn mmap_anon(addr: usize, len: usize, writable: bool) -> Result<(), isize> {
-    let mut flags = x86_64::structures::paging::PageTableFlags::empty();
+    let mut flags = crate::arch::empty_user_page_flags();
     if writable {
-        flags |= x86_64::structures::paging::PageTableFlags::WRITABLE;
+        flags |= crate::arch::writable_user_page_flags();
     }
     process::with_current_task_mut(|task| {
         task.address_space
@@ -278,46 +276,8 @@ pub fn lseek(fd: usize, offset: i64, whence: usize) -> Result<i64, isize> {
     })
 }
 
-const ARCH_SET_GS: usize = 0x1001;
-const ARCH_SET_FS: usize = 0x1002;
-const ARCH_GET_FS: usize = 0x1003;
-const ARCH_GET_GS: usize = 0x1004;
-
 pub fn arch_prctl(code: usize, addr: usize) -> Result<usize, isize> {
-    process::with_current_task_mut(|task| match code {
-        ARCH_SET_FS => {
-            task.fs_base = addr as u64;
-            #[cfg(target_arch = "x86_64")]
-            crate::arch::x86_64::syscall::set_user_bases(task.fs_base, task.gs_base);
-            Ok(0)
-        }
-        ARCH_SET_GS => {
-            task.gs_base = addr as u64;
-            #[cfg(target_arch = "x86_64")]
-            crate::arch::x86_64::syscall::set_user_bases(task.fs_base, task.gs_base);
-            Ok(0)
-        }
-        ARCH_GET_FS => {
-            if addr == 0 {
-                return Err(-14isize);
-            }
-            unsafe {
-                ptr::write(addr as *mut u64, task.fs_base);
-            }
-            Ok(0)
-        }
-        ARCH_GET_GS => {
-            if addr == 0 {
-                return Err(-14isize);
-            }
-            unsafe {
-                ptr::write(addr as *mut u64, task.gs_base);
-            }
-            Ok(0)
-        }
-        _ => Err(-22isize),
-    })
-    .ok_or(-1isize)?
+    crate::arch::arch_prctl(code, addr)
 }
 
 pub fn set_tid_address(_clear_child_tid: usize) -> Result<usize, isize> {
@@ -335,6 +295,133 @@ pub fn rseq(
     _sig: usize,
 ) -> Result<usize, isize> {
     Ok(0)
+}
+
+pub fn fork() -> Result<u64, isize> {
+    let rsp = current_kernel_rsp();
+    let on_task_stack = crate::process::with_current_task_mut(|task| {
+        let (base, top) = task.kernel_stack_range();
+        let rsp = rsp as usize;
+        rsp >= base && rsp <= top
+    })
+    .unwrap_or(false);
+    if !on_task_stack {
+        log::warn!(
+            "fork: kernel caller rsp=0x{:x} is outside task kernel stack; refusing resumable fork",
+            rsp
+        );
+        return Err(-38);
+    }
+
+    let _ = crate::process::with_current_task_mut(|task| {
+        unsafe {
+            crate::arch::capture_current_context(&mut task.context);
+        }
+        task.context
+            .set_kernel_stack_top(task.kernel_stack_top as u64);
+        task.context
+            .set_address_space_root(task.address_space.root_paddr());
+    });
+
+    let child_pid = crate::process::fork_current_task()?;
+
+    if let Some(plan) = crate::process::yield_to_task(child_pid) {
+        unsafe {
+            crate::arch::restore_kernel_syscall_state();
+            crate::arch::switch_context(plan.old_ctx, plan.new_ctx);
+        }
+    }
+
+    if crate::process::current_pid() == child_pid {
+        Ok(0)
+    } else {
+        Ok(child_pid)
+    }
+}
+
+pub fn fork_execve(path: String, argv: Vec<String>) -> Result<u64, isize> {
+    let child_pid = crate::process::fork_current_task()?;
+
+    let configured = crate::process::with_task_mut(child_pid, |task| {
+        task.exec_path = path.clone();
+        task.set_argv(argv.clone());
+        task.context
+            .set_kernel_entry_point(fork_execve_child_entry as *const () as usize as u64);
+        task.context
+            .set_kernel_stack_pointer(task.kernel_stack_top as u64);
+        task.context.set_frame_pointer(task.kernel_stack_top as u64);
+        task.context
+            .set_kernel_stack_top(task.kernel_stack_top as u64);
+        task.userland = false;
+        task.mode = process::task::TaskMode::Kernel;
+    });
+    if configured.is_none() {
+        return Err(-1);
+    }
+
+    if let Some(plan) = crate::process::yield_to_task(child_pid) {
+        unsafe {
+            crate::arch::restore_kernel_syscall_state();
+            crate::arch::switch_context(plan.old_ctx, plan.new_ctx);
+        }
+    }
+
+    Ok(child_pid)
+}
+
+fn fork_execve_child_entry() {
+    let Some((exec_path, argv)) = crate::process::with_current_task_mut(|task| {
+        (
+            core::mem::take(&mut task.exec_path),
+            core::mem::take(&mut task.argv),
+        )
+    }) else {
+        let _ = crate::syscall::handlers::sys_exit(&crate::syscall::dispatch::SyscallArgs {
+            number: crate::syscall::numbers::SYS_EXIT,
+            arg0: 127,
+            arg1: 0,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        });
+        loop {
+            x86_64::instructions::hlt();
+        }
+    };
+
+    let envp = crate::process::with_current_task_mut(|task| {
+        task.env
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+    })
+    .unwrap_or_default();
+
+    if let Err(_errno) = execve_with_args(exec_path.as_str(), argv, envp) {
+        let _ = crate::syscall::handlers::sys_exit(&crate::syscall::dispatch::SyscallArgs {
+            number: crate::syscall::numbers::SYS_EXIT,
+            arg0: 127,
+            arg1: 0,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        });
+    }
+
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
+#[inline]
+fn current_kernel_rsp() -> u64 {
+    let rsp: u64;
+    unsafe {
+        core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nostack, nomem, preserves_flags));
+    }
+    rsp
 }
 
 pub fn execve(path: &str) -> Result<(), isize> {
@@ -476,16 +563,16 @@ pub fn execve_with_args(path: &str, argv: Vec<String>, envp: Vec<String>) -> Res
                         .map(|value| (value + 4095) & !4095)
                         .unwrap_or(0);
                     task.initialize_brk(brk_start);
-                    task.set_mmap_start(0x0000_6000_0000_0000);
-                    task.context.cr3 = task.address_space.root_paddr();
+                    task.set_mmap_start(crate::arch::user_mmap_base());
+                    task.context.set_address_space_root(task.address_space.root_paddr());
                     task.address_space.activate();
-                    task.context.kernel_rsp = task.kernel_stack_top as u64;
+                    task.context.set_kernel_stack_top(task.kernel_stack_top as u64);
                     log::info!(
                         "execve: task prepared pid={} entry=0x{:x} user_sp=0x{:x} cr3=0x{:x} brk_start=0x{:x}",
                         task.pid,
                         plan.entry_point,
                         stack_top,
-                        task.context.cr3,
+                        task.context.address_space_root(),
                         brk_start
                     );
                     drop(old_space);
@@ -498,8 +585,12 @@ pub fn execve_with_args(path: &str, argv: Vec<String>, envp: Vec<String>) -> Res
                     plan.entry_point,
                     stack_top
                 );
+
+                // Set task mode to User before entering usermode
+                let _ = process::set_current_task_mode(process::task::TaskMode::User);
+
                 unsafe {
-                    crate::arch::x86_64::context::enter_usermode();
+                    crate::arch::enter_usermode();
                 }
             }
         }
@@ -530,175 +621,7 @@ fn build_user_stack(
     exec_path: &str,
     plan: &crate::process::binfmt::LoadPlan,
 ) -> Result<usize, isize> {
-    const AT_NULL: usize = 0;
-    const AT_PHDR: usize = 3;
-    const AT_PHENT: usize = 4;
-    const AT_PHNUM: usize = 5;
-    const AT_PAGESZ: usize = 6;
-    const AT_BASE: usize = 7;
-    const AT_FLAGS: usize = 8;
-    const AT_ENTRY: usize = 9;
-    const AT_UID: usize = 11;
-    const AT_EUID: usize = 12;
-    const AT_GID: usize = 13;
-    const AT_EGID: usize = 14;
-    const AT_PLATFORM: usize = 15;
-    const AT_HWCAP: usize = 16;
-    const AT_CLKTCK: usize = 17;
-    const AT_SECURE: usize = 23;
-    const AT_RANDOM: usize = 25;
-    const AT_HWCAP2: usize = 26;
-    const AT_EXECFN: usize = 31;
-    const PAGE_SIZE: usize = 4096;
-    const CLKTCK: usize = 100;
-    const USER_STACK_TOP: usize = 0x0000_7fff_ffff_f000;
-    const USER_STACK_SIZE: usize = 8 * 4096;
-    const USER_STACK_RESERVE: usize = 256 * 4096;
-    const USER_STACK_MAP_SIZE: usize = USER_STACK_SIZE + USER_STACK_RESERVE + PAGE_SIZE;
-
-    let stack_base = USER_STACK_TOP - (USER_STACK_SIZE + USER_STACK_RESERVE);
-    address_space
-        .map_zeroed_region(
-            stack_base,
-            USER_STACK_MAP_SIZE,
-            x86_64::structures::paging::PageTableFlags::WRITABLE,
-        )
-        .map_err(|_| -5isize)?;
-
-    let mut sp = USER_STACK_TOP - USER_STACK_RESERVE;
-    let mut arg_ptrs = Vec::with_capacity(argv.len());
-    let mut env_ptrs = Vec::with_capacity(envp.len());
-
-    for value in envp.iter().rev() {
-        let bytes = value.as_bytes();
-        sp -= bytes.len() + 1;
-        address_space.write_bytes(sp, bytes).map_err(|_| -5isize)?;
-        address_space
-            .write_bytes(sp + bytes.len(), &[0])
-            .map_err(|_| -5isize)?;
-        env_ptrs.push(sp);
-    }
-
-    for value in argv.iter().rev() {
-        let bytes = value.as_bytes();
-        sp -= bytes.len() + 1;
-        address_space.write_bytes(sp, bytes).map_err(|_| -5isize)?;
-        address_space
-            .write_bytes(sp + bytes.len(), &[0])
-            .map_err(|_| -5isize)?;
-        arg_ptrs.push(sp);
-    }
-
-    let platform = b"x86_64";
-    sp -= platform.len() + 1;
-    address_space
-        .write_bytes(sp, platform)
-        .map_err(|_| -5isize)?;
-    address_space
-        .write_bytes(sp + platform.len(), &[0])
-        .map_err(|_| -5isize)?;
-    let platform_addr = sp;
-
-    let exec_bytes = exec_path.as_bytes();
-    sp -= exec_bytes.len() + 1;
-    address_space
-        .write_bytes(sp, exec_bytes)
-        .map_err(|_| -5isize)?;
-    address_space
-        .write_bytes(sp + exec_bytes.len(), &[0])
-        .map_err(|_| -5isize)?;
-    let execfn_addr = sp;
-
-    sp -= 16;
-    let random_addr = sp;
-    let random_seed = [0x5Au8; 16];
-    address_space
-        .write_bytes(random_addr, &random_seed)
-        .map_err(|_| -5isize)?;
-
-    sp &= !0xfusize;
-
-    let push_u64 = |space: &mut crate::mm::address_space::AddressSpace,
-                    sp: &mut usize,
-                    value: usize|
-     -> Result<(), isize> {
-        *sp -= 8;
-        let bytes = (value as u64).to_ne_bytes();
-        space.write_bytes(*sp, &bytes).map_err(|_| -5isize)
-    };
-
-    let push_auxv = |space: &mut crate::mm::address_space::AddressSpace,
-                     sp: &mut usize,
-                     key: usize,
-                     value: usize|
-     -> Result<(), isize> {
-        push_u64(space, sp, value)?;
-        push_u64(space, sp, key)
-    };
-
-    push_auxv(address_space, &mut sp, AT_NULL, 0)?;
-    push_auxv(address_space, &mut sp, AT_EXECFN, execfn_addr)?;
-    push_auxv(address_space, &mut sp, AT_HWCAP2, 0)?;
-    push_auxv(address_space, &mut sp, AT_RANDOM, random_addr)?;
-    push_auxv(address_space, &mut sp, AT_SECURE, 0)?;
-    push_auxv(address_space, &mut sp, AT_CLKTCK, CLKTCK)?;
-    push_auxv(address_space, &mut sp, AT_HWCAP, 0)?;
-    push_auxv(address_space, &mut sp, AT_PLATFORM, platform_addr)?;
-    push_auxv(address_space, &mut sp, AT_EGID, 0)?;
-    push_auxv(address_space, &mut sp, AT_GID, 0)?;
-    push_auxv(address_space, &mut sp, AT_EUID, 0)?;
-    push_auxv(address_space, &mut sp, AT_UID, 0)?;
-    push_auxv(address_space, &mut sp, AT_ENTRY, plan.entry_point)?;
-    push_auxv(address_space, &mut sp, AT_FLAGS, 0)?;
-    push_auxv(address_space, &mut sp, AT_BASE, 0)?;
-    push_auxv(address_space, &mut sp, AT_PAGESZ, PAGE_SIZE)?;
-    push_auxv(address_space, &mut sp, AT_PHNUM, plan.phnum)?;
-    push_auxv(address_space, &mut sp, AT_PHENT, plan.phent_size)?;
-    push_auxv(address_space, &mut sp, AT_PHDR, plan.phdr_addr)?;
-
-    log::info!(
-        "build_user_stack: AT_PHDR=0x{:x} AT_PHENT={} AT_PHNUM={} AT_ENTRY=0x{:x}",
-        plan.phdr_addr,
-        plan.phent_size,
-        plan.phnum,
-        plan.entry_point
-    );
-
-    // Keep argc/argv/envp contiguous. Any alignment padding must be inserted
-    // *before* these vectors so argv[0] stays immediately after argc.
-    let table_qwords = 1usize + argv.len() + 1 + envp.len() + 1; // argc + argv + NULL + envp + NULL
-    let desired_sp_mod_16 = if table_qwords % 2 == 0 { 0 } else { 8 };
-    while (sp % 16) != desired_sp_mod_16 {
-        push_u64(address_space, &mut sp, 0)?;
-    }
-
-    // arg_ptrs and env_ptrs were collected by iterating argv/envp in REVERSE order,
-    // so arg_ptrs[0] = address of argv[last], arg_ptrs[N-1] = address of argv[0].
-    // Pushing them in forward order (NOT reversed) produces:
-    //   RSP → [argc][argv[0] ptr][argv[1] ptr]…[NULL][envp[0] ptr]…[NULL][auxv…]
-    push_u64(address_space, &mut sp, 0)?; // envp terminator
-    for ptr in env_ptrs.iter() {
-        log::info!("envp entry: 0x{:x}", *ptr);
-        push_u64(address_space, &mut sp, *ptr)?;
-    }
-    let envp_start = sp + 8 * env_ptrs.len();
-    log::info!("envp_start: 0x{:x}", envp_start);
-    push_u64(address_space, &mut sp, 0)?; // argv terminator
-    for ptr in arg_ptrs.iter() {
-        push_u64(address_space, &mut sp, *ptr)?;
-        log::info!("argv entry: 0x{:x}", *ptr);
-    }
-
-    push_u64(address_space, &mut sp, argv.len())?; // argc
-
-    log::info!(
-        "build_user_stack: final sp=0x{:x} sp%16={} argc={}",
-        sp,
-        sp % 16,
-        argv.len()
-    );
-
-    Ok(sp)
+    crate::arch::build_initial_user_stack(address_space, argv, envp, exec_path, plan)
 }
 
 fn file_type_to_u32(file_type: FileType) -> u32 {

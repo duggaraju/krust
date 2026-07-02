@@ -1,38 +1,28 @@
-use x86_64::instructions::port::{PortGeneric, ReadWriteAccess};
-
-use crate::arch::{ArchContext, ArchInterrupts, ArchPaging};
-
+#[cfg(feature = "boot-uefi")]
+pub mod boot;
 pub mod context;
-pub mod gdt;
 pub mod interrupts;
 pub mod paging;
-pub mod pit;
 pub mod syscall;
 pub mod userspace;
 
-pub fn shutdown(status: crate::arch::ShutdownStatus) -> ! {
-    use x86_64::instructions::port::Port;
+use crate::arch::{ArchContext, ArchInterrupts, ArchPaging};
 
-    // Best-effort emulator shutdown via ISA debug-exit.
-    // Environments that do not expose this port will simply fall through.
-    let code = match status {
-        crate::arch::ShutdownStatus::Success => 0x10u32,
-        crate::arch::ShutdownStatus::Failure => 0x11u32,
+pub fn shutdown(status: crate::arch::ShutdownStatus) -> ! {
+    let _code = match status {
+        crate::arch::ShutdownStatus::Success => 0,
+        crate::arch::ShutdownStatus::Failure => 1,
     };
 
+    // ARM64 shutdown via PSCI (Power State Coordination Interface)
+    // System off command: SYSTEM_OFF = 0x84000008
     unsafe {
-        let mut port: PortGeneric<u32, ReadWriteAccess> = Port::new(0xf4);
-        port.write(code);
+        core::arch::asm!(
+            "hvc #0",
+            in("x0") 0x84000008u64,
+            options(noreturn, preserves_flags)
+        );
     }
-
-    interrupts::halt_loop()
-}
-
-pub fn init() {
-    gdt::init();
-    interrupts::init();
-    pit::init();
-    syscall::init();
 }
 
 pub struct Interrupts;
@@ -55,10 +45,10 @@ pub struct Paging;
 
 impl ArchPaging for Paging {
     type PageTable = paging::PageTable;
-    type Mapper = paging::OffsetPageTable<'static>;
+    type Mapper = paging::OffsetPageTable;
 
     fn init() {
-        unreachable!("arch paging init is wired by the active boot path");
+        paging::init();
     }
 }
 
@@ -72,4 +62,9 @@ impl ArchContext for Context {
         // Note: actual switching is done via context::switch() inline assembly.
         // This trait impl exists for architectural compatibility.
     }
+}
+
+pub fn init() {
+    interrupts::init();
+    syscall::init();
 }

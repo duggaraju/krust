@@ -30,7 +30,7 @@ enum Commands {
 
 #[derive(Parser, Debug)]
 struct RunArgs {
-    #[arg(value_enum)]
+    #[arg(value_enum, default_value_t = BootMode::Uefi)]
     mode: BootMode,
 
     #[arg(long)]
@@ -141,16 +141,15 @@ fn cmd_mkdisk(args: MkdiskArgs) {
 fn cmd_run(cli: RunArgs) {
     // read env variables that were set in build script
     let kernel_path = env!("KERNEL_PATH");
+    let kernel_bios_path = env!("KERNEL_BIOS_PATH");
     let boot_log_level = env!("KRUST_BOOT_LOG_LEVEL");
     let uefi_path = env!("UEFI_PATH");
     let bios_path = env!("BIOS_PATH");
 
     let mode_uefi = matches!(cli.mode, BootMode::Uefi);
-    let uefi = if cli.headless || cli.pty {
-        true
-    } else {
-        mode_uefi
-    };
+    let uefi = mode_uefi;
+    let use_secondary_serial = cli.headless || cli.pty;
+    let serial_shell_boot = use_secondary_serial || (!uefi && qemu_display_none(&cli.qemu_args));
 
     let sata_vhd = if cli.no_vhd {
         None
@@ -209,8 +208,12 @@ fn cmd_run(cli: RunArgs) {
 
         let code = prebuilt.get_file(Arch::X64, FileType::Code);
         let vars = prebuilt.get_file(Arch::X64, FileType::Vars);
-        let image_path = if cli.headless || cli.pty {
-            build_headless_uefi_image(kernel_path, boot_log_level)
+        let image_path = if serial_shell_boot {
+            build_headless_uefi_image(
+                kernel_path,
+                boot_log_level,
+                if use_secondary_serial { 2 } else { 1 },
+            )
         } else {
             PathBuf::from(uefi_path)
         };
@@ -227,8 +230,17 @@ fn cmd_run(cli: RunArgs) {
             vars.display()
         ));
     } else {
+        let image_path = if serial_shell_boot {
+            build_headless_bios_image(
+                kernel_bios_path,
+                boot_log_level,
+                if use_secondary_serial { 2 } else { 1 },
+            )
+        } else {
+            PathBuf::from(bios_path)
+        };
         cmd.arg("-drive")
-            .arg(format!("format=raw,file={bios_path}"));
+            .arg(format!("format=raw,file={}", image_path.display()));
     }
 
     if !cli.qemu_args.is_empty() {
@@ -245,15 +257,15 @@ fn cmd_run(cli: RunArgs) {
     };
 }
 
-fn build_headless_uefi_image(kernel_path: &str, boot_log_level: &str) -> PathBuf {
+fn build_headless_uefi_image(kernel_path: &str, boot_log_level: &str, shell_port: u8) -> PathBuf {
     let temp_dir = env::temp_dir();
     let pid = std::process::id();
     let ramdisk_path = temp_dir.join(format!("krust-headless-{pid}.ramdisk"));
     let image_path = temp_dir.join(format!("krust-headless-{pid}.img"));
 
     let boot_toml = format!(
-        "log_level = \"{}\"\nshell_port = 2\nshell_console = \"serial\"\n",
-        boot_log_level
+        "log_level = \"{}\"\nshell_port = {}\nshell_console = \"serial\"\n",
+        boot_log_level, shell_port
     );
     fs::write(
         &ramdisk_path,
@@ -267,6 +279,36 @@ fn build_headless_uefi_image(kernel_path: &str, boot_log_level: &str) -> PathBuf
         .expect("failed to create headless uefi image");
 
     image_path
+}
+
+fn build_headless_bios_image(kernel_path: &str, boot_log_level: &str, shell_port: u8) -> PathBuf {
+    let temp_dir = env::temp_dir();
+    let pid = std::process::id();
+    let ramdisk_path = temp_dir.join(format!("krust-headless-{pid}.ramdisk"));
+    let image_path = temp_dir.join(format!("krust-headless-{pid}.bios.img"));
+
+    let boot_toml = format!(
+        "log_level = \"{}\"\nshell_port = {}\nshell_console = \"serial\"\n",
+        boot_log_level, shell_port
+    );
+    fs::write(
+        &ramdisk_path,
+        make_cpio_newc(&[("boot.toml", boot_toml.as_bytes())]),
+    )
+    .expect("failed to create headless ramdisk");
+
+    bootloader::BiosBoot::new(PathBuf::from(kernel_path).as_path())
+        .set_ramdisk(&ramdisk_path)
+        .create_disk_image(&image_path)
+        .expect("failed to create headless bios image");
+
+    image_path
+}
+
+fn qemu_display_none(qemu_args: &[String]) -> bool {
+    qemu_args
+        .windows(2)
+        .any(|w| (w[0] == "--display" || w[0] == "-display") && w[1].eq_ignore_ascii_case("none"))
 }
 
 fn make_cpio_newc(entries: &[(&str, &[u8])]) -> Vec<u8> {

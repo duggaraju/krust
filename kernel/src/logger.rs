@@ -1,19 +1,29 @@
+#[cfg(feature = "arch-x86_64")]
 use bootloader_api::info::FrameBufferInfo;
+#[cfg(feature = "arch-x86_64")]
 use bootloader_x86_64_common::framebuffer::FrameBufferWriter;
 use core::fmt::Write;
 use log::LevelFilter;
 use spin::{Mutex, Once};
+#[cfg(feature = "arch-x86_64")]
 use uart_16550::backend::PioBackend;
+#[cfg(feature = "arch-x86_64")]
 use uart_16550::{Config, Uart16550};
 
+#[cfg(feature = "arch-x86_64")]
 struct KernelLogger {
     /// Framebuffer writer used only during early boot, before the tty manager is up.
     framebuffer: Option<Mutex<FrameBufferWriter>>,
     serial: Option<Mutex<Uart16550<PioBackend>>>,
 }
 
+#[cfg(not(feature = "arch-x86_64"))]
+struct KernelLogger;
+
+#[cfg(feature = "arch-x86_64")]
 struct UartWriter<'a>(&'a mut Uart16550<PioBackend>);
 
+#[cfg(feature = "arch-x86_64")]
 impl core::fmt::Write for UartWriter<'_> {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         self.0.send_bytes_exact(s.as_bytes());
@@ -49,8 +59,13 @@ impl core::fmt::Write for FmtBuf {
     }
 }
 
+#[cfg(feature = "arch-x86_64")]
 static LOGGER: Once<KernelLogger> = Once::new();
 
+#[cfg(not(feature = "arch-x86_64"))]
+static LOGGER: Once<KernelLogger> = Once::new();
+
+#[cfg(feature = "arch-x86_64")]
 pub fn init(
     framebuffer: Option<(&'static mut [u8], FrameBufferInfo)>,
     serial_port: Option<u16>,
@@ -77,6 +92,17 @@ pub fn init(
     log::set_max_level(level);
 }
 
+#[cfg(not(feature = "arch-x86_64"))]
+pub fn init(
+    framebuffer: Option<(&'static mut [u8], ())>,
+    serial_port: Option<u16>,
+    level: LevelFilter,
+) {
+    let _ = (framebuffer, serial_port);
+    log::set_max_level(level);
+}
+
+#[cfg(feature = "arch-x86_64")]
 impl log::Log for KernelLogger {
     fn enabled(&self, _metadata: &log::Metadata) -> bool {
         true

@@ -98,7 +98,9 @@ impl Console {
             match crate::syscall::impls::read(self.stdin_fd, &mut buf) {
                 Ok(0) => core::hint::spin_loop(),
                 Ok(_) => match buf[0] as char {
-                    '\r' | '\n' => return line,
+                    '\r' | '\n' => {
+                        return line;
+                    }
                     '\u{0008}' | '\u{007f}' => {
                         history_cursor = None;
                         if !line.is_empty() {

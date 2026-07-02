@@ -2,12 +2,17 @@ pub mod binfmt;
 pub mod context;
 pub mod scheduler;
 pub mod task;
+pub mod waitqueue;
 
+#[cfg(feature = "drivers")]
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "drivers")]
+use spin::{Mutex, Once};
 
 use self::scheduler::SCHEDULER;
 use self::task::{ControllingTerminal, Credentials, Task, TaskMode, TaskState};
@@ -16,9 +21,26 @@ use crate::fs::vfs::{File, FileType, FsError, Inode, OpenFile};
 
 pub const ROOT_PID: u64 = 1;
 pub const SHELL_PID: u64 = 2;
+pub const KERNEL_IO_TASK_PID: u64 = 3;
 
 static CURRENT_PID: AtomicU64 = AtomicU64::new(ROOT_PID);
-static NEXT_PID: AtomicU64 = AtomicU64::new(3);
+static NEXT_PID: AtomicU64 = AtomicU64::new(4);
+
+#[cfg(feature = "drivers")]
+static TTY_FOREGROUND_PGRP: Once<Mutex<BTreeMap<ControllingTerminal, u64>>> = Once::new();
+
+#[cfg(feature = "drivers")]
+fn tty_foreground_pgrp_map() -> &'static Mutex<BTreeMap<ControllingTerminal, u64>> {
+    TTY_FOREGROUND_PGRP.call_once(|| Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(feature = "drivers")]
+static TTY_INPUT_QUEUE: Once<Mutex<waitqueue::WaitQueue>> = Once::new();
+
+#[cfg(feature = "drivers")]
+fn tty_input_queue() -> &'static Mutex<waitqueue::WaitQueue> {
+    TTY_INPUT_QUEUE.call_once(|| Mutex::new(waitqueue::WaitQueue::new()))
+}
 
 fn dummy_entry() {}
 
@@ -46,7 +68,7 @@ pub fn register_boot_processes(root_cwd: Arc<dyn Inode>) {
             String::from("/"),
             "root",
             dummy_entry,
-            root_credentials,
+            root_credentials.clone(),
         ));
     }
     if scheduler.task_by_pid(SHELL_PID).is_none() {
@@ -71,8 +93,25 @@ pub fn register_boot_processes(root_cwd: Arc<dyn Inode>) {
         shell.set_env(String::from("HOME"), shell_cwd_path);
     }
 
+    // Create kernel I/O task (part of root process) to handle TTY input and wake sleepers
+    #[cfg(feature = "drivers")]
+    if scheduler.task_by_pid(KERNEL_IO_TASK_PID).is_none() {
+        let kio_task = Task::new_with_credentials(
+            KERNEL_IO_TASK_PID,
+            ROOT_PID,
+            Arc::clone(&root_cwd),
+            String::from("/"),
+            "kernel-io",
+            kernel_io_task_entry,
+            root_credentials.clone(),
+        );
+        scheduler.add_task(kio_task);
+    }
+
     let _ = scheduler.set_task_state(ROOT_PID, TaskState::Running);
     let _ = scheduler.set_task_state(SHELL_PID, TaskState::Running);
+    #[cfg(feature = "drivers")]
+    let _ = scheduler.set_task_state(KERNEL_IO_TASK_PID, TaskState::Ready);
 }
 
 fn resolve_boot_home(home: &str, root_cwd: Arc<dyn Inode>) -> (Arc<dyn Inode>, String) {
@@ -146,6 +185,56 @@ pub fn current_uid() -> u32 {
     with_current_task_mut(|task| task.uid()).unwrap_or(0)
 }
 
+pub fn current_pgid() -> u64 {
+    with_current_task_mut(|task| task.pgid).unwrap_or(0)
+}
+
+pub fn current_sid() -> u64 {
+    with_current_task_mut(|task| task.sid).unwrap_or(0)
+}
+
+pub fn task_pgid(pid: u64) -> Option<u64> {
+    let scheduler = SCHEDULER.lock();
+    scheduler
+        .as_ref()
+        .and_then(|scheduler| scheduler.task_by_pid(pid))
+        .map(|task| task.pgid)
+}
+
+pub fn set_task_pgid(pid: u64, pgid: u64) -> Result<(), isize> {
+    let mut scheduler = SCHEDULER.lock();
+    let Some(scheduler) = scheduler.as_mut() else {
+        return Err(-1);
+    };
+
+    let requester_sid = scheduler
+        .task_by_pid(current_pid())
+        .map(|task| task.sid)
+        .ok_or(-1isize)?;
+
+    let target_sid = scheduler
+        .task_by_pid(pid)
+        .map(|task| task.sid)
+        .ok_or(-3isize)?;
+
+    if requester_sid != target_sid {
+        return Err(-1);
+    }
+
+    if !scheduler
+        .tasks()
+        .any(|task| task.sid == requester_sid && task.pid == pgid)
+    {
+        return Err(-3);
+    }
+
+    let Some(task) = scheduler.task_by_pid_mut(pid) else {
+        return Err(-3);
+    };
+    task.pgid = pgid;
+    Ok(())
+}
+
 pub fn current_gid() -> u32 {
     with_current_task_mut(|task| task.gid()).unwrap_or(0)
 }
@@ -215,8 +304,10 @@ fn close_fd_for_pid(pid: u64, fd: usize) -> Result<(), isize> {
 }
 
 pub fn close_all_fds(pid: u64) -> Result<(), isize> {
-    let fds = with_task_mut(pid, |task| task.fd_entries().map(|(fd, _)| fd).collect::<Vec<_>>())
-        .ok_or(-1isize)?;
+    let fds = with_task_mut(pid, |task| {
+        task.fd_entries().map(|(fd, _)| fd).collect::<Vec<_>>()
+    })
+    .ok_or(-1isize)?;
     for fd in fds {
         let _ = close_fd_for_pid(pid, fd);
     }
@@ -340,6 +431,18 @@ pub fn fd_descriptor(fd: usize) -> Result<FileDescriptor, isize> {
     task.fd_descriptor(fd).ok_or(-9)
 }
 
+pub fn dup_fd(old_fd: usize, min_fd: usize) -> Result<usize, isize> {
+    let pid = current_pid();
+    let mut scheduler = SCHEDULER.lock();
+    let Some(scheduler) = scheduler.as_mut() else {
+        return Err(-1);
+    };
+    let Some(task) = scheduler.task_by_pid_mut(pid) else {
+        return Err(-1);
+    };
+    task.dup_fd(old_fd, min_fd)
+}
+
 pub fn mark_shell_exited() {
     if let Some(scheduler) = SCHEDULER.lock().as_mut() {
         let _ = scheduler.set_task_state(SHELL_PID, TaskState::Zombie);
@@ -369,15 +472,23 @@ pub fn fork_current_task() -> Result<u64, isize> {
     child.pid = child_pid;
     child.parent_pid = parent_pid;
     child.state = TaskState::Ready;
-    child.context.rax = 0;
-    if child.context.rsp == 0 {
-        child.context.rsp = child.kernel_stack_top as u64;
+    child.context.set_return_value(0);
+    if child.context.kernel_stack_pointer() == 0 {
+        child
+            .context
+            .set_kernel_stack_pointer(child.kernel_stack_top as u64);
     }
-    if child.context.rbp == 0 {
-        child.context.rbp = child.kernel_stack_top as u64;
+    if child.context.frame_pointer() == 0 {
+        child
+            .context
+            .set_frame_pointer(child.kernel_stack_top as u64);
     }
-    child.context.kernel_rsp = child.kernel_stack_top as u64;
-    child.context.cr3 = child.address_space.root_paddr();
+    child
+        .context
+        .set_kernel_stack_top(child.kernel_stack_top as u64);
+    child
+        .context
+        .set_address_space_root(child.address_space.root_paddr());
     let child_priority_before = child.priority;
 
     if let Some(parent_task) = scheduler.task_by_pid_mut(parent_pid) {
@@ -462,6 +573,10 @@ pub(crate) fn set_controlling_terminal(pid: u64, target: ControllingTerminal) {
     if let Some(scheduler) = SCHEDULER.lock().as_mut() {
         if let Some(task) = scheduler.task_by_pid_mut(pid) {
             task.set_controlling_terminal(target);
+            tty_foreground_pgrp_map()
+                .lock()
+                .entry(target)
+                .or_insert(task.pgid);
         }
     }
 }
@@ -475,4 +590,87 @@ pub(crate) fn current_controlling_terminal() -> Option<ControllingTerminal> {
         .as_ref()
         .and_then(|s| s.task_by_pid(pid))
         .and_then(|task| task.controlling_terminal())
+}
+
+#[cfg(feature = "drivers")]
+pub fn tty_foreground_pgrp_for_current() -> Result<u64, isize> {
+    let tty = current_controlling_terminal().ok_or(-25isize)?;
+    let pgid = tty_foreground_pgrp_map().lock().get(&tty).copied();
+    Ok(pgid.unwrap_or_else(current_pgid))
+}
+
+#[cfg(feature = "drivers")]
+pub fn set_tty_foreground_pgrp_for_current(pgid: u64) -> Result<(), isize> {
+    if pgid == 0 {
+        return Err(-22);
+    }
+    let tty = current_controlling_terminal().ok_or(-25isize)?;
+    let sid = current_sid();
+
+    {
+        let scheduler = SCHEDULER.lock();
+        let Some(scheduler) = scheduler.as_ref() else {
+            return Err(-1);
+        };
+        if !scheduler
+            .tasks()
+            .any(|task| task.sid == sid && task.pgid == pgid)
+        {
+            return Err(-3);
+        }
+    }
+
+    tty_foreground_pgrp_map().lock().insert(tty, pgid);
+    Ok(())
+}
+
+#[cfg(feature = "drivers")]
+/// Put the current task to sleep waiting for TTY input.
+/// The task is moved to Waiting state and will be woken when input arrives.
+pub fn sleep_on_tty_input() -> bool {
+    let pid = current_pid();
+    let mut scheduler = SCHEDULER.lock();
+    let Some(scheduler) = scheduler.as_mut() else {
+        return false;
+    };
+
+    if scheduler.set_task_state(pid, TaskState::Waiting) {
+        tty_input_queue().lock().add_task(pid);
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(feature = "drivers")]
+/// Wake one task waiting for TTY input.
+/// Called by the kernel I/O task when input arrives.
+pub fn wake_one_tty_waiter() -> Option<u64> {
+    let mut queue = tty_input_queue().lock();
+    let pid = queue.wake_one()?;
+
+    let mut scheduler = SCHEDULER.lock();
+    let Some(scheduler) = scheduler.as_mut() else {
+        return Some(pid);
+    };
+
+    let _ = scheduler.set_task_state(pid, TaskState::Ready);
+    Some(pid)
+}
+
+#[cfg(feature = "drivers")]
+/// Kernel I/O task that monitors for TTY input and wakes sleeping tasks.
+/// This runs as a background kernel task, part of the root process.
+pub fn kernel_io_task_entry() {
+    loop {
+        // Poll for TTY input
+        crate::drivers::tty::poll_input();
+
+        // Check if any tasks have pending reads that should wake
+        // For now, wake one waiting task per poll
+        let _ = wake_one_tty_waiter();
+
+        // Yield to other tasks to allow shell to run
+        // This allows the scheduler to switch to waiting tasks when woken
+    }
 }

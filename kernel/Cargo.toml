@@ -4,16 +4,20 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["mm", "process", "fs", "drivers", "modules", "shell"]
-mm = []
-process = ["mm"]
+default = ["fs", "drivers", "modules", "shell", "arch-x86_64", "boot-bios"]
+
+# Architecture features
+boot-bios = ["dep:bootloader_api", "dep:bootloader-x86_64-common", "dep:bootloader-boot-config"]
+boot-uefi = ["dep:uefi"]
+arch-x86_64 = ["dep:uart_16550", "dep:pc-keyboard", "dep:x86_64", "dep:vga"]
+arch-aarch64 = []
 
 # Device feature families. Keep `drivers` as a compatibility umbrella while we
 # migrate call sites from coarse `cfg(feature = "drivers")` checks.
 device = []
 device-null = ["device"]
-device-serial = ["device"]
-device-video = ["device"]
+device-serial = ["device", "arch-x86_64"]
+device-video = ["device", "arch-x86_64"]
 device-tty = ["device", "device-serial", "device-video"]
 drivers = ["device-null", "device-serial", "device-video", "device-tty"]
 
@@ -24,21 +28,22 @@ fs-initrd = ["fs-core"]
 fs-fat32 = ["fs-core", "device"]
 fs-ext4 = ["fs-core", "device", "dep:ext4_rs"]
 fs-dev = ["fs-core", "device"]
-fs-proc = ["fs-core", "process"]
+fs-proc = ["fs-core"]
 fs = ["fs-core", "fs-ramfs", "fs-initrd", "fs-fat32", "fs-ext4", "fs-dev", "fs-proc"]
 
 modules = ["fs"]
 shell = []
 
 [dependencies]
-bootloader_api = "0.11.15"
-bootloader-x86_64-common = "0.11.15"
-bootloader-boot-config = "0.11.15"
+bootloader_api = { version = "0.11.15", optional = true }
+bootloader-x86_64-common = { version = "0.11.15", optional = true }
+bootloader-boot-config = { version = "0.11.15", optional = true }
+uefi = { version = "0.38.0", optional = true }
 log = "0.4.29"
-uart_16550 = "0.6.0"
-pc-keyboard = "0.9.0"
-x86_64 = "0.15.4"
-vga = "0.2.9"
+uart_16550 = { version = "0.6.0", optional = true }
+pc-keyboard = { version = "0.9.0", optional = true }
+x86_64 = { version = "0.15.4", optional = true }
+vga = { version = "0.2.9", optional = true }
 spin = "0.12"
 linked_list_allocator = "0.10"
 bitflags = "2"

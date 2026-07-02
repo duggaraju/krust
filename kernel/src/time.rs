@@ -10,6 +10,12 @@ pub fn uptime_ticks() -> u64 {
     read_tsc().saturating_sub(BOOT_TSC.load(Ordering::Relaxed))
 }
 
+#[cfg(feature = "arch-x86_64")]
 fn read_tsc() -> u64 {
     unsafe { core::arch::x86_64::_rdtsc() }
+}
+
+#[cfg(not(feature = "arch-x86_64"))]
+fn read_tsc() -> u64 {
+    0
 }

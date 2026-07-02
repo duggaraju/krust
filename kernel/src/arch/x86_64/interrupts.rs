@@ -7,12 +7,10 @@ use super::gdt;
 
 const IRQ_BASE_VECTOR: u8 = 32;
 
-#[cfg(feature = "process")]
 struct KernelModeGuard {
     previous: Option<crate::process::task::TaskMode>,
 }
 
-#[cfg(feature = "process")]
 impl KernelModeGuard {
     fn enter() -> Self {
         let previous = crate::process::current_task_mode();
@@ -21,7 +19,6 @@ impl KernelModeGuard {
     }
 }
 
-#[cfg(feature = "process")]
 impl Drop for KernelModeGuard {
     fn drop(&mut self) {
         if let Some(mode) = self.previous {
@@ -80,7 +77,6 @@ pub fn halt_loop() -> ! {
 }
 
 extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
-    #[cfg(feature = "process")]
     let _kernel_mode = KernelModeGuard::enter();
     log::info!("EXCEPTION: BREAKPOINT\n{stack_frame:#?}");
 }
@@ -89,18 +85,19 @@ extern "x86-interrupt" fn double_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: u64,
 ) -> ! {
-    #[cfg(feature = "process")]
     let _kernel_mode = KernelModeGuard::enter();
     log::error!("EXCEPTION: DOUBLE FAULT ({error_code:#x})\n{stack_frame:#?}");
     halt_loop()
 }
 
 extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFrame) {
-    #[cfg(feature = "process")]
     let _kernel_mode = KernelModeGuard::enter();
     log::error!("EXCEPTION: INVALID OPCODE\n{stack_frame:#?}");
-    #[cfg(feature = "process")]
-    if matches!(crate::process::current_task_mode(), Some(crate::process::task::TaskMode::User)) {
+
+    if matches!(
+        crate::process::current_task_mode(),
+        Some(crate::process::task::TaskMode::User)
+    ) {
         let pid = crate::process::current_pid();
         log::error!("invalid opcode in user task pid={} - terminating task", pid);
         let switch_plan = {
@@ -137,13 +134,18 @@ extern "x86-interrupt" fn general_protection_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: u64,
 ) {
-    #[cfg(feature = "process")]
     let _kernel_mode = KernelModeGuard::enter();
     log::error!("EXCEPTION: GENERAL PROTECTION ({error_code:#x})\n{stack_frame:#?}");
-    #[cfg(feature = "process")]
-    if matches!(crate::process::current_task_mode(), Some(crate::process::task::TaskMode::User)) {
+
+    if matches!(
+        crate::process::current_task_mode(),
+        Some(crate::process::task::TaskMode::User)
+    ) {
         let pid = crate::process::current_pid();
-        log::error!("general protection fault in user task pid={} - terminating task", pid);
+        log::error!(
+            "general protection fault in user task pid={} - terminating task",
+            pid
+        );
         let switch_plan = {
             let mut scheduler = crate::process::scheduler::SCHEDULER.lock();
             let Some(scheduler) = scheduler.as_mut() else {
@@ -178,14 +180,12 @@ extern "x86-interrupt" fn page_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
-    #[cfg(feature = "process")]
     let _kernel_mode = KernelModeGuard::enter();
     log::error!("EXCEPTION: PAGE FAULT");
     log::error!("Accessed Address: {:?}", Cr2::read());
     log::error!("Error Code: {:?}", error_code);
     log::error!("{stack_frame:#?}");
 
-    #[cfg(feature = "process")]
     if error_code.contains(PageFaultErrorCode::USER_MODE) {
         let pid = crate::process::current_pid();
         log::error!("page fault in user task pid={} - terminating task", pid);
@@ -222,7 +222,6 @@ extern "x86-interrupt" fn page_fault_handler(
 macro_rules! define_irq_handler {
     ($name:ident, $vector:expr) => {
         extern "x86-interrupt" fn $name(_stack_frame: InterruptStackFrame) {
-            #[cfg(feature = "process")]
             let _kernel_mode = KernelModeGuard::enter();
             log::warn!("INTERRUPT: vector {}", $vector);
         }
@@ -230,23 +229,13 @@ macro_rules! define_irq_handler {
 }
 
 extern "x86-interrupt" fn irq0_handler(_stack_frame: InterruptStackFrame) {
-    #[cfg(feature = "process")]
     let _kernel_mode = KernelModeGuard::enter();
+    use crate::process::scheduler::UPTIME_MS;
 
-    #[cfg(feature = "process")]
-    {
-        use crate::process::scheduler::UPTIME_MS;
-
-        // Update system uptime
-        let mut uptime = UPTIME_MS.lock();
-        *uptime += 10; // PIT fires every 10ms
-        drop(uptime);
-    }
-
-    #[cfg(not(feature = "process"))]
-    {
-        log::warn!("INTERRUPT: vector {}", IRQ_BASE_VECTOR + 0);
-    }
+    // Update system uptime
+    let mut uptime = UPTIME_MS.lock();
+    *uptime += 10; // PIT fires every 10ms
+    drop(uptime);
 }
 define_irq_handler!(irq1_handler, IRQ_BASE_VECTOR + 1);
 define_irq_handler!(irq2_handler, IRQ_BASE_VECTOR + 2);

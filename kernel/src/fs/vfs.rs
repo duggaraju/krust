@@ -6,8 +6,8 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
 use core::str;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(feature = "drivers")]
 use crate::drivers::registry;
@@ -470,7 +470,12 @@ pub fn write_u64_decimal_into<'a>(value: u64, name_buf: &'a mut [u8]) -> Result<
     str::from_utf8(&name_buf[..len]).map_err(|_| FsError::IoError)
 }
 
-pub fn lookup_inode_by_tuple(fs_id: u64, major: u16, minor: u16, ino: u64) -> Option<Arc<dyn Inode>> {
+pub fn lookup_inode_by_tuple(
+    fs_id: u64,
+    major: u16,
+    minor: u16,
+    ino: u64,
+) -> Option<Arc<dyn Inode>> {
     inode_tuple_index()
         .lock()
         .get(&(fs_id, major, minor, ino))

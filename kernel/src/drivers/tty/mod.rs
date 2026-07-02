@@ -265,14 +265,16 @@ impl TtyManager {
             if SERIAL_ECHO.load(Ordering::Relaxed) {
                 write_serial_bytes(&processed);
             }
-            if !crate::drivers::video::is_initialized() {
-                log::debug!("tty: framebuffer not initialized; skipping paint");
-            } else if self.vcs[index].should_use_viewport()
-                || VirtualConsole::needs_full_redraw(&processed)
-            {
-                self.vcs[index].redraw();
-            } else if let Ok(text) = core::str::from_utf8(&processed) {
-                crate::drivers::video::write_str(text);
+            if crate::drivers::video::is_initialized() {
+                if self.vcs[index].should_use_viewport()
+                    || VirtualConsole::needs_full_redraw(&processed)
+                {
+                    self.vcs[index].redraw();
+                } else if let Ok(text) = core::str::from_utf8(&processed) {
+                    crate::drivers::video::write_str(text);
+                } else {
+                    self.vcs[index].redraw();
+                }
             } else {
                 self.vcs[index].redraw();
             }
@@ -295,15 +297,16 @@ impl TtyManager {
             if SERIAL_ECHO.load(Ordering::Relaxed) {
                 write_serial_bytes(&processed);
             }
-            if !crate::drivers::video::is_initialized() {
-                return;
-            }
-            if self.vcs[active].should_use_viewport()
-                || VirtualConsole::needs_full_redraw(&processed)
-            {
-                self.vcs[active].redraw();
-            } else if let Ok(text) = core::str::from_utf8(&processed) {
-                crate::drivers::video::write_str(text);
+            if crate::drivers::video::is_initialized() {
+                if self.vcs[active].should_use_viewport()
+                    || VirtualConsole::needs_full_redraw(&processed)
+                {
+                    self.vcs[active].redraw();
+                } else if let Ok(text) = core::str::from_utf8(&processed) {
+                    crate::drivers::video::write_str(text);
+                } else {
+                    self.vcs[active].redraw();
+                }
             } else {
                 self.vcs[active].redraw();
             }
@@ -371,7 +374,7 @@ fn is_key_press(state: KeyState) -> bool {
     matches!(state, KeyState::Down | KeyState::SingleShot)
 }
 
-fn poll_input() {
+pub(crate) fn poll_input() {
     let serial = SERIAL_DEVICE.lock().clone();
     if let Some(device) = serial {
         let mut buf = [0u8; 64];
@@ -433,8 +436,14 @@ pub(crate) fn tty_read(vc_index: usize, buf: &mut [u8]) -> usize {
     if buf.is_empty() {
         return 0;
     }
-    poll_input();
-    manager().lock().read(vc_index, buf)
+    loop {
+        poll_input();
+        let read = manager().lock().read(vc_index, buf);
+        if read != 0 {
+            return read;
+        }
+        core::hint::spin_loop();
+    }
 }
 
 pub(crate) fn tty_write(vc_index: usize, bytes: &[u8]) {
