@@ -11,9 +11,10 @@ const DOUBLE_FAULT_STACK_SIZE: usize = 4096 * 5;
 
 static TSS: LazyLock<TaskStateSegment> = LazyLock::new(|| {
     let mut tss = TaskStateSegment::new();
-    static DOUBLE_FAULT_STACK: [u8; DOUBLE_FAULT_STACK_SIZE] = [0; DOUBLE_FAULT_STACK_SIZE];
+    static mut DOUBLE_FAULT_STACK: [u8; DOUBLE_FAULT_STACK_SIZE] = [0; DOUBLE_FAULT_STACK_SIZE];
 
-    let stack_start = VirtAddr::from_ptr(&DOUBLE_FAULT_STACK);
+    // Hardware writes the exception frame here, so this must not live in rodata.
+    let stack_start = VirtAddr::from_ptr(core::ptr::addr_of!(DOUBLE_FAULT_STACK));
     let stack_end = stack_start + DOUBLE_FAULT_STACK_SIZE as u64;
     tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = stack_end;
     tss

@@ -5,7 +5,7 @@ use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, Pag
 
 use super::gdt;
 
-const IRQ_BASE_VECTOR: u8 = 32;
+use super::pic::{self, IRQ_BASE_VECTOR};
 
 struct KernelModeGuard {
     previous: Option<crate::process::task::TaskMode>,
@@ -59,7 +59,9 @@ static IDT: LazyLock<InterruptDescriptorTable> = LazyLock::new(|| {
 });
 
 pub fn init() {
+    interrupts::disable();
     IDT.load();
+    pic::init();
 }
 
 pub fn enable() {
@@ -224,6 +226,7 @@ macro_rules! define_irq_handler {
         extern "x86-interrupt" fn $name(_stack_frame: InterruptStackFrame) {
             let _kernel_mode = KernelModeGuard::enter();
             log::warn!("INTERRUPT: vector {}", $vector);
+            pic::end_of_interrupt($vector);
         }
     };
 }
@@ -236,6 +239,7 @@ extern "x86-interrupt" fn irq0_handler(_stack_frame: InterruptStackFrame) {
     let mut uptime = UPTIME_MS.lock();
     *uptime += 10; // PIT fires every 10ms
     drop(uptime);
+    pic::end_of_interrupt(IRQ_BASE_VECTOR);
 }
 define_irq_handler!(irq1_handler, IRQ_BASE_VECTOR + 1);
 define_irq_handler!(irq2_handler, IRQ_BASE_VECTOR + 2);

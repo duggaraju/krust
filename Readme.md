@@ -50,6 +50,46 @@ To quickly repro BusyBox launch from stdin:
 (sleep 8; printf '/bin/bin/busybox ls\n'; sleep 3) | cargo run -Z bindeps -- run uefi --vhd ./target/krust-disk-fat.vhd -- --display none --no-reboot --no-shutdown
 ```
 
+### BIOS/UEFI userspace regression
+
+With an existing ext4 root VHD containing `/bin/busybox`, run:
+
+```bash
+cargo check -p kernel --target x86_64-unknown-none --locked
+cargo build -Z bindeps --locked
+scripts/smoke-userspace.sh target/krust-disk-ext4.vhd
+```
+
+The probe waits for serial shell prompts (rather than sleeping through boot),
+runs BusyBox `echo`, `ls /proc /dev`, `true`, and another `echo` through
+the kernel shell's fork/wait/exec path,
+then requests guest shutdown. It tests both BIOS and UEFI, with a 120-second
+deadline per boot and QEMU snapshots. It checks the runner's success status,
+output markers, directory listings, absence of kernel exceptions, and that the
+source VHD hash is unchanged. Logs remain in `target/userspace-smoke-*.log`;
+generated boot images and ramdisks are removed. Requirements: Bash, GNU
+`timeout`, `sha256sum`, and the normal QEMU/build prerequisites.
+
+This is an entry/IRQ regression, not certification of userspace `fork`.
+An ash subprocess sequence also faults on the original, unmodified UEFI
+kernel during userspace fork (a ring-0 instruction-fetch
+protection fault). Separately, the existing `sys_execve` handler ignores
+userspace argv/envp, so `env /bin/busybox echo ...` loses its arguments.
+Those pre-existing syscall limitations are outside this boot-entry fix;
+the probe deliberately uses the kernel shell's `fork_execve` path.
+
+The kernel must establish CPU/device state instead of inheriting firmware
+defaults. In particular, BIOS can leave the legacy PIC's IRQ0 at vector `0x08`
+(the double-fault vector), while UEFI masks the PIC. A pending timer interrupt
+then enters the double-fault IST before the first userspace instruction; an
+immutable IST stack in read-only memory misleadingly produces a supervisor
+write fault at the ELF entry. The kernel remaps IRQs to `0x20..0x2f`,
+enables only the handled PIT IRQ, acknowledges interrupts, and allocates a
+writable exception stack. BIOS also leaves CR4.OSFXSR clear, unlike UEFI,
+causing BusyBox's first SSE instruction to fault. Explicit x87/SSE initialization
+fixes that second firmware dependency. Kernel page permissions and CR0.WP
+remain unchanged.
+
 ### Runner exit codes
 
 The `run` command enables QEMU's `isa-debug-exit` device. A guest write is
