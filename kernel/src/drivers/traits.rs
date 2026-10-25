@@ -47,6 +47,10 @@ pub struct BusDeviceInfo {
     pub pci_bus: Option<u8>,
     pub pci_device: Option<u8>,
     pub pci_function: Option<u8>,
+    pub vendor_id: Option<u16>,
+    pub device_id: Option<u16>,
+    /// PCI header layout, without the multifunction bit.
+    pub header_type: Option<u8>,
     pub class_code: Option<u8>,
     pub subclass: Option<u8>,
     pub prog_if: Option<u8>,

@@ -8,6 +8,8 @@ use alloc::vec::Vec;
 use crate::drivers::traits::{Bus, BusDeviceInfo, BusError, BusType, DeviceType};
 use crate::module::traits::{KernelModule, KernelRegistry, ModuleError};
 
+mod enumeration;
+
 pub struct PciBus;
 
 pub struct PciBusModule;
@@ -17,46 +19,60 @@ impl PciBus {
         Self
     }
 
-    fn scan_sata_devices(&self) -> Result<Vec<BusDeviceInfo>, BusError> {
+    fn scan_devices(&self) -> Result<Vec<BusDeviceInfo>, BusError> {
         let mut devices = Vec::new();
-        let mut index = 0usize;
+        let mut sata_index = 0usize;
+        const LOG_LIMIT: usize = 32;
 
-        for bus in 0u8..=255 {
-            for device in 0u8..32 {
-                let header = read_header(bus, device, 0)?;
-                if header.vendor_id == 0xffff {
-                    continue;
-                }
-
-                let function_count = if header.multi_function { 8 } else { 1 };
-                for function in 0u8..function_count {
-                    let header = read_header(bus, device, function)?;
-                    if header.vendor_id == 0xffff {
-                        continue;
-                    }
-
-                    if header.class_code == 0x01
-                        && header.subclass == 0x06
-                        && header.prog_if == 0x01
-                    {
-                        let name = sata_name(index);
-                        devices.push(BusDeviceInfo {
-                            name,
-                            bus_type: BusType::Pci,
-                            device_type_hint: Some(DeviceType::Block),
-                            pci_bus: Some(bus),
-                            pci_device: Some(device),
-                            pci_function: Some(function),
-                            class_code: Some(header.class_code),
-                            subclass: Some(header.subclass),
-                            prog_if: Some(header.prog_if),
-                            bar5: Some(u64::from(header.bar5 & 0xffff_fff0)),
-                        });
-                        index = index.saturating_add(1);
-                    }
-                }
+        enumeration::enumerate(read_config_dword, |function| {
+            let ahci = function.is_ahci();
+            let name = if ahci {
+                let name = sata_name(sata_index);
+                sata_index += 1;
+                name
+            } else {
+                format!(
+                    "pci{:02x}:{:02x}.{}",
+                    function.bus, function.device, function.function
+                )
+            };
+            if devices.len() < LOG_LIMIT {
+                log::info!(
+                    "PCI {:02x}:{:02x}.{} vendor={:04x} device={:04x} class={:02x}:{:02x}:{:02x} header={:02x} ahci={}",
+                    function.bus,
+                    function.device,
+                    function.function,
+                    function.vendor_id,
+                    function.device_id,
+                    function.class_code,
+                    function.subclass,
+                    function.prog_if,
+                    function.header_type,
+                    ahci
+                );
             }
-        }
+            devices.push(BusDeviceInfo {
+                name,
+                bus_type: BusType::Pci,
+                device_type_hint: ahci.then_some(DeviceType::Block),
+                pci_bus: Some(function.bus),
+                pci_device: Some(function.device),
+                pci_function: Some(function.function),
+                vendor_id: Some(function.vendor_id),
+                device_id: Some(function.device_id),
+                header_type: Some(function.header_type),
+                class_code: Some(function.class_code),
+                subclass: Some(function.subclass),
+                prog_if: Some(function.prog_if),
+                bar5: function.bar5.map(u64::from),
+            });
+        })?;
+        log::info!(
+            "PCI enumeration: {} functions, {} AHCI controllers ({} detail logs omitted)",
+            devices.len(),
+            sata_index,
+            devices.len().saturating_sub(LOG_LIMIT)
+        );
 
         Ok(devices)
     }
@@ -78,7 +94,7 @@ impl Bus for PciBus {
     }
 
     fn enumerate(&self) -> Result<Vec<BusDeviceInfo>, BusError> {
-        self.scan_sata_devices()
+        self.scan_devices()
     }
 }
 
@@ -106,82 +122,41 @@ impl KernelModule for PciBusModule {
     }
 }
 
+/// Read an aligned dword from legacy PCI configuration space (first 256 bytes).
 #[cfg(target_arch = "x86_64")]
-fn read_header(bus: u8, device: u8, function: u8) -> Result<PciHeader, BusError> {
-    let vendor_id = read_config_word(bus, device, function, 0x00)?;
-    let header_type = read_config_byte(bus, device, function, 0x0e)?;
-    let class_data = read_config_dword(bus, device, function, 0x08)?;
-    let bar5 = read_config_dword(bus, device, function, 0x24)?;
-
-    Ok(PciHeader {
-        vendor_id,
-        class_code: (class_data >> 24) as u8,
-        subclass: (class_data >> 16) as u8,
-        prog_if: (class_data >> 8) as u8,
-        multi_function: header_type & 0x80 != 0,
-        bar5,
-    })
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-fn read_header(_bus: u8, _device: u8, _function: u8) -> Result<PciHeader, BusError> {
-    Err(BusError::DiscoveryFailed)
-}
-
-#[cfg(target_arch = "x86_64")]
-fn read_config_dword(bus: u8, device: u8, function: u8, offset: u8) -> Result<u32, BusError> {
+pub fn read_config_dword(bus: u8, device: u8, function: u8, offset: u8) -> Result<u32, BusError> {
     use x86_64::instructions::port::Port;
 
+    if device >= 32 || function >= 8 || offset & 3 != 0 {
+        return Err(BusError::EnumerationFailed);
+    }
     let address = 0x8000_0000u32
         | (u32::from(bus) << 16)
         | (u32::from(device) << 11)
         | (u32::from(function) << 8)
         | (u32::from(offset) & 0xfc);
 
-    unsafe {
-        let mut config_address: Port<u32> = Port::new(0xcf8);
-        let mut config_data: Port<u32> = Port::new(0xcfc);
-        config_address.write(address);
-        Ok(config_data.read())
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-fn read_config_word(bus: u8, device: u8, function: u8, offset: u8) -> Result<u16, BusError> {
-    let dword = read_config_dword(bus, device, function, offset)?;
-    let shift = u32::from(offset & 0x02) * 8;
-    Ok(((dword >> shift) & 0xffff) as u16)
-}
-
-#[cfg(target_arch = "x86_64")]
-fn read_config_byte(bus: u8, device: u8, function: u8, offset: u8) -> Result<u8, BusError> {
-    let dword = read_config_dword(bus, device, function, offset)?;
-    let shift = u32::from(offset & 0x03) * 8;
-    Ok(((dword >> shift) & 0xff) as u8)
+    // CF8/CFC is one shared address/data pair, including across CPUs.
+    static CONFIG_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let _guard = CONFIG_LOCK.lock();
+        unsafe {
+            let mut config_address: Port<u32> = Port::new(0xcf8);
+            let mut config_data: Port<u32> = Port::new(0xcfc);
+            config_address.write(address);
+            Ok(config_data.read())
+        }
+    })
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn read_config_dword(_bus: u8, _device: u8, _function: u8, _offset: u8) -> Result<u32, BusError> {
-    Err(BusError::DiscoveryFailed)
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-fn read_config_word(_bus: u8, _device: u8, _function: u8, _offset: u8) -> Result<u16, BusError> {
-    Err(BusError::DiscoveryFailed)
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-fn read_config_byte(_bus: u8, _device: u8, _function: u8, _offset: u8) -> Result<u8, BusError> {
-    Err(BusError::DiscoveryFailed)
-}
-
-struct PciHeader {
-    vendor_id: u16,
-    class_code: u8,
-    subclass: u8,
-    prog_if: u8,
-    multi_function: bool,
-    bar5: u32,
+pub fn read_config_dword(
+    _bus: u8,
+    _device: u8,
+    _function: u8,
+    _offset: u8,
+) -> Result<u32, BusError> {
+    Err(BusError::EnumerationFailed)
 }
 
 fn sata_name(index: usize) -> String {

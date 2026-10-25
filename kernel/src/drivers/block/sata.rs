@@ -698,6 +698,7 @@ impl SataDeviceModule {
             if let Some(devices) = registry::list_bus_devices(bus_name.as_str()) {
                 for info in devices {
                     if info.bus_type == BusType::Pci
+                        && info.header_type == Some(0)
                         && info.class_code == Some(0x01)
                         && info.subclass == Some(0x06)
                         && info.prog_if == Some(0x01)
@@ -846,6 +847,7 @@ impl Driver for SataDriver {
 
     fn probe(&self, bus_device: &BusDeviceInfo) -> Result<Option<Arc<dyn Device>>, DriverError> {
         if bus_device.bus_type != BusType::Pci
+            || bus_device.header_type != Some(0)
             || bus_device.class_code != Some(0x01)
             || bus_device.subclass != Some(0x06)
             || bus_device.prog_if != Some(0x01)
