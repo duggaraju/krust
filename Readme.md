@@ -49,3 +49,17 @@ To quickly repro BusyBox launch from stdin:
 ```bash
 (sleep 8; printf '/bin/bin/busybox ls\n'; sleep 3) | cargo run -Z bindeps -- run uefi --vhd ./target/krust-disk-fat.vhd -- --display none --no-reboot --no-shutdown
 ```
+
+### Runner exit codes
+
+The `run` command enables QEMU's `isa-debug-exit` device. A guest write is
+encoded as `(guest_value << 1) | 1` in QEMU's exit status:
+
+| Guest value | Raw QEMU status | Host runner status |
+|-------------|-----------------|--------------------|
+| `0x10` (success) | `33` | `0` (success) |
+| `0x11` (failure) | `35` | `1` (failure) |
+
+Only raw status `33` is success. Every other QEMU status (including `0`),
+termination without an exit code (such as a signal), and QEMU launch or wait
+errors produce a diagnostic and host status `1`.

@@ -3,7 +3,7 @@ use ovmf_prebuilt::{Arch, FileType, Prebuilt, Source};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, ExitCode};
 
 mod disk;
 
@@ -86,11 +86,21 @@ struct MkdiskArgs {
     format: DiskFormat,
 }
 
-fn main() {
+fn main() -> ExitCode {
     let cli = Cli::parse();
-    match cli.command {
+    let result = match cli.command {
         Commands::Run(args) => cmd_run(args),
-        Commands::Mkdisk(args) => cmd_mkdisk(args),
+        Commands::Mkdisk(args) => {
+            cmd_mkdisk(args);
+            Ok(())
+        }
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -138,7 +148,7 @@ fn cmd_mkdisk(args: MkdiskArgs) {
     eprintln!("done: {}", args.output.display());
 }
 
-fn cmd_run(cli: RunArgs) {
+fn cmd_run(cli: RunArgs) -> Result<(), String> {
     // read env variables that were set in build script
     let kernel_path = env!("KERNEL_PATH");
     let kernel_bios_path = env!("KERNEL_BIOS_PATH");
@@ -248,13 +258,29 @@ fn cmd_run(cli: RunArgs) {
         cmd.args(&cli.qemu_args);
     }
 
-    let mut child = cmd.spawn().expect("failed to start qemu-system-x86_64");
-    let status = child.wait().expect("failed to wait on qemu");
-    match status.code().unwrap_or(1) {
-        0x10 => 0, // success
-        0x11 => 1, // failure
-        _ => 2,    // unknown fault
-    };
+    run_qemu(&mut cmd)
+}
+
+fn run_qemu(cmd: &mut Command) -> Result<(), String> {
+    let mut child = cmd
+        .spawn()
+        .map_err(|err| format!("failed to start qemu-system-x86_64: {err}"))?;
+    let status = child
+        .wait()
+        .map_err(|err| format!("failed to wait on qemu-system-x86_64: {err}"))?;
+    check_qemu_exit(status.code())
+}
+
+fn check_qemu_exit(code: Option<i32>) -> Result<(), String> {
+    // isa-debug-exit encodes guest values as (value << 1) | 1.
+    match code {
+        Some(33) => Ok(()),
+        Some(35) => Err("QEMU reported guest failure (guest 0x11, raw exit status 35)".into()),
+        Some(code) => Err(format!(
+            "QEMU terminated unexpectedly (raw exit status {code}); expected 33 (guest success 0x10)"
+        )),
+        None => Err("QEMU terminated without an exit code (possibly killed by a signal)".into()),
+    }
 }
 
 fn build_headless_uefi_image(kernel_path: &str, boot_log_level: &str, shell_port: u8) -> PathBuf {
@@ -355,4 +381,52 @@ fn append_cpio_entry(out: &mut Vec<u8>, ino: u32, name: &str, data: &[u8]) {
     pad4(out);
     out.extend_from_slice(data);
     pad4(out);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qemu_exit_guest_success() {
+        assert_eq!(check_qemu_exit(Some(33)), Ok(()));
+    }
+
+    #[test]
+    fn qemu_exit_guest_failure() {
+        let err = check_qemu_exit(Some(35)).unwrap_err();
+        assert!(err.contains("guest failure"));
+        assert!(err.contains("0x11"));
+        assert!(err.contains("35"));
+    }
+
+    #[test]
+    fn qemu_exit_zero_is_not_guest_success() {
+        let err = check_qemu_exit(Some(0)).unwrap_err();
+        assert!(err.contains("unexpectedly"));
+        assert!(err.contains("raw exit status 0"));
+    }
+
+    #[test]
+    fn qemu_exit_unexpected_status() {
+        for code in [1, 16, 17, 42] {
+            let err = check_qemu_exit(Some(code)).unwrap_err();
+            assert!(err.contains("unexpectedly"));
+            assert!(err.contains(&format!("raw exit status {code}")));
+        }
+    }
+
+    #[test]
+    fn qemu_exit_no_code() {
+        let err = check_qemu_exit(None).unwrap_err();
+        assert!(err.contains("without an exit code"));
+        assert!(err.contains("signal"));
+    }
+
+    #[test]
+    fn qemu_launch_error() {
+        let impossible_path = env::current_exe().unwrap().join("qemu-system-x86_64");
+        let err = run_qemu(&mut Command::new(impossible_path)).unwrap_err();
+        assert!(err.contains("failed to start qemu-system-x86_64"));
+    }
 }
