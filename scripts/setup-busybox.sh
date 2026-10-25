@@ -319,8 +319,9 @@ find "$ROOTFS" -maxdepth 2 | sort | sed 's/^/  /'
 
 # ── 6. Pack into VHD ──────────────────────────────────────────────────────────
 info "Packing into VHD: $OUTPUT  (format: $DISK_FORMAT)"
-# Exclude virtual filesystem directories (proc, dev) — they're mounted separately at runtime
-cargo run -Z bindeps --quiet -- mkdisk "$ROOTFS" "$OUTPUT" --size-mib 64 --exclude proc,dev --format "$DISK_FORMAT"
+# Keep /proc and /dev as plain directories in the image so runtime procfs/devfs
+# mounts have concrete mountpoints on the overlaid root filesystem.
+cargo run -Z bindeps --quiet -- mkdisk "$ROOTFS" "$OUTPUT" --size-mib 64 --format "$DISK_FORMAT"
 
 info "Done!  $(du -sh "$OUTPUT" | cut -f1)  →  $OUTPUT"
 info ""

@@ -141,8 +141,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // Keep ramfs as bootstrap root, then overlay FAT as the runtime root.
         #[cfg(feature = "drivers")]
         let _ = crate::fs::register_mount(
-            "/bin",
-            "fatfs",
+            "/",
+            "ext4",
             crate::fs::MountDevice::device_path("/dev/sda"),
         );
 
