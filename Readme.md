@@ -60,15 +60,45 @@ cargo build -Z bindeps --locked
 scripts/smoke-userspace.sh target/krust-disk-ext4.vhd
 ```
 
-The probe waits for serial shell prompts (rather than sleeping through boot),
-runs BusyBox `echo`, `ls /proc /dev`, `true`, and another `echo` through
-the kernel shell's fork/wait/exec path,
-then requests guest shutdown. It tests both BIOS and UEFI, with a 120-second
-deadline per boot and QEMU snapshots. It checks the runner's success status,
-output markers, directory listings, absence of kernel exceptions, and that the
-source VHD hash is unchanged. Logs remain in `target/userspace-smoke-*.log`;
-generated boot images and ramdisks are removed. Requirements: Bash, GNU
-`timeout`, `sha256sum`, and the normal QEMU/build prerequisites.
+The probe waits for each serial kernel-shell prompt (rather than sleeping
+through boot), changes to `/`, and runs BusyBox `pwd`, `echo`, `ls /proc /dev`,
+`cat /proc/meminfo`, `cat /proc/cpuinfo`, `true`, and another `echo` directly
+through the kernel shell's fork/wait/exec path before requesting debug-exit
+shutdown. It tests both BIOS and UEFI with QEMU `-snapshot`; the supplied VHD
+must already contain `/bin/busybox`. Per-command assertions check `/`, output
+markers, proc/dev listings, memory fields, and CPU fields, without accepting
+echoed command strings as output. Nonzero runner/command status, kernel errors,
+missing shell/prompts, and stalled output/shutdown fail the probe.
+
+The deadline is 120 seconds **per boot**, including command execution and
+shutdown. For short host-side tests, `KRUST_SMOKE_TIMEOUT_SECONDS` accepts only
+decimal integers from `1` to `120` (no leading zeros); e.g.
+`KRUST_SMOKE_TIMEOUT_SECONDS=3 scripts/smoke-userspace.sh disk.vhd runner`.
+Cleanup terminates only the isolated runner process group, allows 0.2 seconds
+for graceful teardown, then kills remaining group members. Generated boot
+images, ramdisks, and traces are confined to an exclusively created directory
+under `target/`, removed on success, failure, timeout, or caught INT/TERM.
+The source VHD hash is checked on every exit after its initial hash, including
+failures; a changed/unreadable VHD fails even an otherwise successful suite.
+Serial logs and copied kernel traces remain in
+`target/userspace-smoke-{bios,uefi}*.log` (overwritten per mode invocation);
+assertion failures also preserve the normalized `*-response.log`.
+Requirements: Bash, GNU `timeout`, `realpath`, `sha256sum`, util-linux `setsid`,
+and the normal QEMU/build prerequisites.
+
+Run the focused host-only harness tests without QEMU or a real VHD:
+
+```bash
+scripts/test-smoke-userspace.sh
+```
+
+The controlled fake runner checks split prompts and rejects premature/batched
+commands. Tests cover success, missing shell, command failure, boot/mid-command
+and closed-output timeouts, echoed markers without output, missing pwd/proc
+content, runner failure, invalid deadlines/paths/arguments, and disk mutation on failure and
+success. They verify owned child processes are reaped, scratch directories
+removed, and an unrelated process left alive. Each case uses a three-second
+deadline; case logs remain in `target/userspace-smoke-test-*.log`.
 
 This is an entry/IRQ regression, not certification of userspace `fork`.
 An ash subprocess sequence also faults on the original, unmodified UEFI
