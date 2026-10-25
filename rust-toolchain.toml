@@ -1,3 +1,5 @@
 [toolchain]
-channel = "nightly"
+# Keep the locked x86_64 crates compatible with Rust's unstable Step trait.
+channel = "nightly-2026-03-01"
+components = ["llvm-tools-preview", "rust-src"]
 targets = ["x86_64-unknown-none", "aarch64-unknown-none"]

@@ -1,12 +1,16 @@
 # Getting Started.
-* Add the x86_64-unknown-none target
+* Install the repository toolchain from the repository root:
 ```bash
-rustup target add x86_64-unknown-none --toolchain nightly
+rustup toolchain install
 ```
-* Install llvm tools
-```bash
-rustup component add llvm-tools-preview --toolchain nightly
-```
+
+`rust-toolchain.toml` pins `nightly-2026-03-01`, including
+`llvm-tools-preview`, `rust-src` (for building the bootloader), and the
+`x86_64-unknown-none` and `aarch64-unknown-none` targets. Cargo automatically uses this pin in the
+repository. Do not override it with `+nightly`: newer floating nightlies
+can break the unstable `Step` trait implementations in the locked `x86_64`
+dependencies. Keep dependency versions and `Cargo.lock` unchanged when
+setting up the toolchain.
 
 * Install BusyBox rootfs build tools
 ```bash
@@ -17,7 +21,12 @@ To build BusyBox with glibc instead of musl, pass `--libc glibc` to `scripts/set
 
 * Build the code
 ```bash
-cargo +nightly build -Z bindeps
+cargo build -Z bindeps --locked
+```
+
+* Check the kernel without building disk images
+```bash
+cargo check -p kernel --target x86_64-unknown-none --locked
 ```
 
 ## Dev loop (headless QEMU)

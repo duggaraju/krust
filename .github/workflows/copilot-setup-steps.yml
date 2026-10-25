@@ -5,9 +5,11 @@ on:
     push:
         paths:
             - .github/workflows/copilot-setup-steps.yml
+            - rust-toolchain.toml
     pull_request:
         paths:
             - .github/workflows/copilot-setup-steps.yml
+            - rust-toolchain.toml
 
 jobs:
     copilot-setup-steps:
@@ -20,11 +22,9 @@ jobs:
             - name: Checkout code
               uses: actions/checkout@v5
 
-            - name: Install Rust nightly toolchain
-              uses: dtolnay/rust-toolchain@nightly
-              with:
-                  targets: x86_64-unknown-none
-                  components: llvm-tools-preview
+            - name: Install repository Rust toolchain
+              # No channel override: install the pin, components, and targets from rust-toolchain.toml.
+              run: rustup toolchain install
 
             - name: Allow agent to read ~/.cargo
               run: |
