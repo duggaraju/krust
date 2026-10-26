@@ -15,6 +15,9 @@ case "$SMOKE_TEST_CASE" in
     kernel-errno) printf 'ERROR: unexpected errno=-12\n' >> "$trace" ;;
     kernel-panic) printf 'panicked at kernel probe\n' >> "$trace" ;;
 esac
+if [[ "$SMOKE_TEST_CASE" == probe-success || "$SMOKE_TEST_CASE" == probe-missing-marker ]]; then
+    printf 'INFO : virtual_address_offset: 0x10000000000\nINFO : Handling Segment: Ph64(ProgramHeader64 { type_: Ok(Load), virtual_addr: 1234, physical_addr: 0 })\n' >> "$trace"
+fi
 printf 'headless kernel trace log: %s\n' "$trace"
 
 # The runner must reap its QEMU stand-in when the harness kills their group.
@@ -37,6 +40,11 @@ esac
 
 expected=(
     "cd /"
+)
+if [[ "$SMOKE_TEST_CASE" == probe-* ]]; then
+    expected+=("/bin/krust-mmap-probe 0x10000001000")
+fi
+expected+=(
     "/bin/busybox pwd"
     "/bin/busybox echo KRUST_ECHO_OK"
     "/bin/busybox ls /proc /dev"
@@ -66,7 +74,16 @@ for index in "${!expected[@]}"; do
     printf '%s: %s\n' "$2" "$command" >> "$SMOKE_TEST_STATE/commands"
     # Serial echo is allowed, but must not satisfy output assertions.
     printf '%s\r\n' "$command"
-    case "$index" in
+    response_index=$index
+    if [[ "$SMOKE_TEST_CASE" == probe-* && $index -ge 1 ]]; then
+        if (( index == 1 )); then
+            [[ "$SMOKE_TEST_CASE" == probe-missing-marker ]] || printf 'KRUST_MMAP_KERNEL_OK\r\n'
+            printf 'KRUST_MMAP_OK\r\n'
+            continue
+        fi
+        response_index=$((index - 1))
+    fi
+    case "$response_index" in
         1) [[ "$SMOKE_TEST_CASE" == bad-pwd ]] || printf '/\r\n' ;;
         2) [[ "$SMOKE_TEST_CASE" == echo-only ]] || printf 'KRUST_ECHO_OK\r\n' ;;
         3) printf '/dev:\r\n\033[1;35mnull\033[m ttyS0\r\n/proc:\r\ncpuinfo \033[1;32mmeminfo\033[m\r\n' ;;

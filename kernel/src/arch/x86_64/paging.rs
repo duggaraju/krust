@@ -74,6 +74,13 @@ pub fn virt_to_phys_addr(virtual_address: u64) -> Option<u64> {
     Some(frame + (virtual_address & 0xfff))
 }
 
+pub fn range_overlaps_supervisor(root: u64, start: usize, end: usize) -> Option<bool> {
+    let offset = physical_memory_offset()?;
+    super::supervisor_overlap::range_overlaps_supervisor(root, start, end, |table, index| {
+        read_page_table_entry(offset, table, index as u64)
+    })
+}
+
 pub unsafe fn init_mapper(physical_memory_offset: u64) -> OffsetPageTable<'static> {
     let physical_memory_offset = VirtAddr::new(physical_memory_offset);
     let level_4_table = unsafe { active_level_4_table(physical_memory_offset) };

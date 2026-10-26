@@ -3,6 +3,8 @@ extern crate alloc;
 use alloc::string::String;
 use core::ptr;
 
+use super::user_layout::{PAGE_SIZE, USER_STACK_TOP};
+
 pub type PageFlags = x86_64::structures::paging::PageTableFlags;
 
 const ARCH_SET_GS: usize = 0x1001;
@@ -10,9 +12,7 @@ const ARCH_SET_FS: usize = 0x1002;
 const ARCH_GET_FS: usize = 0x1003;
 const ARCH_GET_GS: usize = 0x1004;
 
-const PAGE_SIZE: usize = 4096;
 const USER_BRK_MAX: usize = 0x0000_7fff_0000_0000;
-const USER_STACK_TOP: usize = 0x0000_7fff_ffff_f000;
 const USER_STACK_SIZE: usize = 8 * 4096;
 const USER_STACK_RESERVE: usize = 256 * 4096;
 const USER_STACK_MAP_SIZE: usize = USER_STACK_SIZE + USER_STACK_RESERVE + PAGE_SIZE;

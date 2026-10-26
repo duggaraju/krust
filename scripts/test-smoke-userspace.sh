@@ -20,7 +20,7 @@ sleep 300 &
 sentinel=$!
 runner="$PWD/scripts/tests/smoke-userspace-runner.sh"
 
-for scenario in success trace-success kernel-errno kernel-panic missing-shell command-failure timeout closed-output echo-only bad-pwd bad-cat runner-failure mutate-failure mutate-success; do
+for scenario in success trace-success probe-success probe-missing-address probe-missing-marker kernel-errno kernel-panic missing-shell command-failure timeout closed-output echo-only bad-pwd bad-cat runner-failure mutate-failure mutate-success; do
     state="$work/$scenario"
     mkdir "$state"
     printf 'original VHD fixture\n' > "$state/disk.vhd"
@@ -28,14 +28,19 @@ for scenario in success trace-success kernel-errno kernel-panic missing-shell co
     log="$PWD/target/userspace-smoke-test-$scenario.log"
     status=0
     started=$SECONDS
+    probe=0
+    [[ "$scenario" != probe-* ]] || probe=1
     SMOKE_TEST_STATE="$state" SMOKE_TEST_CASE="$scenario" KRUST_SMOKE_TIMEOUT_SECONDS=3 \
+        KRUST_SMOKE_MMAP_PROBE="$probe" \
         scripts/smoke-userspace.sh "$state/disk.vhd" "$runner" > "$log" 2>&1 || status=$?
     (( SECONDS - started <= 8 ))
-    if [[ "$scenario" == success || "$scenario" == trace-success ]]; then
+    if [[ "$scenario" == success || "$scenario" == trace-success || "$scenario" == probe-success ]]; then
         [[ $status == 0 ]]
         grep -q '^bios userspace smoke passed$' "$log"
         grep -q '^uefi userspace smoke passed$' "$log"
-        [[ $(wc -l < "$state/commands") == 18 ]]
+        count=18
+        [[ "$scenario" != probe-success ]] || count=20
+        [[ $(wc -l < "$state/commands") == "$count" ]]
     elif [[ "$scenario" == mutate-success ]]; then
         [[ $status == 1 ]]
         grep -q '^uefi userspace smoke passed$' "$log"
@@ -50,6 +55,8 @@ for scenario in success trace-success kernel-errno kernel-panic missing-shell co
         echo-only) grep -q 'command failed: /bin/busybox echo KRUST_ECHO_OK' "$log" ;;
         bad-pwd) grep -q 'command failed: /bin/busybox pwd' "$log" ;;
         bad-cat) grep -q 'command failed: /bin/busybox cat /proc/meminfo' "$log" ;;
+        probe-missing-address) grep -q 'cannot derive kernel mapping address' "$log" ;;
+        probe-missing-marker) grep -q 'command failed: /bin/krust-mmap-probe' "$log" ;;
     esac
     if [[ "$scenario" == mutate-* ]]; then
         grep -q '^Source VHD changed!$' "$log"

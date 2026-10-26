@@ -81,6 +81,12 @@ pub fn user_mmap_base() -> usize {
     current::userspace::user_mmap_base()
 }
 
+pub use current::user_layout::{PAGE_SIZE as USER_PAGE_SIZE, USER_ADDRESS_END};
+
+pub fn range_overlaps_supervisor(root: u64, start: usize, end: usize) -> Option<bool> {
+    current::paging::range_overlaps_supervisor(root, start, end)
+}
+
 pub fn build_initial_user_stack(
     address_space: &mut crate::mm::address_space::AddressSpace,
     argv: &[alloc::string::String],

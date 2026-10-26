@@ -4,6 +4,7 @@ pub mod context;
 pub mod interrupts;
 pub mod paging;
 pub mod syscall;
+pub mod user_layout;
 pub mod userspace;
 
 use crate::arch::{ArchContext, ArchInterrupts, ArchPaging};

@@ -8,6 +8,10 @@ if (( $# > 2 )); then
     exit 2
 fi
 deadline=${KRUST_SMOKE_TIMEOUT_SECONDS-120}
+if [[ "${KRUST_SMOKE_MMAP_PROBE-0}" != 0 && "${KRUST_SMOKE_MMAP_PROBE-0}" != 1 ]]; then
+    echo "KRUST_SMOKE_MMAP_PROBE must be 0 or 1" >&2
+    exit 2
+fi
 if [[ ! "$deadline" =~ ^([1-9]|[1-9][0-9]|1[01][0-9]|120)$ ]]; then
     echo "KRUST_SMOKE_TIMEOUT_SECONDS must be an integer from 1 to 120" >&2
     exit 2
@@ -62,6 +66,11 @@ before=$(sha256sum "$disk")
 
 commands=(
     "cd /"
+)
+if [[ "${KRUST_SMOKE_MMAP_PROBE-0}" == 1 ]]; then
+    commands+=("/bin/krust-mmap-probe")
+fi
+commands+=(
     "/bin/busybox pwd"
     "/bin/busybox echo KRUST_ECHO_OK"
     "/bin/busybox ls /proc /dev"
@@ -78,28 +87,45 @@ kernel_errors() {
     sed -E '/^ERROR: syscall failed: nr=[0-9]+ \([a-z0-9_]+\) errno=-[0-9]+\r?$/d' "$1" |
         grep -E "$errors" > /dev/null
 }
+mmap_probe_address() {
+    local trace bias segment address
+    trace=$(sed -n 's/^headless kernel trace log: //p' "$1" | tr -d '\r')
+    [[ "$trace" == "$work"/krust-trace-*.log && -f "$trace" ]] || return 1
+    bias=$(sed -nE '/virtual_address_offset: 0x/{s/.*virtual_address_offset: 0x([0-9a-fA-F]+).*/\1/p;q;}' "$trace")
+    segment=$(sed -nE '/Handling Segment:.*type_: Ok\(Load\)/{s/.*virtual_addr: ([0-9a-fA-F]+),.*/\1/p;q;}' "$trace")
+    [[ "$bias" =~ ^[0-9a-fA-F]{1,12}$ && "$segment" =~ ^[0-9a-fA-F]{1,12}$ ]] || return 1
+    # The bootloader logs the relocation bias and original PT_LOAD vaddr.
+    address=$(( (16#$bias + 16#$segment) & ~4095 ))
+    (( address > 0 && address < (1 << 47) )) || return 1
+    printf '0x%x' "$address"
+}
 check_response() {
     # Check only this command's response, with full-line anchors so an echoed
     # command containing the expected string can never substitute for output.
     local response="$work/response"
     tr -d '\r' < "$work/raw-response" | sed -E $'s/\033\\[[0-9;]*m//g' > "$response"
     ! grep -Eq "$errors" "$response" || return 1
-    case "$1" in
-        1) grep -qx '/' "$response" ;;
-        2) grep -qx 'KRUST_ECHO_OK' "$response" ;;
-        3) grep -qx '/proc:' "$response" && grep -qx '/dev:' "$response" &&
+    case "${commands[$1]}" in
+        "/bin/krust-mmap-probe "*) grep -qx 'KRUST_MMAP_OK' "$response" &&
+           grep -qx 'KRUST_MMAP_KERNEL_OK' "$response" ;;
+        "/bin/busybox pwd") grep -qx '/' "$response" ;;
+        "/bin/busybox echo KRUST_ECHO_OK") grep -qx 'KRUST_ECHO_OK' "$response" ;;
+        "/bin/busybox ls /proc /dev") grep -qx '/proc:' "$response" && grep -qx '/dev:' "$response" &&
            grep -Eq '(^|[[:space:]])meminfo([[:space:]]|$)' "$response" &&
            grep -Eq '(^|[[:space:]])null([[:space:]]|$)' "$response" ;;
-        4) grep -Eq '^MemTotal: +[1-9][0-9]* kB$' "$response" &&
+        "/bin/busybox cat /proc/meminfo") grep -Eq '^MemTotal: +[1-9][0-9]* kB$' "$response" &&
            grep -Eq '^MemFree: +[0-9]+ kB$' "$response" &&
            grep -qx 'Buffers:        0 kB' "$response" ;;
-        5) grep -Eq $'^processor\t+: 0$' "$response" &&
+        "/bin/busybox cat /proc/cpuinfo") grep -Eq $'^processor\t+: 0$' "$response" &&
            grep -Eq $'^vendor_id\t+: .+$' "$response" ;;
-        7) grep -qx 'KRUST_FORK_EXEC_OK' "$response" ;;
+        "/bin/busybox echo KRUST_FORK_EXEC_OK") grep -qx 'KRUST_FORK_EXEC_OK' "$response" ;;
     esac
 }
 
 for mode in bios uefi; do
+    if [[ "${KRUST_SMOKE_MMAP_PROBE-0}" == 1 ]]; then
+        commands[1]="/bin/krust-mmap-probe"
+    fi
     log="$PWD/target/userspace-smoke-$mode.log"
     : > "$log"
     rm -f "target/userspace-smoke-$mode-kernel.log" "target/userspace-smoke-$mode-response.log"
@@ -143,6 +169,15 @@ for mode in bios uefi; do
                 cp "$work/response" "target/userspace-smoke-$mode-response.log"
                 failure="command failed: ${commands[$((next - 1))]}"
                 break
+            fi
+            if [[ "${commands[$next]}" == "/bin/krust-mmap-probe" ]]; then
+                if ! address=$(mmap_probe_address "$log"); then
+                    failure="cannot derive kernel mapping address from boot trace"
+                    break
+                fi
+                commands[$next]+=" $address"
+                printf '%s mmap kernel page from boot PT_LOAD: %s\n' "$mode" "$address"
+                printf '\nmmap kernel page from boot PT_LOAD: %s\n' "$address" >> "$log"
             fi
             if ! printf '%s\n' "${commands[$next]}" >&"$input"; then
                 failure="runner closed command input"

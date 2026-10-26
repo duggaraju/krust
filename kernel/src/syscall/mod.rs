@@ -1,6 +1,7 @@
 pub mod dispatch;
 pub mod handlers;
 pub mod impls;
+mod mmap;
 pub mod numbers;
 
 pub fn init(trace_enabled: bool) {

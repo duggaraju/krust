@@ -37,6 +37,11 @@ pub fn virt_to_phys_addr(_virtual_address: u64) -> Option<u64> {
     None
 }
 
+pub fn range_overlaps_supervisor(_root: u64, _start: usize, _end: usize) -> Option<bool> {
+    // Fail closed until this port can inspect its page tables.
+    None
+}
+
 pub fn set_page_table_root(ttbr0: u64) {
     // Set TTBR0_EL1 (Translation Table Base Register)
     unsafe {

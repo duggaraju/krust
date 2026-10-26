@@ -775,7 +775,6 @@ pub fn sys_mmap(args: &SyscallArgs) -> isize {
         return -22; // EINVAL
     }
 
-    let aligned_len = (len + 4095) & !4095;
     let writable = (prot & 0x2) != 0;
 
     let result = crate::process::with_current_task_mut(|task| {
@@ -788,12 +787,24 @@ pub fn sys_mmap(args: &SyscallArgs) -> isize {
                 task.mmap_end
             }
         };
-        let base = (base + 4095) & !4095;
-        let new_end = base.checked_add(aligned_len).ok_or(-12isize)?;
+        let range = super::mmap::checked_mmap_range(
+            base,
+            len,
+            crate::arch::USER_PAGE_SIZE,
+            crate::arch::USER_ADDRESS_END,
+        )?;
+        if crate::arch::range_overlaps_supervisor(
+            task.address_space.root_paddr(),
+            range.base,
+            range.end,
+        ) != Some(false)
+        {
+            return Err(-12);
+        }
         task.address_space
             .map_zeroed_region(
-                base,
-                aligned_len,
+                range.base,
+                range.len,
                 if writable {
                     crate::arch::writable_user_page_flags()
                 } else {
@@ -802,9 +813,9 @@ pub fn sys_mmap(args: &SyscallArgs) -> isize {
             )
             .map_err(|_| -12isize)?;
         if addr == 0 {
-            task.mmap_end = new_end;
+            task.mmap_end = range.end;
         }
-        Ok::<usize, isize>(base)
+        Ok::<usize, isize>(range.base)
     });
 
     match result {
