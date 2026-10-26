@@ -31,6 +31,33 @@ cargo check -p kernel --target x86_64-unknown-none --locked
 
 ## Dev loop (headless QEMU)
 
+### Creating data disks
+
+```bash
+cargo run -Z bindeps -- mkdisk <source_dir> <output.vhd> --size-mib 64 --format fat
+cargo run -Z bindeps -- mkdisk <source_dir> <output.vhd> --size-mib 64 --format ext4
+```
+
+The default data size is 64 MiB. FAT accepts at least 4 MiB and automatically
+selects FAT12/16/32; it does not force FAT32. ext4 accepts at least 16 MiB and
+requires host `mkfs.ext4` and `debugfs` (e2fsprogs). FAT skips file symlinks;
+ext4 preserves symlinks and copies hard links as independent files.
+
+These are fixed version-1 VHDs: the footer stores unsigned 64-bit
+original/current byte sizes, and the complete file must also fit the host's
+signed 64-bit file-offset range. The 512-byte footer is additional to the
+requested data size. CHS geometry is a legacy, rounded/clamped description,
+not a capacity limit. No dynamic-VHD or VHDX capacity limit is imposed on
+this fixed-image layout. FAT additionally has a 32-bit sector count with
+512-byte sectors, allowing at most 2097151 whole MiB.
+Size conversion, footer addition, signed 64-bit host file-offset limits, and
+the format limit are checked before creating parent directories or opening
+the destination. Invalid sizes leave existing destinations unchanged.
+Valid requests still overwrite the destination; this is not atomic replacement
+if formatting or copying fails.
+
+### Running QEMU
+
 Run UEFI with serial logs only:
 
 ```bash

@@ -4,22 +4,56 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-// ── FAT32 VHD ─────────────────────────────────────────────────────────────────
+const MIB: u64 = 1024 * 1024;
+const VHD_FOOTER_SIZE: u64 = 512;
+// Fixed VHDs store 64-bit byte sizes and end with a 512-byte footer.
+// CHS geometry is deliberately clamped; it is not the capacity limit.
+const MAX_VHD_DATA_SIZE: u64 = u64::MAX - VHD_FOOTER_SIZE;
+// fatfs uses a 32-bit sector count and defaults to 512-byte sectors.
+const MAX_FAT_DATA_SIZE: u64 = u32::MAX as u64 * 512;
 
-/// Create a FAT32 VHD by recursively copying all files from `source_dir`.
+fn checked_vhd_size(
+    size_mib: u64,
+    minimum_mib: u64,
+    maximum_data_size: u64,
+    format: &str,
+) -> io::Result<u64> {
+    let invalid = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
+    if size_mib < minimum_mib {
+        return Err(invalid(format!(
+            "{format} VHD size must be at least {minimum_mib} MiB"
+        )));
+    }
+    let data_size = size_mib
+        .checked_mul(MIB)
+        .ok_or_else(|| invalid("VHD size in bytes overflows u64".into()))?;
+    let file_size = data_size
+        .checked_add(VHD_FOOTER_SIZE)
+        .ok_or_else(|| invalid("VHD size including footer overflows u64".into()))?;
+    // Host file offsets are signed 64-bit values; no whole-image allocation
+    // is needed, so usize/isize memory limits are not disk-size limits.
+    if file_size > i64::MAX as u64 {
+        return Err(invalid("VHD size exceeds host file-offset range".into()));
+    }
+    if data_size > maximum_data_size {
+        return Err(invalid(format!(
+            "{format} VHD size exceeds the supported maximum of {} MiB",
+            maximum_data_size / MIB
+        )));
+    }
+    Ok(data_size)
+}
+
+// ── FAT VHD ───────────────────────────────────────────────────────────────────
+
+/// Create a FAT VHD (automatically selected FAT12/16/32) from `source_dir`.
 pub fn create_fat_vhd_from_dir(
     source_dir: &Path,
     output: &Path,
     size_mib: u64,
     exclude: HashSet<&str>,
 ) -> io::Result<()> {
-    let data_size = size_mib * 1024 * 1024;
-    if data_size < 4 * 1024 * 1024 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "VHD size must be at least 4 MiB",
-        ));
-    }
+    let data_size = checked_vhd_size(size_mib, 4, MAX_FAT_DATA_SIZE, "FAT")?;
 
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)?;
@@ -101,13 +135,7 @@ pub fn create_ext4_vhd_from_dir(
     size_mib: u64,
     exclude: HashSet<&str>,
 ) -> io::Result<()> {
-    let data_size = size_mib * 1024 * 1024;
-    if data_size < 16 * 1024 * 1024 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "ext4 VHD size must be at least 16 MiB",
-        ));
-    }
+    let data_size = checked_vhd_size(size_mib, 16, MAX_VHD_DATA_SIZE, "ext4")?;
 
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)?;
@@ -338,4 +366,160 @@ fn put_u32_be(buf: &mut [u8], offset: usize, value: u32) {
 
 fn put_u64_be(buf: &mut [u8], offset: usize, value: u64) {
     buf[offset..offset + 8].copy_from_slice(&value.to_be_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let parent = Path::new("target");
+            fs::create_dir_all(parent).unwrap();
+            let path = parent.join(format!(
+                "disk-test-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[test]
+    fn size_boundaries_for_both_formats() {
+        for (format, minimum, limit) in [
+            ("FAT", 4, MAX_FAT_DATA_SIZE),
+            ("ext4", 16, MAX_VHD_DATA_SIZE),
+        ] {
+            let maximum = limit.min(i64::MAX as u64 - VHD_FOOTER_SIZE) / MIB;
+            for size in [
+                0,
+                minimum - 1,
+                u64::MAX,
+                u64::MAX / MIB + 1,
+                u64::MAX / MIB,
+                i64::MAX as u64 / MIB + 1,
+                MAX_VHD_DATA_SIZE / MIB + 1,
+                maximum + 1,
+            ] {
+                let err = checked_vhd_size(size, minimum, limit, format).unwrap_err();
+                assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{format}: {size}");
+                assert!(err.to_string().contains("VHD size"));
+            }
+            for size in [minimum, 64, maximum] {
+                assert_eq!(
+                    checked_vhd_size(size, minimum, limit, format).unwrap(),
+                    size * MIB
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn size_errors_explain_the_limit() {
+        for (size, expected) in [
+            (0, "at least 4 MiB"),
+            (u64::MAX, "overflows u64"),
+            (u64::MAX / MIB, "host file-offset"),
+            (MAX_FAT_DATA_SIZE / MIB + 1, "2097151 MiB"),
+        ] {
+            assert!(
+                checked_vhd_size(size, 4, MAX_FAT_DATA_SIZE, "FAT")
+                    .unwrap_err()
+                    .to_string()
+                    .contains(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_sizes_do_not_mutate_destinations() {
+        type Creator = fn(&Path, &Path, u64, HashSet<&str>) -> io::Result<()>;
+        let creators: [(Creator, u64, u64); 2] = [
+            (create_fat_vhd_from_dir, 4, MAX_FAT_DATA_SIZE),
+            (create_ext4_vhd_from_dir, 16, MAX_VHD_DATA_SIZE),
+        ];
+        let fixture = Fixture::new();
+        let source = fixture.0.join("missing-source");
+        let existing = fixture.0.join("existing.vhd");
+        let absent = fixture.0.join("absent-parent/disk.vhd");
+        let sentinel = b"existing destination must survive invalid size requests";
+        fs::write(&existing, sentinel).unwrap();
+        let modified = fs::metadata(&existing).unwrap().modified().unwrap();
+        for (create, minimum, limit) in creators {
+            for size in [
+                0,
+                minimum - 1,
+                u64::MAX,
+                u64::MAX / MIB + 1,
+                u64::MAX / MIB,
+                MAX_VHD_DATA_SIZE / MIB + 1,
+                i64::MAX as u64 / MIB + 1,
+                limit.min(i64::MAX as u64 - VHD_FOOTER_SIZE) / MIB + 1,
+            ] {
+                for output in [&existing, &absent] {
+                    let err = create(&source, output, size, HashSet::new()).unwrap_err();
+                    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+                    assert_eq!(fs::read(&existing).unwrap(), sentinel);
+                    assert_eq!(
+                        fs::metadata(&existing).unwrap().modified().unwrap(),
+                        modified
+                    );
+                    assert!(!absent.parent().unwrap().exists());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fat_minimum_and_ordinary_images_are_readable() {
+        let fixture = Fixture::new();
+        let source = fixture.0.join("source");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::write(source.join("nested/hello.txt"), b"disk fixture\n").unwrap();
+        fs::write(source.join("excluded"), b"not copied").unwrap();
+
+        for size in [4, 64] {
+            let output = fixture.0.join(format!("fat-{size}.vhd"));
+            create_fat_vhd_from_dir(&source, &output, size, HashSet::from(["excluded"])).unwrap();
+            let mut image = File::open(&output).unwrap();
+            assert_eq!(
+                image.metadata().unwrap().len(),
+                size * MIB + VHD_FOOTER_SIZE
+            );
+            image
+                .seek(SeekFrom::End(-(VHD_FOOTER_SIZE as i64)))
+                .unwrap();
+            let mut footer = [0; 512];
+            image.read_exact(&mut footer).unwrap();
+            assert_eq!(&footer[..8], b"conectix");
+            assert_eq!(&footer[40..48], &(size * MIB).to_be_bytes());
+            assert_eq!(&footer[48..56], &(size * MIB).to_be_bytes());
+            assert_eq!(&footer[60..64], &2u32.to_be_bytes());
+            assert_eq!(&footer[64..68], &vhd_checksum(&footer).to_be_bytes());
+
+            image.rewind().unwrap();
+            let fat = fatfs::FileSystem::new(image, fatfs::FsOptions::new()).unwrap();
+            let root = fat.root_dir();
+            let mut contents = String::new();
+            root.open_file("nested/hello.txt")
+                .unwrap()
+                .read_to_string(&mut contents)
+                .unwrap();
+            assert_eq!(contents, "disk fixture\n");
+            assert!(root.open_file("excluded").is_err());
+        }
+    }
 }

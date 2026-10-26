@@ -24,7 +24,7 @@ struct Cli {
 enum Commands {
     /// Run the kernel in QEMU
     Run(RunArgs),
-    /// Create a FAT32 VHD image from a directory
+    /// Create a FAT or ext4 VHD image from a directory
     Mkdisk(MkdiskArgs),
 }
 
@@ -57,9 +57,9 @@ struct RunArgs {
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 enum DiskFormat {
-    /// FAT32 filesystem (QEMU VHD, default)
+    /// FAT filesystem (automatically selected FAT12/16/32)
     Fat,
-    /// ext4 filesystem — requires mkfs.ext4 on the host
+    /// ext4 filesystem — requires mkfs.ext4 and debugfs on the host
     Ext4,
 }
 
@@ -73,7 +73,7 @@ struct MkdiskArgs {
     #[arg(value_name = "OUTPUT")]
     output: PathBuf,
 
-    /// Image size in MiB (minimum 32)
+    /// Image data size in MiB (minimum: FAT 4, ext4 16)
     #[arg(long, default_value = "64")]
     size_mib: u64,
 
@@ -116,7 +116,7 @@ fn cmd_mkdisk(args: MkdiskArgs) {
         .filter(|s| !s.is_empty())
         .collect();
     let format_name = match args.format {
-        DiskFormat::Fat => "FAT32",
+        DiskFormat::Fat => "FAT",
         DiskFormat::Ext4 => "ext4",
     };
     eprintln!(
