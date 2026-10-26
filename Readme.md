@@ -116,6 +116,23 @@ failures; a changed/unreadable VHD fails even an otherwise successful suite.
 Serial logs and copied kernel traces remain in
 `target/userspace-smoke-{bios,uefi}*.log` (overwritten per mode invocation);
 assertion failures also preserve the normalized `*-response.log`.
+Syscall tracing defaults to `false`. Enable it at build time for both ordinary
+boot images and regenerated BIOS/UEFI serial-shell ramdisks:
+
+```bash
+KRUST_BOOT_SYSCALL_TRACE=true cargo build -Z bindeps --locked
+scripts/smoke-userspace.sh target/krust-disk-ext4.vhd
+grep -E 'syscall (entry: pid=|exit: pid=|meta: name=)' target/userspace-smoke-{bios,uefi}-kernel.log
+```
+
+These are actual syscall dispatch records, not just the boot configuration.
+The smoke accepts structured `syscall failed: ... errno=...` trace diagnostics
+for userspace probes/retries; command failures and other kernel errors still fail.
+`--headless` and `--pty` still select shell port 2; BIOS with only raw
+`-display none`/`--display none` selects port 1. Ordinary boot console settings
+are unchanged. Rebuild without `KRUST_BOOT_SYSCALL_TRACE` (or set it to `false`)
+to disable these records; rerunning the smoke overwrites its logs.
+
 Requirements: Bash, GNU `timeout`, `realpath`, `sha256sum`, util-linux `setsid`,
 and the normal QEMU/build prerequisites.
 
@@ -128,7 +145,8 @@ scripts/test-smoke-userspace.sh
 The controlled fake runner checks split prompts and rejects premature/batched
 commands. Tests cover success, missing shell, command failure, boot/mid-command
 and closed-output timeouts, echoed markers without output, missing pwd/proc
-content, runner failure, invalid deadlines/paths/arguments, and disk mutation on failure and
+content, expected syscall-probe traces versus unrelated kernel errors, runner
+failure, invalid deadlines/paths/arguments, and disk mutation on failure and
 success. They verify owned child processes are reaped, scratch directories
 removed, and an unrelated process left alive. Each case uses a three-second
 deadline; case logs remain in `target/userspace-smoke-test-*.log`.

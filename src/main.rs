@@ -153,13 +153,13 @@ fn cmd_run(cli: RunArgs) -> Result<(), String> {
     let kernel_path = env!("KERNEL_PATH");
     let kernel_bios_path = env!("KERNEL_BIOS_PATH");
     let boot_log_level = env!("KRUST_BOOT_LOG_LEVEL");
+    let boot_syscall_trace = env!("KRUST_BOOT_SYSCALL_TRACE");
     let uefi_path = env!("UEFI_PATH");
     let bios_path = env!("BIOS_PATH");
 
     let mode_uefi = matches!(cli.mode, BootMode::Uefi);
     let uefi = mode_uefi;
-    let use_secondary_serial = cli.headless || cli.pty;
-    let serial_shell_boot = use_secondary_serial || (!uefi && qemu_display_none(&cli.qemu_args));
+    let shell_port = serial_shell_port(&cli);
 
     let sata_vhd = if cli.no_vhd {
         None
@@ -218,12 +218,8 @@ fn cmd_run(cli: RunArgs) -> Result<(), String> {
 
         let code = prebuilt.get_file(Arch::X64, FileType::Code);
         let vars = prebuilt.get_file(Arch::X64, FileType::Vars);
-        let image_path = if serial_shell_boot {
-            build_headless_uefi_image(
-                kernel_path,
-                boot_log_level,
-                if use_secondary_serial { 2 } else { 1 },
-            )
+        let image_path = if let Some(shell_port) = shell_port {
+            build_headless_uefi_image(kernel_path, boot_log_level, shell_port, boot_syscall_trace)
         } else {
             PathBuf::from(uefi_path)
         };
@@ -240,11 +236,12 @@ fn cmd_run(cli: RunArgs) -> Result<(), String> {
             vars.display()
         ));
     } else {
-        let image_path = if serial_shell_boot {
+        let image_path = if let Some(shell_port) = shell_port {
             build_headless_bios_image(
                 kernel_bios_path,
                 boot_log_level,
-                if use_secondary_serial { 2 } else { 1 },
+                shell_port,
+                boot_syscall_trace,
             )
         } else {
             PathBuf::from(bios_path)
@@ -283,19 +280,20 @@ fn check_qemu_exit(code: Option<i32>) -> Result<(), String> {
     }
 }
 
-fn build_headless_uefi_image(kernel_path: &str, boot_log_level: &str, shell_port: u8) -> PathBuf {
+fn build_headless_uefi_image(
+    kernel_path: &str,
+    boot_log_level: &str,
+    shell_port: u8,
+    boot_syscall_trace: &str,
+) -> PathBuf {
     let temp_dir = env::temp_dir();
     let pid = std::process::id();
     let ramdisk_path = temp_dir.join(format!("krust-headless-{pid}.ramdisk"));
     let image_path = temp_dir.join(format!("krust-headless-{pid}.img"));
 
-    let boot_toml = format!(
-        "log_level = \"{}\"\nshell_port = {}\nshell_console = \"serial\"\n",
-        boot_log_level, shell_port
-    );
     fs::write(
         &ramdisk_path,
-        make_cpio_newc(&[("boot.toml", boot_toml.as_bytes())]),
+        headless_boot_ramdisk(boot_log_level, shell_port, boot_syscall_trace),
     )
     .expect("failed to create headless ramdisk");
 
@@ -307,19 +305,20 @@ fn build_headless_uefi_image(kernel_path: &str, boot_log_level: &str, shell_port
     image_path
 }
 
-fn build_headless_bios_image(kernel_path: &str, boot_log_level: &str, shell_port: u8) -> PathBuf {
+fn build_headless_bios_image(
+    kernel_path: &str,
+    boot_log_level: &str,
+    shell_port: u8,
+    boot_syscall_trace: &str,
+) -> PathBuf {
     let temp_dir = env::temp_dir();
     let pid = std::process::id();
     let ramdisk_path = temp_dir.join(format!("krust-headless-{pid}.ramdisk"));
     let image_path = temp_dir.join(format!("krust-headless-{pid}.bios.img"));
 
-    let boot_toml = format!(
-        "log_level = \"{}\"\nshell_port = {}\nshell_console = \"serial\"\n",
-        boot_log_level, shell_port
-    );
     fs::write(
         &ramdisk_path,
-        make_cpio_newc(&[("boot.toml", boot_toml.as_bytes())]),
+        headless_boot_ramdisk(boot_log_level, shell_port, boot_syscall_trace),
     )
     .expect("failed to create headless ramdisk");
 
@@ -329,6 +328,23 @@ fn build_headless_bios_image(kernel_path: &str, boot_log_level: &str, shell_port
         .expect("failed to create headless bios image");
 
     image_path
+}
+
+fn headless_boot_ramdisk(log_level: &str, shell_port: u8, syscall_trace: &str) -> Vec<u8> {
+    let boot_toml = format!(
+        "log_level = \"{log_level}\"\nshell_port = {shell_port}\nshell_console = \"serial\"\nsyscall_trace = {syscall_trace}\n"
+    );
+    make_cpio_newc(&[("boot.toml", boot_toml.as_bytes())])
+}
+
+fn serial_shell_port(cli: &RunArgs) -> Option<u8> {
+    if cli.headless || cli.pty {
+        Some(2)
+    } else if cli.mode == BootMode::Bios && qemu_display_none(&cli.qemu_args) {
+        Some(1)
+    } else {
+        None
+    }
 }
 
 fn qemu_display_none(qemu_args: &[String]) -> bool {
@@ -386,6 +402,77 @@ fn append_cpio_entry(out: &mut Vec<u8>, ino: u32, name: &str, data: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn headless_boot_config_preserves_trace_and_ports() {
+        for mode in ["bios", "uefi"] {
+            for trace in ["true", "false"] {
+                for (options, expected_port) in [
+                    (vec!["--headless"], 2),
+                    (vec!["--pty"], 2),
+                    (vec!["--headless", "--pty"], 2),
+                ] {
+                    let cli = Cli::parse_from(["krust", "run", mode].into_iter().chain(options));
+                    let Commands::Run(args) = cli.command else {
+                        unreachable!()
+                    };
+                    let port = serial_shell_port(&args).unwrap();
+                    assert_eq!(port, expected_port);
+                    assert_boot_ramdisk(port, trace);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn boot_config_preserves_display_none_and_ordinary_boot() {
+        for mode in ["bios", "uefi"] {
+            let cli = Cli::parse_from(["krust", "run", mode]);
+            let Commands::Run(args) = cli.command else {
+                unreachable!()
+            };
+            assert_eq!(serial_shell_port(&args), None);
+
+            for display_arg in ["-display", "--display"] {
+                let cli = Cli::parse_from(["krust", "run", mode, "--", display_arg, "none"]);
+                let Commands::Run(args) = cli.command else {
+                    unreachable!()
+                };
+                let port = serial_shell_port(&args);
+                assert_eq!(port, if mode == "bios" { Some(1) } else { None });
+                if let Some(port) = port {
+                    for trace in ["true", "false"] {
+                        assert_boot_ramdisk(port, trace);
+                    }
+                }
+            }
+        }
+    }
+
+    fn assert_boot_ramdisk(port: u8, trace: &str) {
+        let ramdisk = headless_boot_ramdisk("debug", port, trace);
+        assert_eq!(&ramdisk[..6], b"070701");
+        let hex = |range: std::ops::Range<usize>| {
+            usize::from_str_radix(std::str::from_utf8(&ramdisk[range]).unwrap(), 16).unwrap()
+        };
+        let name_len = hex(94..102);
+        let data_len = hex(54..62);
+        assert_eq!(&ramdisk[110..110 + name_len], b"boot.toml\0");
+        let data_start = (110 + name_len + 3) & !3;
+        let config = std::str::from_utf8(&ramdisk[data_start..data_start + data_len]).unwrap();
+        assert_eq!(
+            config,
+            format!(
+                "log_level = \"debug\"\nshell_port = {port}\nshell_console = \"serial\"\nsyscall_trace = {trace}\n"
+            )
+        );
+        let trailer_start = (data_start + data_len + 3) & !3;
+        assert_eq!(&ramdisk[trailer_start..trailer_start + 6], b"070701");
+        assert_eq!(
+            &ramdisk[trailer_start + 110..trailer_start + 121],
+            b"TRAILER!!!\0"
+        );
+    }
 
     #[test]
     fn qemu_exit_guest_success() {

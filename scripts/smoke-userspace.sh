@@ -72,6 +72,12 @@ commands=(
     "exit"
 )
 errors='EXCEPTION:|panicked|exited with status|errno|command not found'
+kernel_errors() {
+    # Negative syscall results include normal userspace probes and retries.
+    # Command responses are still checked above, including their errno output.
+    sed -E '/^ERROR: syscall failed: nr=[0-9]+ \([a-z0-9_]+\) errno=-[0-9]+\r?$/d' "$1" |
+        grep -E "$errors" > /dev/null
+}
 check_response() {
     # Check only this command's response, with full-line anchors so an echoed
     # command containing the expected string can never substitute for output.
@@ -173,7 +179,8 @@ for mode in bios uefi; do
     fi
     if [[ -n "$failure" || $status != 0 || $next != ${#commands[@]} || "$valid_trace" != true ]] ||
         ! grep -q 'fork: parent_pid=' "$trace" ||
-        grep -Eq "$errors" "$log" "$trace"; then
+        grep -Eq "$errors" "$log" ||
+        kernel_errors "$trace"; then
         echo "$mode userspace smoke FAILED (${failure:-incomplete suite or runner failure}; status $status, commands $next/${#commands[@]}); see $log" >&2
         exit 1
     fi

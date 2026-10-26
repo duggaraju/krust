@@ -20,7 +20,7 @@ sleep 300 &
 sentinel=$!
 runner="$PWD/scripts/tests/smoke-userspace-runner.sh"
 
-for scenario in success missing-shell command-failure timeout closed-output echo-only bad-pwd bad-cat runner-failure mutate-failure mutate-success; do
+for scenario in success trace-success kernel-errno kernel-panic missing-shell command-failure timeout closed-output echo-only bad-pwd bad-cat runner-failure mutate-failure mutate-success; do
     state="$work/$scenario"
     mkdir "$state"
     printf 'original VHD fixture\n' > "$state/disk.vhd"
@@ -31,7 +31,7 @@ for scenario in success missing-shell command-failure timeout closed-output echo
     SMOKE_TEST_STATE="$state" SMOKE_TEST_CASE="$scenario" KRUST_SMOKE_TIMEOUT_SECONDS=3 \
         scripts/smoke-userspace.sh "$state/disk.vhd" "$runner" > "$log" 2>&1 || status=$?
     (( SECONDS - started <= 8 ))
-    if [[ "$scenario" == success ]]; then
+    if [[ "$scenario" == success || "$scenario" == trace-success ]]; then
         [[ $status == 0 ]]
         grep -q '^bios userspace smoke passed$' "$log"
         grep -q '^uefi userspace smoke passed$' "$log"

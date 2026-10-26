@@ -51,6 +51,7 @@ fn main() {
         kernel_for_bios.display()
     );
     println!("cargo:rustc-env=KRUST_BOOT_LOG_LEVEL={}", boot_log_level);
+    println!("cargo:rustc-env=KRUST_BOOT_SYSCALL_TRACE={}", boot_syscall_trace);
     println!("cargo:rustc-env=UEFI_PATH={}", uefi_path.display());
     println!("cargo:rustc-env=BIOS_PATH={}", bios_path.display());
 }

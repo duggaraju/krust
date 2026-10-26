@@ -9,6 +9,12 @@ printf '%s\n' "$$" >> "$SMOKE_TEST_STATE/pids"
 touch "$TMPDIR/generated.img" "$TMPDIR/generated.ramdisk"
 trace="$TMPDIR/krust-trace-$$.log"
 printf 'fork: parent_pid=1\n' > "$trace"
+case "$SMOKE_TEST_CASE" in
+    trace-success)
+        printf 'INFO : syscall entry: pid=4 nr=9 (mmap) args=[0x0]\r\nINFO : syscall exit: pid=4 nr=9 (mmap) ret=-12\r\nERROR: syscall failed: nr=9 (mmap) errno=-12\r\n' >> "$trace" ;;
+    kernel-errno) printf 'ERROR: unexpected errno=-12\n' >> "$trace" ;;
+    kernel-panic) printf 'panicked at kernel probe\n' >> "$trace" ;;
+esac
 printf 'headless kernel trace log: %s\n' "$trace"
 
 # The runner must reap its QEMU stand-in when the harness kills their group.
