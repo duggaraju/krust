@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 # Controlled host-only stand-in for the runner and its QEMU child.
 set -euo pipefail
-[[ $# == 8 && $1 == run && $3 == --headless && $4 == --vhd &&
-   $6 == -- && $7 == -snapshot && $8 == -no-reboot ]]
+if [[ "$SMOKE_TEST_CASE" == shell-* && ${4-} == --no-vhd ]]; then
+    [[ $# == 7 && $1 == run && $3 == --headless &&
+       $5 == -- && $6 == -snapshot && $7 == -no-reboot ]]
+else
+    [[ $# == 8 && $1 == run && $3 == --headless && $4 == --vhd &&
+       $6 == -- && $7 == -snapshot && $8 == -no-reboot ]]
+fi
 [[ "$TMPDIR" == "$PWD"/target/userspace-smoke-* && -d "$TMPDIR" ]]
 printf '%s\n' "$TMPDIR" >> "$SMOKE_TEST_STATE/workdirs"
 printf '%s\n' "$$" >> "$SMOKE_TEST_STATE/pids"
@@ -57,6 +62,20 @@ expected+=(
     "/bin/busybox echo KRUST_FORK_EXEC_OK"
     "exit"
 )
+if [[ "$SMOKE_TEST_CASE" == shell-* ]]; then
+    source scripts/tests/shell-suite.sh
+    shell_fs=disk
+    [[ "$4" != --no-vhd ]] || shell_fs=ramfs
+    shell_suite "$shell_fs"
+    expected=("${shell_commands[@]}")
+    [[ "$2" != bios ]] || expected[${#expected[@]}-1]=shutdown
+    source scripts/tests/shell-responses.sh
+    shell_fake_cwd=/
+    shell_fake_value=
+    shell_fake_empty=false
+    shell_fake_contents=
+    shell_fake_ticks=100
+fi
 for index in "${!expected[@]}"; do
     # Split a prompt across writes and ensure the host has not sent commands
     # early (especially not a whole batch after the initial boot prompt).
@@ -64,7 +83,7 @@ for index in "${!expected[@]}"; do
         echo "Command arrived before its prompt: $early" >&2
         exit 8
     fi
-    if [[ "$SMOKE_TEST_CASE" == timeout && $index == 4 ]]; then
+    if [[ ( "$SMOKE_TEST_CASE" == timeout || "$SMOKE_TEST_CASE" == shell-timeout ) && $index == 4 ]]; then
         printf 'krust>'
         wait "$child"
         exit 1
@@ -77,6 +96,11 @@ for index in "${!expected[@]}"; do
     printf '%s: %s\n' "$2" "$command" >> "$SMOKE_TEST_STATE/commands"
     # Serial echo is allowed, but must not satisfy output assertions.
     printf '%s\r\n' "$command"
+    if [[ "$SMOKE_TEST_CASE" == shell-* ]]; then
+        shell_fake_response "$command"
+        [[ "$command" != exit && "$command" != shutdown ]] || exit 0
+        continue
+    fi
     response_index=$index
     if [[ "$SMOKE_TEST_CASE" == probe-* && $index -ge 1 ]]; then
         if (( index == 1 )); then

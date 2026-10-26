@@ -110,6 +110,49 @@ The trace should contain `vendor=1af4 device=1044` with `ahci=false`, alongside
 the existing AHCI controller. The timeout bounds this inspection and `-snapshot`
 keeps the source VHD unchanged.
 
+### BIOS/UEFI kernel-shell command regression
+
+```bash
+cargo build -Z bindeps --locked
+scripts/test-smoke-userspace.sh
+scripts/smoke-shell.sh target/krust-disk-ext4.vhd
+```
+
+This is a real QEMU **integration** suite for the kernel's built-ins, not
+BusyBox replacements or host-only unit tests. It reuses the existing serial
+prompt, deadline, isolated-process cleanup, and source-disk hash checks.
+Each firmware mode runs two fresh boots:
+
+- **Disk boot (33 cases):** help, echo/empty input, both environment-setting
+  forms and updates, clear-screen controls, memory/process/device/PCI/module
+  listings, monotonic uptime, exact missing-path diagnostics and recovery,
+  then a BusyBox child to verify external execution still works.
+- **RAM-backed boot (77 cases, `--no-vhd`):** mkdir, relative/absolute navigation,
+  write/read/overwrite round trips, directory and long listings, stat metadata,
+  invalid arguments, missing paths, non-directory navigation, and unknown
+  commands. Every intentional failure is followed by a healthy echo and a
+  cwd assertion. BIOS uses `shutdown`; UEFI uses its `exit` alias.
+
+Assertions are scoped to each response and reject echoed input, wrong/missing
+diagnostics, lost environment/cwd state, corrupt content, and unexpected errors.
+The 120-second deadline applies **per boot**; `KRUST_SMOKE_TIMEOUT_SECONDS`
+may shorten it. Logs remain in
+`target/shell-smoke-{bios,uefi}-{disk,ramfs}{,-kernel,-response}.log`
+(response logs exist only for assertion failures). The existing VHD must contain
+`/bin/busybox`; QEMU snapshots leave it unchanged. No kernel behavior is changed.
+
+The separate RAM-backed mutation phase is intentional:
+[ext4 mkdir currently returns EIO (#51)](https://github.com/duggaraju/krust/issues/51).
+Passing this suite does **not** certify ext4 writes. Listing tests also preserve
+the current shell behavior: dotfiles are shown without `-a`, and RAM-backed
+`ls -a` does not synthesize `.`/`..`; this is not POSIX `ls` certification.
+
+The host-only harness tests include 11 shell scenarios (success plus injected
+state/content/diagnostic/clear/uptime/shutdown failures and timeout). Together
+with the existing scenarios, all 33 check bounded execution, scratch removal,
+owned child cleanup, and survival of an unrelated process. No QEMU or real
+VHD is needed for those controlled tests; the four real boots validate the kernel.
+
 ### BIOS/UEFI userspace regression
 
 With an existing ext4 root VHD containing `/bin/busybox`, run:

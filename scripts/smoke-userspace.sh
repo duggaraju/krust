@@ -8,6 +8,11 @@ if (( $# > 2 )); then
     exit 2
 fi
 deadline=${KRUST_SMOKE_TIMEOUT_SECONDS-120}
+shell_probe=${KRUST_SMOKE_SHELL_PROBE-0}
+if [[ "$shell_probe" != 0 && "$shell_probe" != 1 ]]; then
+    echo "KRUST_SMOKE_SHELL_PROBE must be 0 or 1" >&2
+    exit 2
+fi
 if [[ "${KRUST_SMOKE_MMAP_PROBE-0}" != 0 && "${KRUST_SMOKE_MMAP_PROBE-0}" != 1 ]]; then
     echo "KRUST_SMOKE_MMAP_PROBE must be 0 or 1" >&2
     exit 2
@@ -87,6 +92,19 @@ commands+=(
     "/bin/busybox echo KRUST_FORK_EXEC_OK"
     "exit"
 )
+suite=userspace
+log_prefix=userspace-smoke
+if [[ "$shell_probe" == 1 ]]; then
+    if [[ "${KRUST_SMOKE_MMAP_PROBE-0}" != 0 || "${KRUST_SMOKE_CLOEXEC_PROBE-0}" != 0 ]]; then
+        echo "Run the shell suite separately from mmap/CLOEXEC probes" >&2
+        exit 2
+    fi
+    source scripts/tests/shell-suite.sh
+    shell_suite disk
+    commands=("${shell_commands[@]}")
+    suite=shell
+    log_prefix=shell-smoke
+fi
 errors='EXCEPTION:|panicked|exited with status|errno|command not found'
 kernel_errors() {
     # Negative syscall results include normal userspace probes and retries.
@@ -107,6 +125,10 @@ mmap_probe_address() {
     printf '0x%x' "$address"
 }
 check_response() {
+    if [[ "$shell_probe" == 1 ]]; then
+        shell_check_response "$1"
+        return
+    fi
     # Check only this command's response, with full-line anchors so an echoed
     # command containing the expected string can never substitute for output.
     local response="$work/response"
@@ -132,17 +154,33 @@ check_response() {
     esac
 }
 
-for mode in bios uefi; do
+boots=(bios uefi)
+if [[ "$shell_probe" == 1 ]]; then
+    boots=(bios-disk bios-ramfs uefi-disk uefi-ramfs)
+fi
+for boot in "${boots[@]}"; do
+    mode=${boot%%-*}
+    disk_args=(--vhd "$disk")
+    shell_last_ticks=0
+    if [[ "$shell_probe" == 1 ]]; then
+        shell_fs=${boot#*-}
+        shell_suite "$shell_fs"
+        commands=("${shell_commands[@]}")
+        [[ "$shell_fs" != ramfs ]] || disk_args=(--no-vhd)
+        # Exercise both shutdown spellings across the two firmware modes.
+        commands[${#commands[@]}-1]=exit
+        [[ "$mode" != bios ]] || commands[${#commands[@]}-1]=shutdown
+    fi
     if [[ "${KRUST_SMOKE_MMAP_PROBE-0}" == 1 ]]; then
         commands[1]="/bin/krust-mmap-probe"
     fi
-    log="$PWD/target/userspace-smoke-$mode.log"
+    log="$PWD/target/$log_prefix-$boot.log"
     : > "$log"
-    rm -f "target/userspace-smoke-$mode-kernel.log" "target/userspace-smoke-$mode-response.log"
+    rm -f "target/$log_prefix-$boot-kernel.log" "target/$log_prefix-$boot-response.log"
     : > "$work/raw-response"
     coproc GUEST {
         exec setsid timeout --signal=TERM --kill-after=2s "${deadline}s" \
-            env TMPDIR="$work" "$runner" run "$mode" --headless --vhd "$disk" -- \
+            env TMPDIR="$work" "$runner" run "$mode" --headless "${disk_args[@]}" -- \
             -snapshot -no-reboot 2>&1
     }
     active=$GUEST_PID
@@ -174,9 +212,13 @@ for mode in bios uefi; do
             suffix="${suffix: -8}"
         fi
         if [[ "$suffix" == *"krust> " && $next -lt ${#commands[@]} ]]; then
+            if (( next == 0 )) && grep -Eq "$errors" "$work/raw-response"; then
+                failure="boot diagnostic before first command"
+                break
+            fi
             # A complete prompt ends the previous command's response.
             if (( next > 0 )) && ! check_response "$((next - 1))"; then
-                cp "$work/response" "target/userspace-smoke-$mode-response.log"
+                cp "$work/response" "target/$log_prefix-$boot-response.log"
                 failure="command failed: ${commands[$((next - 1))]}"
                 break
             fi
@@ -213,21 +255,26 @@ for mode in bios uefi; do
         fi
     fi
     stop_guest
+    if [[ "$shell_probe" == 1 && -z "$failure" && $next == ${#commands[@]} ]] &&
+        ! check_response "$((next - 1))"; then
+        cp "$work/response" "target/$log_prefix-$boot-response.log"
+        failure="unexpected shutdown output"
+    fi
     trace=$(sed -n 's/^headless kernel trace log: //p' "$log" | tr -d '\r')
     valid_trace=false
     if [[ "$trace" == "$work"/krust-trace-*.log && -f "$trace" ]]; then
-        cp "$trace" "target/userspace-smoke-$mode-kernel.log"
+        cp "$trace" "target/$log_prefix-$boot-kernel.log"
         valid_trace=true
     fi
     if [[ $status == 124 || $status == 137 ]]; then
         failure="timeout after ${deadline}s (status $status)"
     fi
     if [[ -n "$failure" || $status != 0 || $next != ${#commands[@]} || "$valid_trace" != true ]] ||
-        ! grep -q 'fork: parent_pid=' "$trace" ||
-        grep -Eq "$errors" "$log" ||
+        { [[ "$boot" != *-ramfs ]] && ! grep -q 'fork: parent_pid=' "$trace"; } ||
+        { [[ "$shell_probe" == 0 ]] && grep -Eq "$errors" "$log"; } ||
         kernel_errors "$trace"; then
-        echo "$mode userspace smoke FAILED (${failure:-incomplete suite or runner failure}; status $status, commands $next/${#commands[@]}); see $log" >&2
+        echo "$boot $suite smoke FAILED (${failure:-incomplete suite or runner failure}; status $status, commands $next/${#commands[@]}); see $log" >&2
         exit 1
     fi
-    echo "$mode userspace smoke passed"
+    echo "$boot $suite smoke passed"
 done

@@ -20,7 +20,7 @@ sleep 300 &
 sentinel=$!
 runner="$PWD/scripts/tests/smoke-userspace-runner.sh"
 
-for scenario in success trace-success probe-success probe-missing-address probe-missing-marker cloexec-success cloexec-missing-before cloexec-missing-exec cloexec-missing-fork cloexec-echo-only kernel-errno kernel-panic missing-shell command-failure timeout closed-output echo-only bad-pwd bad-cat runner-failure mutate-failure mutate-success; do
+for scenario in success trace-success probe-success probe-missing-address probe-missing-marker cloexec-success cloexec-missing-before cloexec-missing-exec cloexec-missing-fork cloexec-echo-only shell-success shell-echo-only shell-env-loss shell-no-clear shell-wrong-diagnostic shell-missing-recovery shell-uptime-backwards shell-bad-content shell-cwd-loss shell-shutdown-error shell-timeout kernel-errno kernel-panic missing-shell command-failure timeout closed-output echo-only bad-pwd bad-cat runner-failure mutate-failure mutate-success; do
     state="$work/$scenario"
     mkdir "$state"
     printf 'original VHD fixture\n' > "$state/disk.vhd"
@@ -30,14 +30,37 @@ for scenario in success trace-success probe-success probe-missing-address probe-
     started=$SECONDS
     probe=0
     cloexec=0
+    shell=0
+    deadline=3
     [[ "$scenario" != probe-* ]] || probe=1
     [[ "$scenario" != cloexec-* ]] || cloexec=1
-    SMOKE_TEST_STATE="$state" SMOKE_TEST_CASE="$scenario" KRUST_SMOKE_TIMEOUT_SECONDS=3 \
+    if [[ "$scenario" == shell-* ]]; then
+        shell=1
+        deadline=10
+        [[ "$scenario" != shell-timeout ]] || deadline=3
+    fi
+    SMOKE_TEST_STATE="$state" SMOKE_TEST_CASE="$scenario" KRUST_SMOKE_TIMEOUT_SECONDS="$deadline" \
         KRUST_SMOKE_MMAP_PROBE="$probe" \
         KRUST_SMOKE_CLOEXEC_PROBE="$cloexec" \
+        KRUST_SMOKE_SHELL_PROBE="$shell" \
         scripts/smoke-userspace.sh "$state/disk.vhd" "$runner" > "$log" 2>&1 || status=$?
-    (( SECONDS - started <= 8 ))
-    if [[ "$scenario" == success || "$scenario" == trace-success || "$scenario" == probe-success || "$scenario" == cloexec-success ]]; then
+    (( SECONDS - started <= (shell == 1 ? 45 : 8) ))
+    if [[ "$scenario" == shell-success ]]; then
+        [[ $status == 0 ]]
+        for boot in bios-disk bios-ramfs uefi-disk uefi-ramfs; do
+            grep -q "^$boot shell smoke passed$" "$log"
+        done
+        [[ $(wc -l < "$state/commands") == 220 ]]
+    elif [[ "$scenario" == shell-* ]]; then
+        [[ $status == 1 ]]
+        if [[ "$scenario" == shell-bad-content || "$scenario" == shell-cwd-loss ]]; then
+            grep -q '^bios-disk shell smoke passed$' "$log"
+            grep -q '^bios-ramfs shell smoke FAILED' "$log"
+        else
+            grep -q '^bios-disk shell smoke FAILED' "$log"
+        fi
+        ! grep -q '^uefi-.* shell smoke passed' "$log"
+    elif [[ "$scenario" == success || "$scenario" == trace-success || "$scenario" == probe-success || "$scenario" == cloexec-success ]]; then
         [[ $status == 0 ]]
         grep -q '^bios userspace smoke passed$' "$log"
         grep -q '^uefi userspace smoke passed$' "$log"
@@ -62,6 +85,8 @@ for scenario in success trace-success probe-success probe-missing-address probe-
         probe-missing-address) grep -q 'cannot derive kernel mapping address' "$log" ;;
         probe-missing-marker) grep -q 'command failed: /bin/krust-mmap-probe' "$log" ;;
         cloexec-missing-*|cloexec-echo-only) grep -q 'command failed: cloexec-test' "$log" ;;
+        shell-timeout) grep -q 'timeout after 3s' "$log" ;;
+        shell-shutdown-error) grep -q 'unexpected shutdown output' "$log" ;;
     esac
     if [[ "$scenario" == mutate-* ]]; then
         grep -q '^Source VHD changed!$' "$log"
@@ -107,3 +132,17 @@ for invalid in missing-disk directory-disk missing-runner nonexecutable-runner e
     [[ $status != 0 ]]
 done
 echo "invalid paths and arguments rejected"
+
+for invalid in '' 2 true; do
+    status=0
+    KRUST_SMOKE_SHELL_PROBE="$invalid" scripts/smoke-userspace.sh \
+        "$work/success/disk.vhd" "$runner" > "$work/invalid.log" 2>&1 || status=$?
+    [[ $status == 2 ]]
+    grep -q 'KRUST_SMOKE_SHELL_PROBE must be 0 or 1' "$work/invalid.log"
+done
+status=0
+KRUST_SMOKE_SHELL_PROBE=1 KRUST_SMOKE_MMAP_PROBE=1 scripts/smoke-userspace.sh \
+    "$work/success/disk.vhd" "$runner" > "$work/invalid.log" 2>&1 || status=$?
+[[ $status == 2 ]]
+grep -q 'Run the shell suite separately' "$work/invalid.log"
+echo "invalid shell suite settings rejected"
