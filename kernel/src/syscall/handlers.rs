@@ -844,16 +844,13 @@ pub fn sys_fcntl(args: &SyscallArgs) -> isize {
     // F_DUPFD=0, F_GETFD=1, F_SETFD=2, F_GETFL=3, F_SETFL=4, F_DUPFD_CLOEXEC=1030
     match cmd {
         0 | 1030 => {
-            if arg > i32::MAX as usize {
-                return -22;
-            }
-            match crate::process::dup_fd(fd, arg) {
+            match crate::process::dup_fd(fd, arg, cmd == 1030) {
                 Ok(new_fd) => new_fd as isize,
                 Err(errno) => errno,
             }
         }
-        1 => 0, // F_GETFD: no close-on-exec flag
-        2 => 0, // F_SETFD: ignore
+        1 => crate::process::fd_flags(fd).map(|flags| flags as isize).unwrap_or_else(|errno| errno),
+        2 => crate::process::set_fd_flags(fd, arg).map(|()| 0).unwrap_or_else(|errno| errno),
         3 => {
             // Return open access mode bits in Linux O_* layout.
             match crate::process::fd_descriptor(fd) {

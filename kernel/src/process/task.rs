@@ -1,7 +1,8 @@
 extern crate alloc;
 
+use super::fd_table::FdTable;
 use crate::arch::CpuContext;
-use crate::fs::vfs::{File, FileDescriptor, FileOpenMode, Inode, OpenFile, SeekFrom};
+use crate::fs::vfs::{FileDescriptor, FileOpenMode, Inode, OpenFile};
 use crate::mm::address_space::AddressSpace;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -111,7 +112,7 @@ pub struct Task {
     pub time_usage_ms: u64,
     /// Time when task was last started running (in milliseconds since boot)
     start_time_ms: u64,
-    fds: FdTable,
+    fds: FdTable<FdEntry>,
     /// Environment variables: Arc<EnvMap> enables CoW semantics.
     /// Cloning a task is O(1); modifying an env var triggers Arc::make_mut().
     pub env: Arc<EnvMap>,
@@ -338,17 +339,17 @@ impl Task {
         if let Ok(file) =
             crate::fs::vfs::open_path(target).or_else(|_| crate::fs::vfs::open_path(fallback))
         {
-            self.fds.insert_at(0, file, FileOpenMode::ReadOnly);
+            self.fds.insert_at(0, fd_entry(file, FileOpenMode::ReadOnly), 0);
         }
         if let Ok(file) =
             crate::fs::vfs::open_path(target).or_else(|_| crate::fs::vfs::open_path(fallback))
         {
-            self.fds.insert_at(1, file, FileOpenMode::WriteOnly);
+            self.fds.insert_at(1, fd_entry(file, FileOpenMode::WriteOnly), 0);
         }
         if let Ok(file) =
             crate::fs::vfs::open_path(target).or_else(|_| crate::fs::vfs::open_path(fallback))
         {
-            self.fds.insert_at(2, file, FileOpenMode::WriteOnly);
+            self.fds.insert_at(2, fd_entry(file, FileOpenMode::WriteOnly), 0);
         }
     }
 
@@ -361,20 +362,33 @@ impl Task {
         "/dev/null"
     }
 
-    pub fn open_fd(&mut self, file: OpenFile) -> usize {
-        self.fds.insert(file, FileOpenMode::ReadWrite)
+    pub fn open_fd(&mut self, file: OpenFile, flags: usize, mode: FileOpenMode) -> usize {
+        let entry = fd_entry(file, mode);
+        self.fds.insert(entry, flags)
     }
 
-    pub fn close_fd(&mut self, fd: usize) -> Option<OpenFile> {
-        self.fds.remove(fd)
+    pub fn close_fd(&mut self, fd: usize) -> Option<Arc<OpenFileDescription>> {
+        self.fds.remove(fd).map(|entry| entry.file)
     }
 
-    pub fn take_fd(&mut self, fd: usize) -> Option<OpenFile> {
-        self.fds.remove(fd)
+    pub fn fd_file(&self, fd: usize) -> Option<Arc<OpenFileDescription>> {
+        self.fds.get(fd).map(|entry| Arc::clone(&entry.file))
     }
 
-    pub fn put_fd(&mut self, fd: usize, file: OpenFile) {
-        self.fds.insert_at(fd, file, FileOpenMode::ReadWrite);
+    pub fn fd_flags(&self, fd: usize) -> Result<usize, isize> {
+        self.fds.flags(fd)
+    }
+
+    pub fn set_fd_flags(&mut self, fd: usize, flags: usize) -> Result<(), isize> {
+        self.fds.set_flags(fd, flags)
+    }
+
+    pub fn close_on_exec(&mut self) -> Vec<Arc<OpenFileDescription>> {
+        self.fds
+            .close_on_exec()
+            .into_iter()
+            .map(|entry| entry.file)
+            .collect()
     }
 
     pub fn fd_entries(&self) -> impl Iterator<Item = (usize, FileDescriptor)> + '_ {
@@ -382,13 +396,11 @@ impl Task {
     }
 
     pub fn fd_descriptor(&self, fd: usize) -> Option<FileDescriptor> {
-        self.fds.descriptor(fd)
+        self.fds.get(fd).map(|entry| entry.descriptor)
     }
 
-    pub fn dup_fd(&mut self, old_fd: usize, min_fd: usize) -> Result<usize, isize> {
-        let source = self.fds.entry(old_fd).ok_or(-9isize)?;
-        let cloned = clone_fd_entry(source).ok_or(-5isize)?;
-        Ok(self.fds.insert_existing_from(min_fd, cloned))
+    pub fn dup_fd(&mut self, old_fd: usize, min_fd: usize, cloexec: bool) -> Result<usize, isize> {
+        self.fds.duplicate(old_fd, min_fd, cloexec)
     }
 
     /// Get an environment variable (zero-copy)
@@ -514,13 +526,22 @@ impl Task {
     }
 }
 
-struct FdTable {
-    slots: Vec<Option<FdEntry>>,
-}
-
+#[derive(Clone)]
 struct FdEntry {
     descriptor: FileDescriptor,
-    file: OpenFile,
+    file: Arc<OpenFileDescription>,
+}
+
+pub struct OpenFileDescription {
+    pub file: spin::Mutex<OpenFile>,
+}
+
+impl Drop for OpenFileDescription {
+    fn drop(&mut self) {
+        if let Err(err) = self.file.get_mut().close() {
+            log::error!("failed to close open file description: {:?}", err);
+        }
+    }
 }
 
 impl Clone for Task {
@@ -601,111 +622,13 @@ impl Clone for Task {
     }
 }
 
-impl FdTable {
-    fn new() -> Self {
-        Self { slots: Vec::new() }
+fn fd_entry(file: OpenFile, mode: FileOpenMode) -> FdEntry {
+    FdEntry {
+        descriptor: descriptor_for(file.inode().as_ref(), mode),
+        file: Arc::new(OpenFileDescription {
+            file: spin::Mutex::new(file),
+        }),
     }
-
-    fn insert(&mut self, file: OpenFile, mode: FileOpenMode) -> usize {
-        let descriptor = descriptor_for(file.inode().as_ref(), mode);
-        let entry = FdEntry { descriptor, file };
-
-        for fd in 3..self.slots.len() {
-            if self.slots[fd].is_none() {
-                self.slots[fd] = Some(entry);
-                return fd;
-            }
-        }
-
-        let fd = self.slots.len().max(3);
-        if self.slots.len() < fd {
-            self.slots.resize_with(fd, || None);
-        }
-        self.slots.push(Some(entry));
-        fd
-    }
-
-    fn insert_at(&mut self, fd: usize, file: OpenFile, mode: FileOpenMode) {
-        if fd >= self.slots.len() {
-            self.slots.resize_with(fd + 1, || None);
-        }
-        let descriptor = descriptor_for(file.inode().as_ref(), mode);
-        self.slots[fd] = Some(FdEntry { descriptor, file });
-    }
-
-    fn insert_existing_from(&mut self, min_fd: usize, entry: FdEntry) -> usize {
-        let start = core::cmp::max(3, min_fd);
-        if start >= self.slots.len() {
-            self.slots.resize_with(start + 1, || None);
-            self.slots[start] = Some(entry);
-            return start;
-        }
-
-        let mut pending = Some(entry);
-        for fd in start..self.slots.len() {
-            if self.slots[fd].is_none() {
-                self.slots[fd] = pending.take();
-                return fd;
-            }
-        }
-
-        self.slots.push(pending);
-        self.slots.len() - 1
-    }
-
-    fn remove(&mut self, fd: usize) -> Option<OpenFile> {
-        if fd >= self.slots.len() {
-            return None;
-        }
-        self.slots[fd].take().map(|entry| entry.file)
-    }
-
-    fn iter(&self) -> impl Iterator<Item = (usize, &FdEntry)> {
-        self.slots
-            .iter()
-            .enumerate()
-            .filter_map(|(fd, slot)| slot.as_ref().map(|entry| (fd, entry)))
-    }
-
-    fn descriptor(&self, fd: usize) -> Option<FileDescriptor> {
-        self.slots
-            .get(fd)
-            .and_then(|slot| slot.as_ref().map(|entry| entry.descriptor))
-    }
-
-    fn entry(&self, fd: usize) -> Option<&FdEntry> {
-        self.slots.get(fd).and_then(|slot| slot.as_ref())
-    }
-}
-
-impl Clone for FdTable {
-    fn clone(&self) -> Self {
-        let mut cloned = Self {
-            slots: Vec::with_capacity(self.slots.len()),
-        };
-
-        for slot in &self.slots {
-            let cloned_slot = slot.as_ref().and_then(|entry| clone_fd_entry(entry));
-            cloned.slots.push(cloned_slot);
-        }
-
-        cloned
-    }
-}
-
-fn clone_fd_entry(entry: &FdEntry) -> Option<FdEntry> {
-    let inode = crate::fs::vfs::lookup_inode_by_tuple(
-        entry.descriptor.fs_id,
-        entry.descriptor.major,
-        entry.descriptor.minor,
-        entry.descriptor.inode,
-    )?;
-    let mut cloned_file = OpenFile::new(inode, None).ok()?;
-    let _ = cloned_file.seek(SeekFrom::Start(entry.file.position()));
-    Some(FdEntry {
-        descriptor: entry.descriptor,
-        file: cloned_file,
-    })
 }
 
 #[cfg(feature = "drivers")]

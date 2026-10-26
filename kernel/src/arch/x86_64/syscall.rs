@@ -1,6 +1,6 @@
 use x86_64::VirtAddr;
 use x86_64::registers::model_specific::{
-    Efer, EferFlags, FsBase, KernelGsBase, LStar, SFMask, Star,
+    Efer, EferFlags, FsBase, GsBase, KernelGsBase, LStar, SFMask, Star,
 };
 use x86_64::registers::rflags::RFlags;
 
@@ -166,6 +166,13 @@ pub fn set_kernel_stack_top(rsp: u64) {
 
 pub fn set_user_bases(fs_base: u64, _gs_base: u64) {
     FsBase::write(VirtAddr::new(fs_base));
+}
+
+pub fn prepare_usermode_entry(gs_base: u64) {
+    // Exec entered through SYSCALL has already swapped GS, unlike a kernel
+    // fork_execve caller. Normalize both bases before the non-returning IRET.
+    GsBase::write(VirtAddr::new(gs_base));
+    restore_kernel_gs_base();
 }
 
 pub fn restore_kernel_gs_base() {

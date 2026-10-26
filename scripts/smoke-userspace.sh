@@ -12,6 +12,10 @@ if [[ "${KRUST_SMOKE_MMAP_PROBE-0}" != 0 && "${KRUST_SMOKE_MMAP_PROBE-0}" != 1 ]
     echo "KRUST_SMOKE_MMAP_PROBE must be 0 or 1" >&2
     exit 2
 fi
+if [[ "${KRUST_SMOKE_CLOEXEC_PROBE-0}" != 0 && "${KRUST_SMOKE_CLOEXEC_PROBE-0}" != 1 ]]; then
+    echo "KRUST_SMOKE_CLOEXEC_PROBE must be 0 or 1" >&2
+    exit 2
+fi
 if [[ ! "$deadline" =~ ^([1-9]|[1-9][0-9]|1[01][0-9]|120)$ ]]; then
     echo "KRUST_SMOKE_TIMEOUT_SECONDS must be an integer from 1 to 120" >&2
     exit 2
@@ -70,6 +74,9 @@ commands=(
 if [[ "${KRUST_SMOKE_MMAP_PROBE-0}" == 1 ]]; then
     commands+=("/bin/krust-mmap-probe")
 fi
+if [[ "${KRUST_SMOKE_CLOEXEC_PROBE-0}" == 1 ]]; then
+    commands+=("cloexec-test")
+fi
 commands+=(
     "/bin/busybox pwd"
     "/bin/busybox echo KRUST_ECHO_OK"
@@ -106,6 +113,9 @@ check_response() {
     tr -d '\r' < "$work/raw-response" | sed -E $'s/\033\\[[0-9;]*m//g' > "$response"
     ! grep -Eq "$errors" "$response" || return 1
     case "${commands[$1]}" in
+        "cloexec-test") grep -qx 'KRUST_CLOEXEC_BEFORE_OK' "$response" &&
+           grep -qx 'KRUST_CLOEXEC_EXEC_OK' "$response" &&
+           grep -qx 'KRUST_CLOEXEC_FORK_OK' "$response" ;;
         "/bin/krust-mmap-probe "*) grep -qx 'KRUST_MMAP_OK' "$response" &&
            grep -qx 'KRUST_MMAP_KERNEL_OK' "$response" ;;
         "/bin/busybox pwd") grep -qx '/' "$response" ;;

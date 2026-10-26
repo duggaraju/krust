@@ -25,10 +25,20 @@ pub struct Stat {
     pub mode: u32,
 }
 
-pub fn open(path: &str, _flags: usize) -> Result<usize, isize> {
+pub fn open(path: &str, flags: usize) -> Result<usize, isize> {
     let absolute = resolve_absolute_from_current_cwd(path).map_err(errno_from_fs)?;
     let file = vfs::open_path(absolute.as_str()).map_err(errno_from_fs)?;
-    process::open_file(file)
+    let mode = match flags & 3 {
+        0 => vfs::FileOpenMode::ReadOnly,
+        1 => vfs::FileOpenMode::WriteOnly,
+        _ => vfs::FileOpenMode::ReadWrite,
+    };
+    let fd_flags = if flags & process::fd_table::O_CLOEXEC != 0 {
+        process::fd_table::FD_CLOEXEC
+    } else {
+        0
+    };
+    process::open_file(file, fd_flags, mode)
 }
 
 pub fn close(fd: usize) -> Result<(), isize> {
@@ -546,7 +556,7 @@ pub fn execve_with_args(path: &str, argv: Vec<String>, envp: Vec<String>) -> Res
                 )?;
                 log::info!("execve: user stack ready sp=0x{:x}", stack_top);
 
-                process::with_current_task_mut(|task| {
+                let closed = process::with_current_task_mut(|task| {
                     let old_space = core::mem::replace(&mut task.address_space, image_space);
                     task.set_argv(request.argv.clone());
                     task.exec_path = original_path.clone(); // visible name, not resolved symlink
@@ -576,8 +586,11 @@ pub fn execve_with_args(path: &str, argv: Vec<String>, envp: Vec<String>) -> Res
                         brk_start
                     );
                     drop(old_space);
+                    // All fallible loading is complete and the new image is active.
+                    task.close_on_exec()
                 })
                 .ok_or(-1isize)?;
+                drop(closed);
 
                 log::info!(
                     "execve: entering usermode pid={} entry=0x{:x} stack=0x{:x}",

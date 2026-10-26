@@ -299,6 +299,7 @@ pub unsafe fn enter_usermode() -> ! {
             task.context.thread_local_base(true),
             task.context.thread_local_base(false),
         );
+        super::syscall::prepare_usermode_entry(task.context.thread_local_base(false));
         task.activate_address_space();
     });
 

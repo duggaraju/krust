@@ -6,6 +6,10 @@ use alloc::vec::Vec;
 
 use super::console::Console;
 
+#[cfg(debug_assertions)]
+#[path = "cloexec_test.rs"]
+mod cloexec_test;
+
 /// Dispatch a command line to the appropriate handler.
 pub fn dispatch(line: &str, console: &mut Console) -> bool {
     let parts: Vec<&str> = line.trim().splitn(2, ' ').collect();
@@ -31,6 +35,8 @@ pub fn dispatch(line: &str, console: &mut Console) -> bool {
         "lspci" => cmd_lspci(console),
         "lsmod" => cmd_lsmod(console),
         "uptime" => cmd_uptime(console),
+        #[cfg(debug_assertions)]
+        "cloexec-test" => cloexec_test::run(console),
         "shutdown" | "exit" => return false,
         _ => {
             let _ = launch_external_command(line, console);

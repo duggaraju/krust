@@ -1,5 +1,6 @@
 pub mod binfmt;
 pub mod context;
+pub mod fd_table;
 pub mod scheduler;
 pub mod task;
 pub mod waitqueue;
@@ -270,7 +271,11 @@ pub fn set_current_cwd(cwd: Arc<dyn Inode>, cwd_path: String) -> Result<(), isiz
     Ok(())
 }
 
-pub fn open_file(file: OpenFile) -> Result<usize, isize> {
+pub fn open_file(
+    file: OpenFile,
+    flags: usize,
+    mode: crate::fs::vfs::FileOpenMode,
+) -> Result<usize, isize> {
     let pid = current_pid();
     let mut scheduler = SCHEDULER.lock();
     let Some(scheduler) = scheduler.as_mut() else {
@@ -280,7 +285,7 @@ pub fn open_file(file: OpenFile) -> Result<usize, isize> {
         return Err(-1);
     };
 
-    Ok(task.open_fd(file))
+    Ok(task.open_fd(file, flags, mode))
 }
 
 pub fn close_fd(fd: usize) -> Result<(), isize> {
@@ -299,8 +304,11 @@ fn close_fd_for_pid(pid: u64, fd: usize) -> Result<(), isize> {
         };
         task.close_fd(fd).ok_or(-9isize)?
     };
-    let mut file = file;
-    file.close().map_err(errno_from_fs)
+    // Closing one alias must not close the shared open file description.
+    match Arc::try_unwrap(file) {
+        Ok(mut file) => file.file.get_mut().close().map_err(errno_from_fs),
+        Err(_) => Ok(()),
+    }
 }
 
 pub fn close_all_fds(pid: u64) -> Result<(), isize> {
@@ -328,63 +336,11 @@ fn errno_from_fs(err: FsError) -> isize {
 }
 
 pub fn read_fd(fd: usize, buf: &mut [u8]) -> Result<usize, isize> {
-    let pid = current_pid();
-    let file = {
-        let mut scheduler = SCHEDULER.lock();
-        let Some(scheduler) = scheduler.as_mut() else {
-            return Err(-1);
-        };
-        let Some(task) = scheduler.task_by_pid_mut(pid) else {
-            return Err(-1);
-        };
-        match task.take_fd(fd) {
-            Some(file) => file,
-            None => return Err(-9),
-        }
-    };
-
-    let mut file = file;
-    let result = file.read(buf).map_err(errno_from_fs);
-
-    let mut scheduler = SCHEDULER.lock();
-    let Some(scheduler) = scheduler.as_mut() else {
-        return Err(-1);
-    };
-    let Some(task) = scheduler.task_by_pid_mut(pid) else {
-        return Err(-1);
-    };
-    task.put_fd(fd, file);
-    result
+    with_fd(fd, |file| file.read(buf).map_err(errno_from_fs))
 }
 
 pub fn write_fd(fd: usize, buf: &[u8]) -> Result<usize, isize> {
-    let pid = current_pid();
-    let file = {
-        let mut scheduler = SCHEDULER.lock();
-        let Some(scheduler) = scheduler.as_mut() else {
-            return Err(-1);
-        };
-        let Some(task) = scheduler.task_by_pid_mut(pid) else {
-            return Err(-1);
-        };
-        match task.take_fd(fd) {
-            Some(file) => file,
-            None => return Err(-9),
-        }
-    };
-
-    let mut file = file;
-    let result = file.write(buf).map_err(errno_from_fs);
-
-    let mut scheduler = SCHEDULER.lock();
-    let Some(scheduler) = scheduler.as_mut() else {
-        return Err(-1);
-    };
-    let Some(task) = scheduler.task_by_pid_mut(pid) else {
-        return Err(-1);
-    };
-    task.put_fd(fd, file);
-    result
+    with_fd(fd, |file| file.write(buf).map_err(errno_from_fs))
 }
 
 pub fn with_fd<R>(
@@ -392,7 +348,7 @@ pub fn with_fd<R>(
     f: impl FnOnce(&mut OpenFile) -> Result<R, isize>,
 ) -> Result<R, isize> {
     let pid = current_pid();
-    let mut file = {
+    let file = {
         let mut scheduler = SCHEDULER.lock();
         let Some(scheduler) = scheduler.as_mut() else {
             return Err(-1);
@@ -400,23 +356,13 @@ pub fn with_fd<R>(
         let Some(task) = scheduler.task_by_pid_mut(pid) else {
             return Err(-1);
         };
-        match task.take_fd(fd) {
+        match task.fd_file(fd) {
             Some(file) => file,
             None => return Err(-9),
         }
     };
 
-    let result = f(&mut file);
-
-    let mut scheduler = SCHEDULER.lock();
-    let Some(scheduler) = scheduler.as_mut() else {
-        return Err(-1);
-    };
-    let Some(task) = scheduler.task_by_pid_mut(pid) else {
-        return Err(-1);
-    };
-    task.put_fd(fd, file);
-    result
+    f(&mut file.file.lock())
 }
 
 pub fn fd_descriptor(fd: usize) -> Result<FileDescriptor, isize> {
@@ -431,7 +377,15 @@ pub fn fd_descriptor(fd: usize) -> Result<FileDescriptor, isize> {
     task.fd_descriptor(fd).ok_or(-9)
 }
 
-pub fn dup_fd(old_fd: usize, min_fd: usize) -> Result<usize, isize> {
+pub fn fd_flags(fd: usize) -> Result<usize, isize> {
+    with_current_task_mut(|task| task.fd_flags(fd)).ok_or(-1isize)?
+}
+
+pub fn set_fd_flags(fd: usize, flags: usize) -> Result<(), isize> {
+    with_current_task_mut(|task| task.set_fd_flags(fd, flags)).ok_or(-1isize)?
+}
+
+pub fn dup_fd(old_fd: usize, min_fd: usize, cloexec: bool) -> Result<usize, isize> {
     let pid = current_pid();
     let mut scheduler = SCHEDULER.lock();
     let Some(scheduler) = scheduler.as_mut() else {
@@ -440,7 +394,7 @@ pub fn dup_fd(old_fd: usize, min_fd: usize) -> Result<usize, isize> {
     let Some(task) = scheduler.task_by_pid_mut(pid) else {
         return Err(-1);
     };
-    task.dup_fd(old_fd, min_fd)
+    task.dup_fd(old_fd, min_fd, cloexec)
 }
 
 pub fn mark_shell_exited() {

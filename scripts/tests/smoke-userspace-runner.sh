@@ -44,6 +44,9 @@ expected=(
 if [[ "$SMOKE_TEST_CASE" == probe-* ]]; then
     expected+=("/bin/krust-mmap-probe 0x10000001000")
 fi
+if [[ "$SMOKE_TEST_CASE" == cloexec-* ]]; then
+    expected+=("cloexec-test")
+fi
 expected+=(
     "/bin/busybox pwd"
     "/bin/busybox echo KRUST_ECHO_OK"
@@ -79,6 +82,17 @@ for index in "${!expected[@]}"; do
         if (( index == 1 )); then
             [[ "$SMOKE_TEST_CASE" == probe-missing-marker ]] || printf 'KRUST_MMAP_KERNEL_OK\r\n'
             printf 'KRUST_MMAP_OK\r\n'
+            continue
+        fi
+        response_index=$((index - 1))
+    fi
+    if [[ "$SMOKE_TEST_CASE" == cloexec-* && $index -ge 1 ]]; then
+        if (( index == 1 )); then
+            if [[ "$SMOKE_TEST_CASE" != cloexec-echo-only ]]; then
+                [[ "$SMOKE_TEST_CASE" == cloexec-missing-before ]] || printf 'KRUST_CLOEXEC_BEFORE_OK\r\n'
+                [[ "$SMOKE_TEST_CASE" == cloexec-missing-exec ]] || printf 'KRUST_CLOEXEC_EXEC_OK\r\n'
+                [[ "$SMOKE_TEST_CASE" == cloexec-missing-fork ]] || printf 'KRUST_CLOEXEC_FORK_OK\r\n'
+            fi
             continue
         fi
         response_index=$((index - 1))
