@@ -4,6 +4,74 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+use crate::boot_settings::{BootSettings, FstabEntry, parse_fstab, validate_fstab_root};
+
+pub struct DiskMountConfig {
+    pub settings: BootSettings,
+    pub fstab: String,
+    entries: Vec<FstabEntry>,
+}
+
+impl DiskMountConfig {
+    pub fn load(source: &Path, format: &str, custom: Option<&str>) -> io::Result<Self> {
+        let mut settings = BootSettings {
+            root_fs: format.into(),
+            ..Default::default()
+        };
+        let fstab = if let Some(contents) = custom {
+            contents.to_owned()
+        } else {
+            match fs::read_to_string(source.join("etc/fstab")) {
+                Ok(contents) => contents,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => settings.default_fstab(),
+                Err(error) => return Err(error),
+            }
+        };
+        let entries = parse_fstab(&fstab).map_err(io::Error::other)?;
+        if let Some(root) = entries.iter().find(|entry| entry.target == "/") {
+            settings.root_device = root.source.clone();
+        }
+        settings.validate().map_err(io::Error::other)?;
+        validate_fstab_root(&entries, &settings).map_err(io::Error::other)?;
+        let config = Self {
+            settings,
+            fstab,
+            entries,
+        };
+        for directory in config.directories() {
+            let path = source.join(directory.trim_start_matches('/'));
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => {
+                    return Err(io::Error::other(format!(
+                        "mountpoint {} must be a directory, not a file or symlink",
+                        path.display()
+                    )));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(config)
+    }
+
+    fn directories(&self) -> Vec<String> {
+        let mut dirs = vec![String::from("/etc")];
+        for entry in &self.entries {
+            let mut path = String::new();
+            for component in entry.target.split('/').filter(|part| !part.is_empty()) {
+                path.push('/');
+                path.push_str(component);
+                if !dirs.contains(&path) {
+                    dirs.push(path.clone());
+                }
+            }
+        }
+        dirs.sort_by_key(|path| path.matches('/').count());
+        dirs
+    }
+}
+
 const MIB: u64 = 1024 * 1024;
 const VHD_FOOTER_SIZE: u64 = 512;
 // Fixed VHDs store 64-bit byte sizes and end with a 512-byte footer.
@@ -53,6 +121,19 @@ pub fn create_fat_vhd_from_dir(
     size_mib: u64,
     exclude: HashSet<&str>,
 ) -> io::Result<()> {
+    // Validate size before reading configuration or touching the output.
+    checked_vhd_size(size_mib, 4, MAX_FAT_DATA_SIZE, "FAT")?;
+    let config = DiskMountConfig::load(source_dir, "fat", None)?;
+    create_fat_vhd_with_config(source_dir, output, size_mib, exclude, &config)
+}
+
+pub fn create_fat_vhd_with_config(
+    source_dir: &Path,
+    output: &Path,
+    size_mib: u64,
+    exclude: HashSet<&str>,
+    config: &DiskMountConfig,
+) -> io::Result<()> {
     let data_size = checked_vhd_size(size_mib, 4, MAX_FAT_DATA_SIZE, "FAT")?;
 
     if let Some(parent) = output.parent() {
@@ -77,6 +158,12 @@ pub fn create_fat_vhd_from_dir(
         let root = fs.root_dir();
 
         copy_dir_to_fat(source_dir, source_dir, &root, &exclude)?;
+        for path in config.directories() {
+            root.create_dir(path.trim_start_matches('/'))?;
+        }
+        let mut fstab = root.create_file("etc/fstab")?;
+        fstab.truncate()?;
+        fstab.write_all(config.fstab.as_bytes())?;
     }
 
     append_vhd_footer(output, data_size)?;
@@ -129,11 +216,24 @@ fn copy_dir_to_fat<T: fatfs::ReadWriteSeek>(
 ///
 /// Requires `mkfs.ext4` and `debugfs` from e2fsprogs.
 /// Symlinks are preserved; hard links are copied as independent files.
+#[allow(dead_code)]
 pub fn create_ext4_vhd_from_dir(
     source_dir: &Path,
     output: &Path,
     size_mib: u64,
     exclude: HashSet<&str>,
+) -> io::Result<()> {
+    checked_vhd_size(size_mib, 16, MAX_VHD_DATA_SIZE, "ext4")?;
+    let config = DiskMountConfig::load(source_dir, "ext4", None)?;
+    create_ext4_vhd_with_config(source_dir, output, size_mib, exclude, &config)
+}
+
+pub fn create_ext4_vhd_with_config(
+    source_dir: &Path,
+    output: &Path,
+    size_mib: u64,
+    exclude: HashSet<&str>,
+    config: &DiskMountConfig,
 ) -> io::Result<()> {
     let data_size = checked_vhd_size(size_mib, 16, MAX_VHD_DATA_SIZE, "ext4")?;
 
@@ -173,6 +273,21 @@ pub fn create_ext4_vhd_from_dir(
     // debugfs supports: mkdir, write <src> <dst>, symlink <dst> <target>.
     let mut script = String::new();
     collect_debugfs_cmds(source_dir, source_dir, &exclude, &mut script)?;
+    for path in config.directories() {
+        if !source_dir.join(path.trim_start_matches('/')).is_dir()
+            || path
+                .trim_start_matches('/')
+                .split('/')
+                .any(|part| exclude.contains(part))
+        {
+            script.push_str(&format!("mkdir {}\n", debugfs_quote(&path)?));
+        }
+    }
+    let fstab_file = TemporaryFstab::new(&config.fstab)?;
+    script.push_str(&format!(
+        "write {} /etc/fstab\n",
+        debugfs_quote(&fstab_file.0.to_string_lossy())?
+    ));
 
     let status = Command::new("debugfs")
         .args(["-w", "-f", "/dev/stdin"])
@@ -195,6 +310,33 @@ pub fn create_ext4_vhd_from_dir(
             io::ErrorKind::Other,
             format!("debugfs exited with {}", status),
         ));
+    }
+    let result = Command::new("debugfs")
+        .arg("-R")
+        .arg("cat /etc/fstab")
+        .arg(output)
+        .output()?;
+    if !result.status.success() || result.stdout != config.fstab.as_bytes() {
+        return Err(io::Error::other(format!(
+            "failed to populate /etc/fstab: {}",
+            String::from_utf8_lossy(&result.stderr)
+        )));
+    }
+
+    for path in config.directories() {
+        let result = Command::new("debugfs")
+            .arg("-R")
+            .arg(format!("stat {}", debugfs_quote(&path)?))
+            .arg(output)
+            .output()?;
+        if !result.status.success()
+            || !String::from_utf8_lossy(&result.stdout).contains("Type: directory")
+        {
+            return Err(io::Error::other(format!(
+                "failed to create mountpoint {path}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            )));
+        }
     }
 
     // Ensure the file is exactly data_size bytes before appending the footer.
@@ -239,6 +381,9 @@ fn collect_debugfs_cmds(
             .to_string_lossy()
             .into_owned();
         let img_path = format!("/{}", rel.replace('\\', "/"));
+        if img_path == "/etc/fstab" {
+            continue;
+        }
 
         let meta = fs::symlink_metadata(&host_path)?;
 
@@ -246,19 +391,68 @@ fn collect_debugfs_cmds(
             let target = fs::read_link(&host_path)?;
             let target_str = target.to_string_lossy();
             // debugfs: symlink <link_in_image> <target>
-            script.push_str(&format!("symlink {} {}\n", img_path, target_str));
+            script.push_str(&format!(
+                "symlink {} {}\n",
+                debugfs_quote(&img_path)?,
+                debugfs_quote(&target_str)?
+            ));
             eprintln!("  symlink {} → {}", img_path, target_str);
         } else if meta.is_dir() {
-            script.push_str(&format!("mkdir {}\n", img_path));
+            script.push_str(&format!("mkdir {}\n", debugfs_quote(&img_path)?));
             collect_debugfs_cmds(base, &host_path, exclude, script)?;
         } else if meta.is_file() {
             // debugfs write needs an absolute host path.
             let abs = fs::canonicalize(&host_path)?;
-            script.push_str(&format!("write {} {}\n", abs.display(), img_path));
+            script.push_str(&format!(
+                "write {} {}\n",
+                debugfs_quote(&abs.to_string_lossy())?,
+                debugfs_quote(&img_path)?
+            ));
             eprintln!("  wrote {} ({} bytes)", img_path, meta.len());
         }
     }
     Ok(())
+}
+
+fn debugfs_quote(value: &str) -> io::Result<String> {
+    if value.chars().any(|c| c.is_control()) {
+        return Err(io::Error::other(
+            "control characters are unsupported in debugfs paths",
+        ));
+    }
+    Ok(format!(
+        "\"{}\"",
+        value.replace('\\', "\\\\").replace('"', "\\\"")
+    ))
+}
+
+struct TemporaryFstab(std::path::PathBuf);
+
+impl TemporaryFstab {
+    fn new(contents: &str) -> io::Result<Self> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "krust-fstab-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        let temporary = Self(path);
+        file.write_all(contents.as_bytes())?;
+        Ok(temporary)
+    }
+}
+
+impl Drop for TemporaryFstab {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_file(&self.0) {
+            eprintln!("failed to remove {}: {error}", self.0.display());
+        }
+    }
 }
 
 // Keep old name as an alias so any external callers aren't broken.
@@ -520,6 +714,91 @@ mod tests {
                 .unwrap();
             assert_eq!(contents, "disk fixture\n");
             assert!(root.open_file("excluded").is_err());
+            let mut fstab = String::new();
+            root.open_file("etc/fstab")
+                .unwrap()
+                .read_to_string(&mut fstab)
+                .unwrap();
+            let entries = parse_fstab(&fstab).unwrap();
+            assert_eq!(entries[0].filesystem, "fat");
+            assert!(root.open_dir("proc").is_ok());
+            assert!(root.open_dir("dev").is_ok());
+            assert!(!source.join("etc/fstab").exists());
         }
+    }
+
+    #[test]
+    fn custom_fstab_is_preserved_and_can_be_overridden() {
+        let fixture = Fixture::new();
+        let source = fixture.0.join("source");
+        fs::create_dir_all(source.join("etc")).unwrap();
+        let custom = "# custom mounts\n/dev/sda / fat defaults 0 0\nnone /mnt/child ramfs defaults 0 0\nnone /mnt ramfs defaults 0 0\n/dev/sdb /optional fat noauto 0 0\n";
+        fs::write(source.join("etc/fstab"), custom).unwrap();
+        let config = DiskMountConfig::load(&source, "fat", None).unwrap();
+        assert_eq!(config.fstab, custom);
+        let output = fixture.0.join("custom.vhd");
+        create_fat_vhd_with_config(&source, &output, 4, HashSet::new(), &config).unwrap();
+        let fat =
+            fatfs::FileSystem::new(File::open(&output).unwrap(), fatfs::FsOptions::new()).unwrap();
+        let mut contents = String::new();
+        fat.root_dir()
+            .open_file("etc/fstab")
+            .unwrap()
+            .read_to_string(&mut contents)
+            .unwrap();
+        assert_eq!(contents, custom);
+        assert!(fat.root_dir().open_dir("mnt/child").is_ok());
+        let replacement = "/dev/sda / fat defaults 0 0\n";
+        let replacement_config = DiskMountConfig::load(&source, "fat", Some(replacement)).unwrap();
+        let replacement_image = fixture.0.join("override.vhd");
+        create_fat_vhd_with_config(
+            &source,
+            &replacement_image,
+            4,
+            HashSet::new(),
+            &replacement_config,
+        )
+        .unwrap();
+        let replacement_fs = fatfs::FileSystem::new(
+            File::open(replacement_image).unwrap(),
+            fatfs::FsOptions::new(),
+        )
+        .unwrap();
+        let mut replacement_contents = String::new();
+        replacement_fs
+            .root_dir()
+            .open_file("etc/fstab")
+            .unwrap()
+            .read_to_string(&mut replacement_contents)
+            .unwrap();
+        assert_eq!(replacement_contents, replacement);
+        assert_eq!(
+            fs::read_to_string(source.join("etc/fstab")).unwrap(),
+            custom
+        );
+        assert!(DiskMountConfig::load(&source, "ext4", None).is_err());
+    }
+
+    #[test]
+    fn invalid_fstab_does_not_mutate_image() {
+        let fixture = Fixture::new();
+        let source = fixture.0.join("source");
+        fs::create_dir_all(source.join("etc")).unwrap();
+        fs::write(source.join("etc/fstab"), "proc /proc proc ro 0 0\n").unwrap();
+        let output = fixture.0.join("existing.vhd");
+        fs::write(&output, "sentinel").unwrap();
+        assert!(create_fat_vhd_from_dir(&source, &output, 4, HashSet::new()).is_err());
+        assert_eq!(fs::read_to_string(output).unwrap(), "sentinel");
+    }
+
+    #[test]
+    fn generated_mountpoint_cannot_replace_source_file() {
+        let fixture = Fixture::new();
+        fs::write(fixture.0.join("proc"), "do not overwrite").unwrap();
+        assert!(DiskMountConfig::load(&fixture.0, "ext4", None).is_err());
+        assert_eq!(
+            fs::read_to_string(fixture.0.join("proc")).unwrap(),
+            "do not overwrite"
+        );
     }
 }

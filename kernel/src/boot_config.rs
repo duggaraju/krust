@@ -1,29 +1,23 @@
 extern crate alloc;
 
-use core::slice;
+use alloc::format;
+use alloc::string::String;
+use alloc::vec;
 
+#[cfg(feature = "fs")]
+use crate::fs::vfs::FileSystem;
 #[cfg(feature = "arch-x86_64")]
 use bootloader_api::BootInfo;
 #[cfg(feature = "arch-x86_64")]
 use bootloader_api::info::Optional;
 
-#[cfg(feature = "fs")]
-use crate::fs::initrd::InitrdFs;
-#[cfg(feature = "fs")]
-use crate::fs::vfs::FileSystem;
-#[cfg(feature = "arch-x86_64")]
-use x86_64::VirtAddr;
+use crate::boot_settings::{BootSettings, MAX_CONFIG_BYTES};
+pub use crate::boot_settings::{DEFAULT_VIRTUAL_CONSOLES, MAX_VIRTUAL_CONSOLES};
 
 pub struct BootConfig {
+    pub settings: BootSettings,
     pub log_level: log::LevelFilter,
-    pub shell_port: u8,
-    pub shell_console: ShellConsole,
-    pub virtual_consoles: usize,
-    pub syscall_trace: bool,
 }
-
-pub const DEFAULT_VIRTUAL_CONSOLES: usize = 6;
-pub const MAX_VIRTUAL_CONSOLES: usize = 12;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShellConsole {
@@ -32,292 +26,95 @@ pub enum ShellConsole {
     Framebuffer,
 }
 
-impl Default for BootConfig {
-    fn default() -> Self {
-        Self {
-            log_level: log::LevelFilter::Info,
-            shell_port: 1,
-            shell_console: ShellConsole::Auto,
-            virtual_consoles: DEFAULT_VIRTUAL_CONSOLES,
-            syscall_trace: false,
-        }
-    }
-}
-
 impl BootConfig {
     #[cfg(feature = "arch-x86_64")]
     pub fn from_boot_info(boot_info: &BootInfo) -> Self {
-        let mut config = Self::default();
-        config.log_level = read_log_level(boot_info).unwrap_or(config.log_level);
-        config.shell_port = read_shell_port(boot_info).unwrap_or(config.shell_port);
-        config.shell_console = read_shell_console(boot_info).unwrap_or(config.shell_console);
-        config.virtual_consoles =
-            read_virtual_consoles(boot_info).unwrap_or(config.virtual_consoles);
-        config.syscall_trace = read_syscall_trace(boot_info).unwrap_or(config.syscall_trace);
-        config
+        let result =
+            read_ramdisk_file(boot_info, "boot.toml").and_then(|contents| match contents {
+                Some(contents) => BootSettings::parse(&contents),
+                None => Ok(BootSettings::default()),
+            });
+        let settings = result.unwrap_or_else(|error| {
+            crate::logger::init(None, Some(0x3f8), log::LevelFilter::Info);
+            panic!("invalid boot configuration: {error}");
+        });
+        let log_level = settings.log_level.parse().expect("validated log level");
+        Self {
+            settings,
+            log_level,
+        }
     }
 
     pub fn shell_port(&self) -> u8 {
-        self.shell_port
+        self.settings.shell_port
     }
 
     pub fn shell_console(&self) -> ShellConsole {
-        self.shell_console
+        match self.settings.shell_console.as_str() {
+            "serial" => ShellConsole::Serial,
+            "framebuffer" => ShellConsole::Framebuffer,
+            _ => ShellConsole::Auto,
+        }
     }
 
     pub fn virtual_consoles(&self) -> usize {
-        self.virtual_consoles
+        self.settings.virtual_consoles
     }
 
     pub fn syscall_trace(&self) -> bool {
-        self.syscall_trace
+        self.settings.syscall_trace
     }
 }
 
 #[cfg(feature = "arch-x86_64")]
-fn read_syscall_trace(boot_info: &BootInfo) -> Option<bool> {
-    let ramdisk_addr = match boot_info.ramdisk_addr {
-        Optional::Some(addr) if boot_info.ramdisk_len > 0 => addr,
-        _ => return None,
-    };
-
-    let len = boot_info.ramdisk_len as usize;
-    let ptr = VirtAddr::new(ramdisk_addr).as_ptr();
-    let ramdisk = unsafe {
-        // SAFETY: the bootloader already maps the ramdisk into virtual memory and
-        // exposes the mapped address in BootInfo::ramdisk_addr.
-        slice::from_raw_parts(ptr, len)
-    };
-
-    let fs = InitrdFs::new(ramdisk).ok()?;
-    let root = fs.root_inode();
-    let config = root.lookup("boot.toml").ok()?;
-
-    let mut buf = [0u8; 256];
-    let read = config.read(0, &mut buf).ok()?;
-    let contents = core::str::from_utf8(&buf[..read]).ok()?;
-    parse_syscall_trace(contents)
-}
-
-#[cfg(feature = "arch-x86_64")]
-fn read_log_level(boot_info: &BootInfo) -> Option<log::LevelFilter> {
-    let ramdisk_addr = match boot_info.ramdisk_addr {
-        Optional::Some(addr) if boot_info.ramdisk_len > 0 => addr,
-        _ => return None,
-    };
-
-    let len = boot_info.ramdisk_len as usize;
-    let ptr = VirtAddr::new(ramdisk_addr).as_ptr();
-    let ramdisk = unsafe {
-        // SAFETY: the bootloader already maps the ramdisk into virtual memory and
-        // exposes the mapped address in BootInfo::ramdisk_addr.
-        slice::from_raw_parts(ptr, len)
-    };
-
-    let fs = InitrdFs::new(ramdisk).ok()?;
-    let root = fs.root_inode();
-    let config = root.lookup("boot.toml").ok()?;
-
-    let mut buf = [0u8; 256];
-    let read = config.read(0, &mut buf).ok()?;
-    let contents = core::str::from_utf8(&buf[..read]).ok()?;
-    parse_log_level(contents)
-}
-
-#[cfg(feature = "arch-x86_64")]
-fn read_shell_port(boot_info: &BootInfo) -> Option<u8> {
-    let ramdisk_addr = match boot_info.ramdisk_addr {
-        Optional::Some(addr) if boot_info.ramdisk_len > 0 => addr,
-        _ => return None,
-    };
-
-    let len = boot_info.ramdisk_len as usize;
-    let ptr = VirtAddr::new(ramdisk_addr).as_ptr();
-    let ramdisk = unsafe {
-        // SAFETY: the bootloader already maps the ramdisk into virtual memory and
-        // exposes the mapped address in BootInfo::ramdisk_addr.
-        slice::from_raw_parts(ptr, len)
-    };
-
-    let fs = InitrdFs::new(ramdisk).ok()?;
-    let root = fs.root_inode();
-    let config = root.lookup("boot.toml").ok()?;
-
-    let mut buf = [0u8; 256];
-    let read = config.read(0, &mut buf).ok()?;
-    let contents = core::str::from_utf8(&buf[..read]).ok()?;
-    parse_shell_port(contents)
-}
-
-#[cfg(feature = "arch-x86_64")]
-fn read_shell_console(boot_info: &BootInfo) -> Option<ShellConsole> {
-    let ramdisk_addr = match boot_info.ramdisk_addr {
-        Optional::Some(addr) if boot_info.ramdisk_len > 0 => addr,
-        _ => return None,
-    };
-
-    let len = boot_info.ramdisk_len as usize;
-    let ptr = VirtAddr::new(ramdisk_addr).as_ptr();
-    let ramdisk = unsafe {
-        // SAFETY: the bootloader already maps the ramdisk into virtual memory and
-        // exposes the mapped address in BootInfo::ramdisk_addr.
-        slice::from_raw_parts(ptr, len)
-    };
-
-    let fs = InitrdFs::new(ramdisk).ok()?;
-    let root = fs.root_inode();
-    let config = root.lookup("boot.toml").ok()?;
-
-    let mut buf = [0u8; 256];
-    let read = config.read(0, &mut buf).ok()?;
-    let contents = core::str::from_utf8(&buf[..read]).ok()?;
-    parse_shell_console(contents)
-}
-
-fn read_virtual_consoles(boot_info: &BootInfo) -> Option<usize> {
-    #[cfg(feature = "arch-x86_64")]
+pub fn read_ramdisk_file(boot_info: &BootInfo, name: &str) -> Result<Option<String>, String> {
+    #[cfg(feature = "fs")]
     {
-        let ramdisk_addr = match boot_info.ramdisk_addr {
-            Optional::Some(addr) if boot_info.ramdisk_len > 0 => addr,
-            _ => return None,
+        let address = match boot_info.ramdisk_addr {
+            Optional::Some(address) if boot_info.ramdisk_len > 0 => address,
+            _ => return Ok(None),
         };
-
-        let len = boot_info.ramdisk_len as usize;
-        let ptr = VirtAddr::new(ramdisk_addr).as_ptr();
+        // BootInfo provides a mapped ramdisk that lives for the entire boot.
         let ramdisk = unsafe {
-            // SAFETY: the bootloader already maps the ramdisk into virtual memory and
-            // exposes the mapped address in BootInfo::ramdisk_addr.
-            slice::from_raw_parts(ptr, len)
+            core::slice::from_raw_parts(address as *const u8, boot_info.ramdisk_len as usize)
         };
-
-        let fs = InitrdFs::new(ramdisk).ok()?;
-        let root = fs.root_inode();
-        let config = root.lookup("boot.toml").ok()?;
-
-        let mut buf = [0u8; 256];
-        let read = config.read(0, &mut buf).ok()?;
-        let contents = core::str::from_utf8(&buf[..read]).ok()?;
-        parse_virtual_consoles(contents)
+        let fs = crate::fs::initrd::InitrdFs::new(ramdisk)
+            .map_err(|e| format!("invalid boot ramdisk: {e:?}"))?;
+        let mut inode = fs.root_inode();
+        for component in name.split('/') {
+            inode = match inode.lookup(component) {
+                Ok(inode) => inode,
+                Err(crate::fs::vfs::FsError::NotFound) => return Ok(None),
+                Err(e) => return Err(format!("cannot read ramdisk {name}: {e:?}")),
+            };
+        }
+        read_config_inode(inode.as_ref()).map(Some)
     }
-
-    #[cfg(not(feature = "arch-x86_64"))]
-    None
+    #[cfg(not(feature = "fs"))]
+    {
+        let _ = (boot_info, name);
+        Ok(None)
+    }
 }
 
-fn parse_log_level(contents: &str) -> Option<log::LevelFilter> {
-    for line in contents.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        let (key, value) = line.split_once('=')?;
-        if key.trim() != "log_level" {
-            continue;
-        }
-
-        let value = value.trim().trim_matches('"');
-        return match value {
-            "off" => Some(log::LevelFilter::Off),
-            "error" => Some(log::LevelFilter::Error),
-            "warn" | "warning" => Some(log::LevelFilter::Warn),
-            "info" => Some(log::LevelFilter::Info),
-            "debug" => Some(log::LevelFilter::Debug),
-            "trace" => Some(log::LevelFilter::Trace),
-            _ => None,
-        };
+#[cfg(feature = "fs")]
+pub fn read_config_inode(inode: &dyn crate::fs::vfs::Inode) -> Result<String, String> {
+    if inode.file_type() != crate::fs::vfs::FileType::Regular || inode.size() > MAX_CONFIG_BYTES {
+        return Err("configuration must be a regular file of at most 16 KiB".into());
     }
-
-    None
-}
-
-fn parse_shell_port(contents: &str) -> Option<u8> {
-    for line in contents.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
+    let mut bytes = vec![0; MAX_CONFIG_BYTES + 1];
+    let mut length = 0;
+    loop {
+        let count = inode
+            .read(length, &mut bytes[length..])
+            .map_err(|e| format!("configuration read failed: {e:?}"))?;
+        length += count;
+        if length > MAX_CONFIG_BYTES {
+            return Err("configuration exceeds 16 KiB".into());
         }
-
-        let (key, value) = line.split_once('=')?;
-        if key.trim() != "shell_port" {
-            continue;
+        if count == 0 {
+            bytes.truncate(length);
+            return String::from_utf8(bytes).map_err(|_| "configuration is not UTF-8".into());
         }
-
-        let value = value.trim().trim_matches('"');
-        return value
-            .parse::<u8>()
-            .ok()
-            .filter(|port| *port >= 1 && *port <= 2);
     }
-
-    None
-}
-
-fn parse_shell_console(contents: &str) -> Option<ShellConsole> {
-    for line in contents.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        let (key, value) = line.split_once('=')?;
-        if key.trim() != "shell_console" {
-            continue;
-        }
-
-        let value = value.trim().trim_matches('"');
-        return match value {
-            "auto" => Some(ShellConsole::Auto),
-            "serial" => Some(ShellConsole::Serial),
-            "framebuffer" => Some(ShellConsole::Framebuffer),
-            _ => None,
-        };
-    }
-
-    None
-}
-
-fn parse_syscall_trace(contents: &str) -> Option<bool> {
-    for line in contents.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        let (key, value) = line.split_once('=')?;
-        if key.trim() != "syscall_trace" {
-            continue;
-        }
-
-        let value = value.trim().trim_matches('"').to_ascii_lowercase();
-        return match value.as_str() {
-            "1" | "true" | "yes" | "on" => Some(true),
-            "0" | "false" | "no" | "off" => Some(false),
-            _ => None,
-        };
-    }
-
-    None
-}
-
-fn parse_virtual_consoles(contents: &str) -> Option<usize> {
-    for line in contents.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        let (key, value) = line.split_once('=')?;
-        if key.trim() != "virtual_consoles" {
-            continue;
-        }
-
-        let value = value.trim().trim_matches('"');
-        return value
-            .parse::<usize>()
-            .ok()
-            .map(|count| count.clamp(1, MAX_VIRTUAL_CONSOLES));
-    }
-
-    None
 }

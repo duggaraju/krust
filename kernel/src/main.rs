@@ -7,6 +7,8 @@ extern crate alloc;
 pub mod arch;
 
 pub mod boot_config;
+#[path = "../../boot_settings.rs"]
+pub mod boot_settings;
 
 #[cfg(feature = "drivers")]
 pub mod drivers;
@@ -137,21 +139,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     #[cfg(feature = "fs")]
     {
-        let _ = crate::fs::register_mount("/", "ramfs", crate::fs::MountDevice::None);
-        // Keep ramfs as bootstrap root, then overlay FAT as the runtime root.
-        #[cfg(feature = "drivers")]
-        let _ = crate::fs::register_mount(
-            "/",
-            "ext4",
-            crate::fs::MountDevice::device_path("/dev/sda"),
-        );
-
-        let _ = crate::fs::register_mount("/proc", "proc", crate::fs::MountDevice::None);
-        #[cfg(feature = "drivers")]
-        let _ = crate::fs::register_mount("/dev", "dev", crate::fs::MountDevice::None);
-
-        if let Err(err) = fs::mount_registered_filesystems() {
-            log::error!("failed to mount registered filesystems: {:?}", err);
+        if let Err(error) = fs::boot::mount_filesystems(&boot_config.settings, boot_info) {
+            panic!("boot mounts failed: {error}");
         }
     }
 

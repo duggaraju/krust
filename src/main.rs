@@ -5,7 +5,10 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
+#[path = "../boot_settings.rs"]
+mod boot_settings;
 mod disk;
+use boot_settings::BootSettings;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 enum BootMode {
@@ -39,11 +42,15 @@ struct RunArgs {
     #[arg(long)]
     pty: bool,
 
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", conflicts_with = "no_vhd")]
     vhd: Option<PathBuf>,
 
     #[arg(long = "no-vhd")]
     no_vhd: bool,
+
+    /// Boot TOML settings; overrides the VHD's automatic .boot.toml sidecar.
+    #[arg(long, value_name = "PATH")]
+    boot_config: Option<PathBuf>,
 
     /// Extra raw arguments passed directly to qemu-system-x86_64.
     /// Usage: krust run <mode> [options] -- <qemu args...>
@@ -84,6 +91,10 @@ struct MkdiskArgs {
     /// Filesystem format to use
     #[arg(long, value_enum, default_value = "fat")]
     format: DiskFormat,
+
+    /// Use this fstab instead of DIR/etc/fstab or generated defaults.
+    #[arg(long, value_name = "PATH")]
+    fstab: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -119,6 +130,27 @@ fn cmd_mkdisk(args: MkdiskArgs) {
         DiskFormat::Fat => "FAT",
         DiskFormat::Ext4 => "ext4",
     };
+    let custom_fstab = args
+        .fstab
+        .as_ref()
+        .map(fs::read_to_string)
+        .transpose()
+        .unwrap_or_else(|e| {
+            eprintln!("error: cannot read fstab: {e}");
+            std::process::exit(1);
+        });
+    let config = disk::DiskMountConfig::load(
+        &args.source_dir,
+        match args.format {
+            DiskFormat::Fat => "fat",
+            DiskFormat::Ext4 => "ext4",
+        },
+        custom_fstab.as_deref(),
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("error: invalid mount configuration: {e}");
+        std::process::exit(1);
+    });
     eprintln!(
         "creating {}MiB {} VHD from '{}' → '{}' (exclude: {:?})",
         args.size_mib,
@@ -128,23 +160,38 @@ fn cmd_mkdisk(args: MkdiskArgs) {
         exclude_dirs
     );
     let result = match args.format {
-        DiskFormat::Fat => disk::create_fat_vhd_from_dir(
+        DiskFormat::Fat => disk::create_fat_vhd_with_config(
             &args.source_dir,
             &args.output,
             args.size_mib,
             exclude_dirs,
+            &config,
         ),
-        DiskFormat::Ext4 => disk::create_ext4_vhd_from_dir(
+        DiskFormat::Ext4 => disk::create_ext4_vhd_with_config(
             &args.source_dir,
             &args.output,
             args.size_mib,
             exclude_dirs,
+            &config,
         ),
     };
     result.unwrap_or_else(|err| {
         eprintln!("error: {}", err);
         std::process::exit(1);
     });
+    let sidecar = boot_sidecar_path(&args.output);
+    fs::write(
+        &sidecar,
+        format!(
+            "root_fs = \"{}\"\nroot_device = \"{}\"\n",
+            config.settings.root_fs, config.settings.root_device
+        ),
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("error: cannot write {}: {e}", sidecar.display());
+        std::process::exit(1);
+    });
+    eprintln!("boot configuration: {}", sidecar.display());
     eprintln!("done: {}", args.output.display());
 }
 
@@ -152,10 +199,6 @@ fn cmd_run(cli: RunArgs) -> Result<(), String> {
     // read env variables that were set in build script
     let kernel_path = env!("KERNEL_PATH");
     let kernel_bios_path = env!("KERNEL_BIOS_PATH");
-    let boot_log_level = env!("KRUST_BOOT_LOG_LEVEL");
-    let boot_syscall_trace = env!("KRUST_BOOT_SYSCALL_TRACE");
-    let uefi_path = env!("UEFI_PATH");
-    let bios_path = env!("BIOS_PATH");
 
     let mode_uefi = matches!(cli.mode, BootMode::Uefi);
     let uefi = mode_uefi;
@@ -163,7 +206,7 @@ fn cmd_run(cli: RunArgs) -> Result<(), String> {
 
     let sata_vhd = if cli.no_vhd {
         None
-    } else if let Some(path) = cli.vhd {
+    } else if let Some(path) = cli.vhd.clone() {
         if !path.exists() {
             eprintln!("error: VHD not found: {}", path.display());
             eprintln!(
@@ -176,6 +219,11 @@ fn cmd_run(cli: RunArgs) -> Result<(), String> {
     } else {
         None
     };
+    let mut settings = load_boot_settings(&cli, sata_vhd.as_deref())?;
+    if let Some(port) = shell_port {
+        settings.shell_port = port;
+        settings.shell_console = "serial".into();
+    }
     let mut cmd = Command::new("qemu-system-x86_64");
     if cli.headless {
         let trace_path = env::temp_dir().join(format!("krust-trace-{}.log", std::process::id()));
@@ -212,20 +260,21 @@ fn cmd_run(cli: RunArgs) -> Result<(), String> {
         eprintln!("attached SATA VHD: {}", path.display());
     }
 
+    let boot_image = build_boot_image(
+        if uefi { kernel_path } else { kernel_bios_path },
+        &settings,
+        uefi,
+    )?;
+    cmd.arg("-drive").arg(format!(
+        "format=raw,file={}",
+        boot_image.directory.join("boot.img").display()
+    ));
     if uefi {
         let prebuilt =
             Prebuilt::fetch(Source::LATEST, "target/ovmf").expect("failed to update prebuilt");
 
         let code = prebuilt.get_file(Arch::X64, FileType::Code);
         let vars = prebuilt.get_file(Arch::X64, FileType::Vars);
-        let image_path = if let Some(shell_port) = shell_port {
-            build_headless_uefi_image(kernel_path, boot_log_level, shell_port, boot_syscall_trace)
-        } else {
-            PathBuf::from(uefi_path)
-        };
-
-        cmd.arg("-drive")
-            .arg(format!("format=raw,file={}", image_path.display()));
         cmd.arg("-drive").arg(format!(
             "if=pflash,format=raw,unit=0,file={},readonly=on",
             code.display()
@@ -235,19 +284,6 @@ fn cmd_run(cli: RunArgs) -> Result<(), String> {
             "if=pflash,format=raw,unit=1,file={},snapshot=on",
             vars.display()
         ));
-    } else {
-        let image_path = if let Some(shell_port) = shell_port {
-            build_headless_bios_image(
-                kernel_bios_path,
-                boot_log_level,
-                shell_port,
-                boot_syscall_trace,
-            )
-        } else {
-            PathBuf::from(bios_path)
-        };
-        cmd.arg("-drive")
-            .arg(format!("format=raw,file={}", image_path.display()));
     }
 
     if !cli.qemu_args.is_empty() {
@@ -256,6 +292,47 @@ fn cmd_run(cli: RunArgs) -> Result<(), String> {
     }
 
     run_qemu(&mut cmd)
+}
+
+fn boot_sidecar_path(image: &std::path::Path) -> PathBuf {
+    let mut name = image.as_os_str().to_owned();
+    name.push(".boot.toml");
+    PathBuf::from(name)
+}
+
+fn load_boot_settings(
+    cli: &RunArgs,
+    disk: Option<&std::path::Path>,
+) -> Result<BootSettings, String> {
+    let defaults = BootSettings::parse(include_str!(env!("BOOT_CONFIG_PATH")))?;
+    let path = cli
+        .boot_config
+        .clone()
+        .or_else(|| disk.map(boot_sidecar_path));
+    if let Some(path) = path {
+        match fs::read_to_string(&path) {
+            Ok(contents) => {
+                return BootSettings::parse_with_defaults(&contents, defaults)
+                    .map_err(|e| format!("{}: {e}", path.display()));
+            }
+            Err(e) if cli.boot_config.is_none() && e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!(
+                    "no boot sidecar at {}; using legacy ext4 root defaults",
+                    path.display()
+                );
+            }
+            Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+        }
+    }
+    if disk.is_none() {
+        Ok(BootSettings {
+            root_fs: "ramfs".into(),
+            root_device: "none".into(),
+            ..defaults
+        })
+    } else {
+        Ok(defaults)
+    }
 }
 
 fn run_qemu(cmd: &mut Command) -> Result<(), String> {
@@ -280,61 +357,57 @@ fn check_qemu_exit(code: Option<i32>) -> Result<(), String> {
     }
 }
 
-fn build_headless_uefi_image(
-    kernel_path: &str,
-    boot_log_level: &str,
-    shell_port: u8,
-    boot_syscall_trace: &str,
-) -> PathBuf {
-    let temp_dir = env::temp_dir();
-    let pid = std::process::id();
-    let ramdisk_path = temp_dir.join(format!("krust-headless-{pid}.ramdisk"));
-    let image_path = temp_dir.join(format!("krust-headless-{pid}.img"));
-
-    fs::write(
-        &ramdisk_path,
-        headless_boot_ramdisk(boot_log_level, shell_port, boot_syscall_trace),
-    )
-    .expect("failed to create headless ramdisk");
-
-    bootloader::UefiBoot::new(PathBuf::from(kernel_path).as_path())
-        .set_ramdisk(&ramdisk_path)
-        .create_disk_image(&image_path)
-        .expect("failed to create headless uefi image");
-
-    image_path
+struct TemporaryBootImage {
+    directory: PathBuf,
 }
 
-fn build_headless_bios_image(
-    kernel_path: &str,
-    boot_log_level: &str,
-    shell_port: u8,
-    boot_syscall_trace: &str,
-) -> PathBuf {
-    let temp_dir = env::temp_dir();
-    let pid = std::process::id();
-    let ramdisk_path = temp_dir.join(format!("krust-headless-{pid}.ramdisk"));
-    let image_path = temp_dir.join(format!("krust-headless-{pid}.bios.img"));
-
-    fs::write(
-        &ramdisk_path,
-        headless_boot_ramdisk(boot_log_level, shell_port, boot_syscall_trace),
-    )
-    .expect("failed to create headless ramdisk");
-
-    bootloader::BiosBoot::new(PathBuf::from(kernel_path).as_path())
-        .set_ramdisk(&ramdisk_path)
-        .create_disk_image(&image_path)
-        .expect("failed to create headless bios image");
-
-    image_path
+impl Drop for TemporaryBootImage {
+    fn drop(&mut self) {
+        for name in ["boot.img", "boot.ramdisk"] {
+            let path = self.directory.join(name);
+            if let Err(error) = fs::remove_file(&path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!("cannot remove {}: {error}", path.display());
+                }
+            }
+        }
+        if let Err(error) = fs::remove_dir(&self.directory) {
+            eprintln!("cannot remove {}: {error}", self.directory.display());
+        }
+    }
 }
 
-fn headless_boot_ramdisk(log_level: &str, shell_port: u8, syscall_trace: &str) -> Vec<u8> {
-    let boot_toml = format!(
-        "log_level = \"{log_level}\"\nshell_port = {shell_port}\nshell_console = \"serial\"\nsyscall_trace = {syscall_trace}\n"
-    );
-    make_cpio_newc(&[("boot.toml", boot_toml.as_bytes())])
+fn build_boot_image(
+    kernel_path: &str,
+    settings: &BootSettings,
+    uefi: bool,
+) -> Result<TemporaryBootImage, String> {
+    let directory = env::temp_dir().join(format!("krust-boot-{}", std::process::id()));
+    fs::create_dir(&directory)
+        .map_err(|e| format!("cannot create {}: {e}", directory.display()))?;
+    let image = TemporaryBootImage { directory };
+    let ramdisk = image.directory.join("boot.ramdisk");
+    let output = image.directory.join("boot.img");
+    fs::write(&ramdisk, boot_ramdisk(settings))
+        .map_err(|e| format!("cannot write boot ramdisk: {e}"))?;
+    let result = if uefi {
+        bootloader::UefiBoot::new(std::path::Path::new(kernel_path))
+            .set_ramdisk(&ramdisk)
+            .create_disk_image(&output)
+    } else {
+        bootloader::BiosBoot::new(std::path::Path::new(kernel_path))
+            .set_ramdisk(&ramdisk)
+            .create_disk_image(&output)
+    };
+    result.map_err(|e| format!("cannot create boot image: {e}"))?;
+    Ok(image)
+}
+
+fn boot_ramdisk(settings: &BootSettings) -> Vec<u8> {
+    make_cpio_newc(&[
+        ("boot.toml", settings.to_toml().as_bytes()),
+        ("etc/fstab", settings.default_fstab().as_bytes()),
+    ])
 }
 
 fn serial_shell_port(cli: &RunArgs) -> Option<u8> {
@@ -450,7 +523,14 @@ mod tests {
     }
 
     fn assert_boot_ramdisk(port: u8, trace: &str) {
-        let ramdisk = headless_boot_ramdisk("debug", port, trace);
+        let settings = BootSettings {
+            log_level: "debug".into(),
+            shell_port: port,
+            shell_console: "serial".into(),
+            syscall_trace: trace == "true",
+            ..Default::default()
+        };
+        let ramdisk = boot_ramdisk(&settings);
         assert_eq!(&ramdisk[..6], b"070701");
         let hex = |range: std::ops::Range<usize>| {
             usize::from_str_radix(std::str::from_utf8(&ramdisk[range]).unwrap(), 16).unwrap()
@@ -460,18 +540,100 @@ mod tests {
         assert_eq!(&ramdisk[110..110 + name_len], b"boot.toml\0");
         let data_start = (110 + name_len + 3) & !3;
         let config = std::str::from_utf8(&ramdisk[data_start..data_start + data_len]).unwrap();
+        assert_eq!(BootSettings::parse(config).unwrap(), settings);
+        let fstab_start = (data_start + data_len + 3) & !3;
+        let fstab_name_len = hex(fstab_start + 94..fstab_start + 102);
+        let fstab_len = hex(fstab_start + 54..fstab_start + 62);
         assert_eq!(
-            config,
-            format!(
-                "log_level = \"debug\"\nshell_port = {port}\nshell_console = \"serial\"\nsyscall_trace = {trace}\n"
-            )
+            &ramdisk[fstab_start + 110..fstab_start + 110 + fstab_name_len],
+            b"etc/fstab\0"
         );
-        let trailer_start = (data_start + data_len + 3) & !3;
+        let fstab_data = (fstab_start + 110 + fstab_name_len + 3) & !3;
+        assert_eq!(
+            &ramdisk[fstab_data..fstab_data + fstab_len],
+            settings.default_fstab().as_bytes()
+        );
+        let trailer_start = (fstab_data + fstab_len + 3) & !3;
         assert_eq!(&ramdisk[trailer_start..trailer_start + 6], b"070701");
         assert_eq!(
             &ramdisk[trailer_start + 110..trailer_start + 121],
             b"TRAILER!!!\0"
         );
+    }
+
+    #[test]
+    fn root_settings_survive_all_console_modes_and_firmware() {
+        for mode in ["bios", "uefi"] {
+            for options in [vec![], vec!["--headless"], vec!["--pty"]] {
+                let cli = Cli::parse_from(["krust", "run", mode].into_iter().chain(options));
+                let Commands::Run(args) = cli.command else {
+                    unreachable!()
+                };
+                let mut settings =
+                    BootSettings::parse("root_fs = \"fat\"\nroot_device = \"/dev/sdb\"").unwrap();
+                if let Some(port) = serial_shell_port(&args) {
+                    settings.shell_port = port;
+                    settings.shell_console = "serial".into();
+                }
+                let ramdisk = boot_ramdisk(&settings);
+                assert!(
+                    ramdisk
+                        .windows(b"root_fs = \"fat\"".len())
+                        .any(|window| window == b"root_fs = \"fat\"")
+                );
+                assert!(
+                    ramdisk
+                        .windows(b"/dev/sdb / fat".len())
+                        .any(|window| window == b"/dev/sdb / fat")
+                );
+            }
+        }
+        let cli = Cli::parse_from(["krust", "run", "bios", "--no-vhd"]);
+        let Commands::Run(args) = cli.command else {
+            unreachable!()
+        };
+        let settings = load_boot_settings(&args, None).unwrap();
+        assert_eq!(settings.root_fs, "ramfs");
+        assert_eq!(settings.root_device, "none");
+    }
+
+    #[test]
+    fn boot_sidecar_selection_and_explicit_override() {
+        let directory = env::temp_dir().join(format!("krust-settings-test-{}", std::process::id()));
+        fs::create_dir(&directory).unwrap();
+        let disk = directory.join("test.vhd");
+        let sidecar = boot_sidecar_path(&disk);
+        let custom = directory.join("custom.toml");
+        fs::write(&sidecar, "root_fs = \"fat\"\n").unwrap();
+        fs::write(&custom, "root_fs = \"ramfs\"\nroot_device = \"none\"\n").unwrap();
+        let cli = Cli::parse_from(["krust", "run", "bios"]);
+        let Commands::Run(args) = cli.command else {
+            unreachable!()
+        };
+        assert_eq!(
+            load_boot_settings(&args, Some(&disk)).unwrap().root_fs,
+            "fat"
+        );
+        let cli = Cli::parse_from([
+            "krust",
+            "run",
+            "bios",
+            "--boot-config",
+            custom.to_str().unwrap(),
+        ]);
+        let Commands::Run(args) = cli.command else {
+            unreachable!()
+        };
+        assert_eq!(
+            load_boot_settings(&args, Some(&disk)).unwrap().root_fs,
+            "ramfs"
+        );
+        fs::write(&custom, "root_fs = \"bad\"\n").unwrap();
+        assert!(load_boot_settings(&args, Some(&disk)).is_err());
+        fs::remove_file(&custom).unwrap();
+        assert!(load_boot_settings(&args, Some(&disk)).is_err());
+        fs::remove_file(&sidecar).unwrap();
+        fs::remove_dir(directory).unwrap();
     }
 
     #[test]

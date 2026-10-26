@@ -1,5 +1,7 @@
 extern crate alloc;
 
+#[cfg(feature = "arch-x86_64")]
+pub mod boot;
 #[cfg(feature = "drivers")]
 pub mod devfs;
 #[cfg(feature = "fs-ext4")]
@@ -51,6 +53,7 @@ pub fn init() {
     #[cfg(feature = "drivers")]
     {
         let _ = register_filesystem_factory("fatfs", Arc::new(fat::FatFsFactory));
+        let _ = register_filesystem_factory("fat", Arc::new(fat::FatFsFactory));
         log::info!("registered fatfs filesystem factory");
     }
 
@@ -299,6 +302,29 @@ pub fn register_mount_with_options(
         device,
         options: MountOptions::default().with_pairs(&option_pairs),
     });
+    Ok(())
+}
+
+pub fn mount_required(path: &str, name: &str, device: MountDevice) -> Result<(), FsError> {
+    if path != "/" {
+        ensure_directory_path(path)?;
+    }
+    let fs: Arc<dyn FileSystem> = if name == "ramfs" {
+        Arc::new(RamFs::new())
+    } else if matches!(device, MountDevice::None) {
+        filesystem(name)?
+    } else {
+        let mountpoint = self::vfs::lookup_path(path)?;
+        let block = resolve_mount_block_device(&device)?;
+        filesystem_from_factory(name, mountpoint, block, &MountOptions::default())?
+    };
+    if path == "/" {
+        self::vfs::mount_root(fs)?;
+    } else {
+        self::vfs::mount(path, fs)?;
+    }
+    track_active_mount(name);
+    log::info!("mount: mounted filesystem '{}' on '{}'", name, path);
     Ok(())
 }
 

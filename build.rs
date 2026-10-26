@@ -3,7 +3,12 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::vec::Vec;
 
+#[path = "boot_settings.rs"]
+#[allow(dead_code)]
+mod boot_settings;
+
 fn main() {
+    println!("cargo:rerun-if-changed=boot_settings.rs");
     println!("cargo:rerun-if-env-changed=KRUST_BOOT_LOG_LEVEL");
     println!("cargo:rerun-if-env-changed=KRUST_BOOT_SHELL_CONSOLE");
     println!("cargo:rerun-if-env-changed=KRUST_BOOT_SYSCALL_TRACE");
@@ -22,8 +27,24 @@ fn main() {
         "log_level = \"{}\"\nshell_port = 1\nshell_console = \"{}\"\nsyscall_trace = {}\n",
         boot_log_level, boot_shell_console, boot_syscall_trace
     );
+    let settings =
+        boot_settings::BootSettings::parse(&boot_toml).expect("invalid build-time boot settings");
+    let boot_toml = settings.to_toml();
+    let boot_config_path = out_dir.join("boot.toml");
+    fs::write(&boot_config_path, &boot_toml).expect("failed to write boot configuration");
+    println!(
+        "cargo:rustc-env=BOOT_CONFIG_PATH={}",
+        boot_config_path.display()
+    );
     let ramdisk_path = out_dir.join("boot.ramdisk");
-    write_boot_ramdisk(&ramdisk_path, &boot_toml);
+    fs::write(
+        &ramdisk_path,
+        make_cpio_newc(&[
+            ("boot.toml", boot_toml.as_bytes()),
+            ("etc/fstab", settings.default_fstab().as_bytes()),
+        ]),
+    )
+    .expect("failed to create boot ramdisk");
 
     // create an UEFI disk image (optional)
     let uefi_path = out_dir.join("uefi.img");
@@ -51,7 +72,10 @@ fn main() {
         kernel_for_bios.display()
     );
     println!("cargo:rustc-env=KRUST_BOOT_LOG_LEVEL={}", boot_log_level);
-    println!("cargo:rustc-env=KRUST_BOOT_SYSCALL_TRACE={}", boot_syscall_trace);
+    println!(
+        "cargo:rustc-env=KRUST_BOOT_SYSCALL_TRACE={}",
+        boot_syscall_trace
+    );
     println!("cargo:rustc-env=UEFI_PATH={}", uefi_path.display());
     println!("cargo:rustc-env=BIOS_PATH={}", bios_path.display());
 }
@@ -60,20 +84,26 @@ fn strip_kernel_for_bios(kernel: &PathBuf, out_dir: &PathBuf) -> PathBuf {
     let stripped = out_dir.join("kernel-bios-stripped");
     // Try llvm-objcopy first (available via llvm-tools-preview rustup component),
     // fall back to system strip if not found.
-    let stripped_ok = try_llvm_objcopy(kernel, &stripped)
-        || try_system_strip(kernel, &stripped);
+    let stripped_ok = try_llvm_objcopy(kernel, &stripped) || try_system_strip(kernel, &stripped);
     if stripped_ok {
         stripped
     } else {
         // Strip failed — use the original (slow but functional).
-        eprintln!("cargo:warning=Could not strip kernel debug info for BIOS image; BIOS boot will be slow");
+        eprintln!(
+            "cargo:warning=Could not strip kernel debug info for BIOS image; BIOS boot will be slow"
+        );
         kernel.clone()
     }
 }
 
 fn try_llvm_objcopy(src: &PathBuf, dst: &PathBuf) -> bool {
     // Find llvm-objcopy via llvm-tools or on PATH.
-    let candidates = ["llvm-objcopy", "llvm-objcopy-18", "llvm-objcopy-17", "llvm-objcopy-16"];
+    let candidates = [
+        "llvm-objcopy",
+        "llvm-objcopy-18",
+        "llvm-objcopy-17",
+        "llvm-objcopy-16",
+    ];
     for tool in &candidates {
         let status = Command::new(tool)
             .args(["--strip-debug", "--strip-unneeded"])
@@ -100,11 +130,6 @@ fn try_system_strip(src: &PathBuf, dst: &PathBuf) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
-}
-
-fn write_boot_ramdisk(path: &PathBuf, boot_toml: &str) {
-    fs::write(path, make_cpio_newc(&[("boot.toml", boot_toml.as_bytes())]))
-        .expect("failed to create boot ramdisk");
 }
 
 fn make_cpio_newc(entries: &[(&str, &[u8])]) -> Vec<u8> {
