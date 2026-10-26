@@ -73,6 +73,10 @@ pub fn empty_user_page_flags() -> ArchPageFlags {
     current::userspace::empty_user_page_flags()
 }
 
+pub fn mmap_user_page_flags(prot: usize) -> Result<ArchPageFlags, isize> {
+    current::userspace::mmap_user_page_flags(prot)
+}
+
 pub fn user_brk_max() -> usize {
     current::userspace::user_brk_max()
 }

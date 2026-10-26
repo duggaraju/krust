@@ -270,12 +270,36 @@ impl AddressSpace {
         zero_frame(frame);
         let map_result = with_frame_allocator(|frame_allocator| {
             let mut mapper = unsafe { mapper_for_frame(self.root_frame) };
-            let target_flags = flags | PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
-            let mut mapped = unsafe { mapper.map_to(page, frame, target_flags, frame_allocator) };
+            // BIT_9 marks an allocated, owned PROT_NONE leaf, never a supervisor page.
+            let mut target_flags = flags | PageTableFlags::USER_ACCESSIBLE;
+            if !flags.contains(PageTableFlags::BIT_9) {
+                target_flags |= PageTableFlags::PRESENT;
+            }
+            // Non-present/read-only leaves must not restrict their sibling mappings.
+            let parent_flags = PageTableFlags::PRESENT
+                | PageTableFlags::WRITABLE
+                | PageTableFlags::USER_ACCESSIBLE;
+            let mut mapped = unsafe {
+                mapper.map_to_with_table_flags(
+                    page,
+                    frame,
+                    target_flags,
+                    parent_flags,
+                    frame_allocator,
+                )
+            };
             if mapped.is_err() {
                 if let Ok((_, flush)) = mapper.unmap(page) {
                     flush.flush();
-                    mapped = unsafe { mapper.map_to(page, frame, target_flags, frame_allocator) };
+                    mapped = unsafe {
+                        mapper.map_to_with_table_flags(
+                            page,
+                            frame,
+                            target_flags,
+                            parent_flags,
+                            frame_allocator,
+                        )
+                    };
                 }
             }
 

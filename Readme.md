@@ -160,10 +160,11 @@ for userspace probes/retries; command failures and other kernel errors still fai
 are unchanged. Rebuild without `KRUST_BOOT_SYSCALL_TRACE` (or set it to `false`)
 to disable these records; rerunning the smoke overwrites its logs.
 
-### mmap range regression (#9)
+### mmap range and protection regressions (#9, #8)
 
 ```bash
 scripts/test-mmap.sh
+scripts/test-mmap-protection-harness.sh
 cargo check -p kernel --target x86_64-unknown-none --locked
 cargo build -Z bindeps --locked
 scripts/test-mmap-guest.sh target/krust-disk-ext4.vhd
@@ -216,10 +217,33 @@ fallback placement. Consequently a hint whose rounded range is outside the
 user limit is rejected, even where Linux could ignore it and allocate elsewhere.
 In-range hints are not rejected merely for being unaligned. Zero hints retain
 the existing monotonic placement beginning at the architecture's mmap base.
-This change does not implement protection enforcement (#8) or overlap/replacement
+This change does not implement `mprotect` (#7) or overlap/replacement
 policy between user mappings (#10). ARM64 now also owns the mmap layout constants;
 its existing unimplemented page-table inspection fails closed rather than
 claiming a range is safe.
+
+Anonymous x86_64 `mmap` accepts all combinations of `PROT_READ`, `PROT_WRITE`,
+and `PROT_EXEC`; unknown protection bits return `EINVAL` after the existing
+unsupported-mode and zero-length checks. Non-executable mappings use NX;
+read-only mappings omit write permission. Hardware permits reads on write-only
+and execute-only pages too; no `READ_IMPLIES_EXEC` personality is implemented.
+`PROT_NONE` retains its allocated frame, USER identity, and ownership record,
+but uses a software-marked non-present leaf, denying reads, writes, and execution.
+Parent tables remain user-accessible; kernel initialization writes through the
+physical-memory alias, not the protected user address. Boot explicitly enables
+EFER.NXE and CR0.WP. ARM64's actual protection-helper surface is cross-compiled,
+but valid protections return `ENOSYS`: this is not ARM64 runtime support.
+
+The guest script additionally boots BIOS and UEFI protection probes in separate
+kernel-shell-launched processes, avoiding the known userspace `fork` bug (#48).
+It exercises all eight combinations (including executing EXEC-only/RX zero-page
+tails into an adjacent executable RET), then attempts nine forbidden writes,
+instruction fetches, and `PROT_NONE` accesses. Each must produce its exact
+user-mode page-fault class and task status 139; the shell must run a healthy
+BusyBox child after every fault. Missing faults/statuses fail the focused harness.
+Expected faults are allowed only there, never in the standard smoke harness.
+Logs: `target/mmap-protections-{bios,uefi}{,-kernel}.log`. The host-only protection
+harness tests reject missing/wrong faults, missing statuses, and unrelated faults.
 
 Requirements: Bash, GNU `timeout`, `realpath`, `sha256sum`, util-linux `setsid`,
 and the normal QEMU/build prerequisites.

@@ -12,6 +12,7 @@ pub mod pit;
 pub mod syscall;
 mod supervisor_overlap;
 pub mod user_layout;
+pub mod user_protection;
 pub mod userspace;
 
 pub fn shutdown(status: crate::arch::ShutdownStatus) -> ! {

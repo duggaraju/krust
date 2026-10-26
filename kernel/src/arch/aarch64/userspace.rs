@@ -1,6 +1,13 @@
 /// ARM64-specific user-mode page flags and userspace utilities.
 use crate::process::task::Task;
 
+#[path = "user_protection.rs"]
+mod user_protection;
+
+pub fn mmap_user_page_flags(prot: usize) -> Result<PageFlags, isize> {
+    user_protection::mmap_page_flags(prot).map(PageFlags)
+}
+
 /// ARM64 page table descriptor format (stage 1, EL0/EL1)
 /// Attributes: valid, access flags, shareability, memory type, etc.
 #[repr(transparent)]

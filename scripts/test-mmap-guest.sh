@@ -33,9 +33,12 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 export TMPDIR="$work"
-cc -std=c11 -O2 -Wall -Wextra -Werror -nostdlib -static -no-pie \
+cc -std=c11 -O2 -Wall -Wextra -Werror -ffreestanding -nostdlib -static -no-pie \
     -fno-pie -fno-stack-protector -mno-red-zone -Wl,--build-id=none \
     scripts/tests/mmap-guest.c -o "$work/probe"
+cc -std=c11 -O2 -Wall -Wextra -Werror -ffreestanding -nostdlib -static -no-pie \
+    -fno-pie -fno-stack-protector -mno-red-zone -Wl,--build-id=none \
+    scripts/tests/mmap-protection-guest.c -o "$work/protection"
 cp --reflink=auto "$disk" "$work/disk.vhd"
 debugfs -w -R 'rm /bin/krust-mmap-probe' "$work/disk.vhd" \
     > "$work/debugfs.log" 2>&1
@@ -45,6 +48,15 @@ debugfs -w -R 'set_inode_field /bin/krust-mmap-probe mode 0100755' "$work/disk.v
     >> "$work/debugfs.log" 2>&1
 debugfs -R 'stat /bin/krust-mmap-probe' "$work/disk.vhd" 2>/dev/null |
     grep -q 'Type: regular'
+debugfs -w -R 'rm /bin/krust-mmap-protection' "$work/disk.vhd" \
+    >> "$work/debugfs.log" 2>&1
+debugfs -w -R "write $work/protection /bin/krust-mmap-protection" "$work/disk.vhd" \
+    >> "$work/debugfs.log" 2>&1
+debugfs -w -R 'set_inode_field /bin/krust-mmap-protection mode 0100755' "$work/disk.vhd" \
+    >> "$work/debugfs.log" 2>&1
+debugfs -R 'stat /bin/krust-mmap-protection' "$work/disk.vhd" 2>/dev/null |
+    grep -q 'Type: regular'
+bash scripts/test-mmap-protections.sh "$work/disk.vhd" "$runner"
 KRUST_SMOKE_MMAP_PROBE=1 scripts/smoke-userspace.sh "$work/disk.vhd" "$runner"
 for mode in bios uefi; do
     cp "target/userspace-smoke-$mode.log" "target/mmap-guest-$mode.log"

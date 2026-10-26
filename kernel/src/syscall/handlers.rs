@@ -775,7 +775,10 @@ pub fn sys_mmap(args: &SyscallArgs) -> isize {
         return -22; // EINVAL
     }
 
-    let writable = (prot & 0x2) != 0;
+    let page_flags = match crate::arch::mmap_user_page_flags(prot) {
+        Ok(flags) => flags,
+        Err(errno) => return errno,
+    };
 
     let result = crate::process::with_current_task_mut(|task| {
         let base = if addr != 0 {
@@ -805,11 +808,7 @@ pub fn sys_mmap(args: &SyscallArgs) -> isize {
             .map_zeroed_region(
                 range.base,
                 range.len,
-                if writable {
-                    crate::arch::writable_user_page_flags()
-                } else {
-                    crate::arch::empty_user_page_flags()
-                },
+                page_flags,
             )
             .map_err(|_| -12isize)?;
         if addr == 0 {
