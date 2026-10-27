@@ -699,35 +699,58 @@ pub fn sys_fork(_args: &SyscallArgs) -> isize {
 }
 
 pub fn sys_execve(args: &SyscallArgs) -> isize {
-    let path_ptr = args.arg0 as *const u8;
-    let Some(path) = (unsafe { read_cstr(path_ptr) }) else {
-        warn!("sys_execve received invalid path pointer");
-        return -14;
+    let arguments = (|| {
+        let path = super::user_memory::cstring(args.arg0, 4096)?;
+        let mut budget = 128 * 1024;
+        let argv = super::user_memory::string_vector(args.arg1, &mut budget)?;
+        let envp = super::user_memory::string_vector(args.arg2, &mut budget)?;
+        Ok::<_, isize>((path, argv, envp))
+    })();
+    let (path, argv, envp) = match arguments {
+        Ok(arguments) => arguments,
+        Err(errno) => {
+            warn!("execve: cannot copy user arguments: errno {}, path=0x{:x} argv=0x{:x} envp=0x{:x}", errno, args.arg0, args.arg1, args.arg2);
+            return errno;
+        }
     };
-
-    match impls::execve(path) {
+    match impls::execve_with_args(&path, argv, envp) {
         Ok(()) => 0,
         Err(errno) => errno,
     }
 }
 
 pub fn sys_wait4(args: &SyscallArgs) -> isize {
+    if args.arg2 & !1 != 0 {
+        return -22;
+    }
+    if args.arg3 != 0 {
+        return -95; // rusage is not implemented.
+    }
+    if args.arg0 != usize::MAX && (args.arg0 as isize) <= 0 {
+        return -38; // Process-group selection is not implemented.
+    }
     let pid = if args.arg0 == usize::MAX {
         None
     } else {
         Some(args.arg0 as u64)
     };
-    let status_ptr = args.arg1 as *mut isize;
+    if args.arg1 != 0 {
+        if let Err(errno) = super::user_memory::validate_write(args.arg1, core::mem::size_of::<i32>()) {
+            return errno;
+        }
+    }
 
-    match crate::process::wait_for_child(pid) {
-        Ok((child_pid, status)) => {
-            if !status_ptr.is_null() {
-                unsafe {
-                    ptr::write(status_ptr, status as isize);
+    match crate::process::wait_for_child_with_options(pid, args.arg2 & 1 != 0) {
+        Ok(Some((child_pid, status))) => {
+            if args.arg1 != 0 {
+                let encoded = (status & 0xff) << 8;
+                if let Err(errno) = super::user_memory::copy_to(args.arg1, &encoded.to_ne_bytes()) {
+                    return errno;
                 }
             }
             child_pid as isize
         }
+        Ok(None) => 0,
         Err(errno) => errno,
     }
 }

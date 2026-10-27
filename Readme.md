@@ -97,9 +97,18 @@ The kernel permits up to four interpreter redirects, then rejects the exec with
 `ELOOP` rather than looping forever. This also protects against old recursive
 scripts. Errors when launching from the kernel shell are logged with their
 errno and the child exits with status 127; the parent shell remains responsive.
-This fix does not implement missing userspace fork/exec behavior (#48/#49);
-commands executed *inside* BusyBox's shell and non-shell wrapper applets still
-depend on those separate fixes.
+Userspace fork now resumes the child from its saved syscall register frame
+with return value zero, rather than a copied Rust kernel continuation. User
+page-table branches are private to each address space, so child writes and
+exec cannot replace the parent's mappings. Exec copies bounded argv/envp
+vectors from validated user pages before replacing the image, preserving empty
+arguments and an explicitly empty environment.
+
+Wait status uses Linux's four-byte `int` buffer and exit-code encoding.
+Any-child/positive-PID waits support `WNOHANG` and return `ECHILD` after the last
+child is reaped. Process-group selection, nonzero rusage, and unsupported wait
+options are explicitly rejected. Full signal/wait semantics and per-task
+x87/SSE state remain separate work items (#14/#15/#50).
 
 Run the bounded FAT shell regression with an existing native BusyBox binary:
 
@@ -107,10 +116,15 @@ Run the bounded FAT shell regression with an existing native BusyBox binary:
 scripts/test-fat-shell.sh target/rootfs/bin/busybox
 ```
 
-It verifies ext4-to-FAT applet installation, real `sh`/`ash` execution, valid
-one/four-level script loading, self/two-script loops, over-limit chains, and
-parent-shell recovery on BIOS and UEFI. The test uses an owned temporary image,
-QEMU snapshots, and unchanged-image hash checks.
+It verifies ext4-to-FAT applet installation, real `sh`/`ash` execution, repeated
+`ls` from automated and interactive BusyBox shells, valid one/four-level script
+loading, self/two-script loops, over-limit chains, and parent-shell recovery on
+BIOS and UEFI. A freestanding C fixture additionally checks preserved fork
+registers and stack/global/mmap isolation across child exec, exact argv/envp,
+invalid pointers, oversized strings, a vector crossing a page boundary,
+failed-exec recovery, and a canary next to the wait status buffer. The test
+requires a host C compiler and uses an owned temporary image, QEMU snapshots,
+and unchanged-image hash checks.
 
 Each image also gets a `<image>.boot.toml` sidecar selecting its root filesystem
 and device. The launcher reads this automatically and includes it in the boot

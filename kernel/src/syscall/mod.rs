@@ -2,6 +2,7 @@ pub mod dispatch;
 pub mod handlers;
 pub mod impls;
 mod mmap;
+mod user_memory;
 pub mod numbers;
 
 pub fn init(trace_enabled: bool) {

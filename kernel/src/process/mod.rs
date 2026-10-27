@@ -416,13 +416,13 @@ pub fn fork_current_task() -> Result<u64, isize> {
     let Some(scheduler) = scheduler.as_mut() else {
         return Err(-1);
     };
-    let Some(parent) = scheduler.task_by_pid(parent_pid).cloned() else {
+    let Some(parent) = scheduler.task_by_pid(parent_pid) else {
         return Err(-1);
     };
     let parent_priority_before = parent.priority;
 
-    let child_pid = alloc_pid();
     let mut child = parent.clone();
+    let child_pid = alloc_pid();
     child.pid = child_pid;
     child.parent_pid = parent_pid;
     child.state = TaskState::Ready;
@@ -481,7 +481,10 @@ pub fn fork_current_task() -> Result<u64, isize> {
 }
 
 pub fn wait_for_child(pid: Option<u64>) -> Result<(u64, i32), isize> {
-    use x86_64::instructions::hlt;
+    wait_for_child_with_options(pid, false)?.ok_or(-10)
+}
+
+pub fn wait_for_child_with_options(pid: Option<u64>, nohang: bool) -> Result<Option<(u64, i32)>, isize> {
     let parent_pid = current_pid();
 
     loop {
@@ -490,14 +493,27 @@ pub fn wait_for_child(pid: Option<u64>) -> Result<(u64, i32), isize> {
             let Some(scheduler) = scheduler.as_mut() else {
                 return Err(-1);
             };
-            scheduler.reap_zombie_child(parent_pid, pid)
+            let reaped = scheduler.reap_zombie_child(parent_pid, pid);
+            if reaped.is_none() && !scheduler.tasks().any(|task| {
+                task.parent_pid == parent_pid && pid.is_none_or(|pid| task.pid == pid)
+            }) {
+                return Err(-10); // ECHILD
+            }
+            reaped
         };
 
         if let Some(result) = maybe_child {
-            return Ok(result);
+            return Ok(Some(result));
+        }
+        if nohang {
+            return Ok(None);
         }
 
-        hlt();
+        let enabled = x86_64::instructions::interrupts::are_enabled();
+        x86_64::instructions::interrupts::enable_and_hlt();
+        if !enabled {
+            x86_64::instructions::interrupts::disable();
+        }
     }
 }
 

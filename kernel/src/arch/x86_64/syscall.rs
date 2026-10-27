@@ -11,6 +11,7 @@ struct SyscallCpuLocal {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct SavedRegs {
     rdi: u64,
     rsi: u64,
@@ -26,7 +27,10 @@ struct SavedRegs {
     r13: u64,
     r14: u64,
     r15: u64,
+    user_rsp: u64,
 }
+
+const _: () = assert!(core::mem::size_of::<SavedRegs>() == 120);
 
 static mut SYSCALL_CPU_LOCAL: SyscallCpuLocal = SyscallCpuLocal {
     kernel_rsp: 0,
@@ -60,11 +64,12 @@ syscall_entry_trampoline:
 
     mov rdi, gs:[8]
     mov rsi, rsp
-    sub rsp, 128
+    sub rsp, 136
     call syscall_dispatch_from_regs
-    add rsp, 128
+    add rsp, 136
     mov gs:[8], rax
 
+.Lsyscall_return:
     pop rdi
     pop rsi
     pop rdx
@@ -85,11 +90,70 @@ syscall_entry_trampoline:
     mov rax, gs:[8]
     swapgs
     sysretq
+
+    .global fork_child_trampoline
+fork_child_trampoline:
+    sub rsp, 8
+    call fork_child_prepare_return
+    mov rsp, rax
+    mov qword ptr gs:[8], 0
+    jmp .Lsyscall_return
 "#
 );
 
 unsafe extern "C" {
     fn syscall_entry_trampoline();
+    fn fork_child_trampoline();
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn fork_child_prepare_return() -> u64 {
+    let (frame, gs_base) = crate::process::with_current_task_mut(|task| {
+        task.mode = crate::process::task::TaskMode::User;
+        (
+            task.kernel_stack_top - core::mem::size_of::<SavedRegs>(),
+            task.context.thread_local_base(false),
+        )
+    })
+    .expect("fork child must be registered");
+    GsBase::write(VirtAddr::from_ptr(core::ptr::addr_of!(SYSCALL_CPU_LOCAL)));
+    KernelGsBase::write(VirtAddr::new(gs_base));
+    frame as u64
+}
+
+pub fn fork_from_syscall() -> Result<u64, isize> {
+    let frame = crate::process::with_current_task_mut(|task| {
+        if !task.userland {
+            return Err(-38isize);
+        }
+        let address = task.kernel_stack_top - core::mem::size_of::<SavedRegs>();
+        // SYSCALL saves this fixed frame at the top of the current task's stack.
+        Ok(unsafe { (address as *const SavedRegs).read() })
+    })
+    .ok_or(-1isize)??;
+    let child = crate::process::fork_current_task()?;
+    crate::process::with_task_mut(child, |task| {
+        let address = task.kernel_stack_top - core::mem::size_of::<SavedRegs>();
+        unsafe {
+            (address as *mut SavedRegs).write(frame);
+        }
+        task.context.set_kernel_stack_pointer(address as u64);
+        task.context.set_frame_pointer(0);
+        task.context
+            .set_kernel_stack_top(task.kernel_stack_top as u64);
+        task.context
+            .set_kernel_entry_point(fork_child_trampoline as *const () as u64);
+        task.context.set_user_entry_point(frame.rcx);
+        task.context.set_user_stack_pointer(frame.user_rsp);
+    })
+    .ok_or(-1isize)?;
+    if let Some(plan) = crate::process::yield_to_task(child) {
+        unsafe {
+            crate::arch::restore_kernel_syscall_state();
+            crate::arch::switch_context(plan.old_ctx, plan.new_ctx);
+        }
+    }
+    Ok(child)
 }
 
 #[unsafe(no_mangle)]
@@ -134,6 +198,11 @@ extern "C" fn syscall_dispatch_from_regs(number: u64, regs: *const SavedRegs) ->
         number,
         result as u64
     );
+    if let Some(gs_base) =
+        crate::process::with_current_task_mut(|task| task.context.thread_local_base(false))
+    {
+        KernelGsBase::write(VirtAddr::new(gs_base));
+    }
     result
 }
 

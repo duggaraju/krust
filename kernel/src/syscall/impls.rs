@@ -308,45 +308,7 @@ pub fn rseq(
 }
 
 pub fn fork() -> Result<u64, isize> {
-    let rsp = current_kernel_rsp();
-    let on_task_stack = crate::process::with_current_task_mut(|task| {
-        let (base, top) = task.kernel_stack_range();
-        let rsp = rsp as usize;
-        rsp >= base && rsp <= top
-    })
-    .unwrap_or(false);
-    if !on_task_stack {
-        log::warn!(
-            "fork: kernel caller rsp=0x{:x} is outside task kernel stack; refusing resumable fork",
-            rsp
-        );
-        return Err(-38);
-    }
-
-    let _ = crate::process::with_current_task_mut(|task| {
-        unsafe {
-            crate::arch::capture_current_context(&mut task.context);
-        }
-        task.context
-            .set_kernel_stack_top(task.kernel_stack_top as u64);
-        task.context
-            .set_address_space_root(task.address_space.root_paddr());
-    });
-
-    let child_pid = crate::process::fork_current_task()?;
-
-    if let Some(plan) = crate::process::yield_to_task(child_pid) {
-        unsafe {
-            crate::arch::restore_kernel_syscall_state();
-            crate::arch::switch_context(plan.old_ctx, plan.new_ctx);
-        }
-    }
-
-    if crate::process::current_pid() == child_pid {
-        Ok(0)
-    } else {
-        Ok(child_pid)
-    }
+    crate::arch::fork_from_syscall()
 }
 
 pub fn fork_execve(path: String, argv: Vec<String>) -> Result<u64, isize> {
@@ -424,15 +386,6 @@ fn fork_execve_child_entry() {
     loop {
         x86_64::instructions::hlt();
     }
-}
-
-#[inline]
-fn current_kernel_rsp() -> u64 {
-    let rsp: u64;
-    unsafe {
-        core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nostack, nomem, preserves_flags));
-    }
-    rsp
 }
 
 pub fn execve(path: &str) -> Result<(), isize> {
@@ -550,18 +503,10 @@ pub fn execve_with_args(path: &str, argv: Vec<String>, envp: Vec<String>) -> Res
                     request.envp.len()
                 );
 
-                // Ensure we always have at least a minimal environment for glibc compatibility
-                let mut envp_vec = request.envp.clone();
-                if envp_vec.is_empty() {
-                    // Add minimal PATH environment for glibc
-                    envp_vec.push(String::from("PATH=/bin"));
-                    log::info!("execve: added minimal PATH environment");
-                }
-
                 let stack_top = build_user_stack(
                     &mut image_space,
                     &request.argv,
-                    &envp_vec,
+                    &request.envp,
                     original_path.as_str(), // AT_EXECFN: original name passed to execve
                     &plan,
                 )?;

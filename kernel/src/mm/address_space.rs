@@ -33,6 +33,7 @@ struct Mapping {
 pub struct AddressSpace {
     root_frame: PhysFrame<Size4KiB>,
     mappings: Vec<Mapping>,
+    private_tables: Vec<PhysFrame<Size4KiB>>,
 }
 
 impl Clone for AddressSpace {
@@ -46,6 +47,9 @@ impl Drop for AddressSpace {
     fn drop(&mut self) {
         for mapping in self.mappings.drain(..) {
             deallocate_frame(mapping.frame);
+        }
+        for table in self.private_tables.drain(..) {
+            deallocate_frame(table);
         }
         deallocate_frame(self.root_frame);
     }
@@ -85,6 +89,7 @@ impl AddressSpace {
         Ok(Self {
             root_frame: new_root,
             mappings: Vec::with_capacity(512),
+            private_tables: Vec::new(),
         })
     }
 
@@ -266,15 +271,17 @@ impl AddressSpace {
         page: Page<Size4KiB>,
         flags: PageTableFlags,
     ) -> Result<PhysFrame<Size4KiB>, MmError> {
+        self.make_user_path_private(page)?;
+        let mut flags = flags | PageTableFlags::USER_ACCESSIBLE;
+        if !flags.contains(PageTableFlags::BIT_9) {
+            flags |= PageTableFlags::PRESENT;
+        }
         let frame = allocate_frame().ok_or(MmError::OutOfFrames)?;
         zero_frame(frame);
         let map_result = with_frame_allocator(|frame_allocator| {
             let mut mapper = unsafe { mapper_for_frame(self.root_frame) };
             // BIT_9 marks an allocated, owned PROT_NONE leaf, never a supervisor page.
-            let mut target_flags = flags | PageTableFlags::USER_ACCESSIBLE;
-            if !flags.contains(PageTableFlags::BIT_9) {
-                target_flags |= PageTableFlags::PRESENT;
-            }
+            let target_flags = flags;
             // Non-present/read-only leaves must not restrict their sibling mappings.
             let parent_flags = PageTableFlags::PRESENT
                 | PageTableFlags::WRITABLE
@@ -315,6 +322,47 @@ impl AddressSpace {
 
         self.mappings.push(Mapping { page, frame, flags });
         Ok(frame)
+    }
+
+    fn make_user_path_private(&mut self, page: Page<Size4KiB>) -> Result<(), MmError> {
+        let offset = crate::arch::physical_memory_offset().ok_or(MmError::InvalidAddress)?;
+        let mut table_frame = self.root_frame;
+        for index in [page.p4_index(), page.p3_index(), page.p2_index()] {
+            let table = unsafe {
+                &mut *((offset + table_frame.start_address().as_u64()) as *mut PageTable)
+            };
+            let entry = &mut table[index];
+            if entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+                return Err(MmError::InvalidAddress);
+            }
+            let old = if entry.is_unused() {
+                None
+            } else {
+                Some(entry.frame().map_err(|_| MmError::InvalidAddress)?)
+            };
+            if let Some(frame) = old {
+                if self.private_tables.contains(&frame) {
+                    table_frame = frame;
+                    continue;
+                }
+            }
+            // Inherited kernel table branches must never be edited in place:
+            // a child exec would otherwise replace the parent's user mappings.
+            let private = allocate_frame().ok_or(MmError::OutOfFrames)?;
+            zero_frame(private);
+            if let Some(frame) = old {
+                if let Err(error) = copy_frame_contents(frame, private) {
+                    deallocate_frame(private);
+                    return Err(error);
+                }
+            }
+            let flags = entry.flags() | PageTableFlags::PRESENT
+                | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+            entry.set_frame(private, flags);
+            self.private_tables.push(private);
+            table_frame = private;
+        }
+        Ok(())
     }
 }
 

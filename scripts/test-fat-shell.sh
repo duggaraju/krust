@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Bound real FAT shell launches and recursive interpreter failures in QEMU.
+# Exercise FAT shell subprocesses and recursive interpreter failures in QEMU.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 if (( $# > 2 )); then
@@ -8,6 +8,9 @@ if (( $# > 2 )); then
 fi
 binary=$(realpath -e "${1:-target/rootfs/bin/busybox}")
 runner=$(realpath -e "${2:-target/debug/krust}")
+for tool in cc setsid timeout sha256sum; do
+    command -v "$tool" >/dev/null || { echo "Missing required tool: $tool" >&2; exit 2; }
+done
 work="$PWD/target/fat-shell-$$"
 mkdir "$work"
 active=
@@ -68,11 +71,17 @@ printf '#!/bin/nested2\n' > "$work/root/bin/nested1"
 printf '#!/bin/nested3\n' > "$work/root/bin/nested2"
 printf '#!/bin/nested4\n' > "$work/root/bin/nested3"
 printf '#!/bin/busybox echo\n' > "$work/root/bin/nested4"
+cc -std=c11 -O2 -Wall -Wextra -Werror -ffreestanding -nostdlib -static -no-pie \
+    -fno-pie -fno-stack-protector -mno-red-zone -Wl,--build-id=none \
+    scripts/tests/process-guest.c -o "$work/root/bin/proctest"
 "$runner" mkdisk "$work/root" "$work/disk.vhd" --format fat > "$work/mkdisk.log" 2>&1
+printf 'syscall_trace = true\n' >> "$work/disk.vhd.boot.toml"
 before=$(sha256sum "$work/disk.vhd")
 commands=(
     "/bin/sh -c pwd"
     "/bin/ash -c pwd"
+    "/bin/proctest"
+    '/bin/busybox sh -c ls;ls;echo${IFS}KRUST_ASH_SUBPROCESS_OK'
     "/bin/direct"
     "/bin/nested1"
     "/bin/selfloop"
@@ -82,6 +91,7 @@ commands=(
     "/bin/chain1"
     "echo KRUST_AFTER_LIMIT"
     "/bin/sh -c pwd"
+    "/bin/busybox sh"
     "exit"
 )
 for mode in bios uefi; do
@@ -96,6 +106,8 @@ for mode in bios uefi; do
     exec {input}>&"${GUEST[1]}"
     exec {output}<&"${GUEST[0]}"
     next=0
+    interactive_next=0
+    interactive_commands=("ls" "ls" "echo KRUST_INTERACTIVE_OK" "exit")
     suffix=
     response=
     end=$((SECONDS + 120))
@@ -109,6 +121,12 @@ for mode in bios uefi; do
         if (( ${#suffix} > 8 )); then
             suffix="${suffix: -8}"
         fi
+        if (( next > 0 && interactive_next < ${#interactive_commands[@]} )) &&
+            [[ "${commands[$((next - 1))]}" == "/bin/busybox sh" && "$suffix" == *"# " ]]; then
+            printf '%s\n' "${interactive_commands[$interactive_next]}" >&"$input"
+            interactive_next=$((interactive_next + 1))
+            suffix=
+        fi
         if [[ "$suffix" == *"krust> " ]]; then
             if (( next > 0 )); then
                 previous=${commands[$((next - 1))]}
@@ -121,6 +139,16 @@ for mode in bios uefi; do
                     /bin/direct) [[ "$clean" == direct ]] ;;
                     /bin/nested1) [[ "$clean" == '/bin/nested4 /bin/nested3 /bin/nested2 /bin/nested1' ]] ;;
                     "/bin/sh -c pwd"|"/bin/ash -c pwd") [[ "$clean" == / ]] ;;
+                    /bin/proctest) [[ "$clean" == KRUST_PROCESS_OK ]] ;;
+                    "/bin/busybox sh")
+                        [[ "$interactive_next" == 4 ]]
+                        grep -q KRUST_INTERACTIVE_OK <<< "$clean"
+                        [[ "$(grep -cw bin <<< "$clean")" == 2 ]]
+                        ! grep -Eq 'not found|Usage:|errno|status' <<< "$clean" ;;
+                    '/bin/busybox sh -c ls;ls;echo${IFS}KRUST_ASH_SUBPROCESS_OK')
+                        grep -qx KRUST_ASH_SUBPROCESS_OK <<< "$clean"
+                        [[ "$(grep -cw bin <<< "$clean")" == 2 ]]
+                        ! grep -Eq 'not found|Usage:|errno|status' <<< "$clean" ;;
                     *) [[ -z "$clean" ]] ;;
                 esac
             fi

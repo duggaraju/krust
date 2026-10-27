@@ -125,6 +125,13 @@ pub fn restore_kernel_syscall_state() {
     current::syscall::restore_kernel_gs_base();
 }
 
+pub fn fork_from_syscall() -> Result<u64, isize> {
+    #[cfg(target_arch = "x86_64")]
+    { current::syscall::fork_from_syscall() }
+    #[cfg(not(target_arch = "x86_64"))]
+    { Err(-38) }
+}
+
 pub fn set_physical_memory_offset(physical_memory_offset: u64) {
     current::paging::set_physical_memory_offset(physical_memory_offset);
 }
