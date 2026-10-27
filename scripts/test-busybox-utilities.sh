@@ -3,18 +3,57 @@
 set -euo pipefail
 export LC_ALL=C
 cd "$(dirname "$0")/.."
-if (( $# > 3 )); then
-    echo "Usage: $0 [busybox [runner [fat|ext4]]]" >&2
+usage() {
+    echo "Usage: $0 [busybox [runner [fat|ext4]]] [--firmware bios|uefi|all] [--utility NAME ...] [--output-dir DIR]"
+}
+invalid_argument() {
+    echo "$1" >&2
+    usage >&2
     exit 2
+}
+positional=()
+selected=()
+firmwares=(bios uefi)
+output_dir=target
+while (( $# )); do
+    case "$1" in
+        --firmware)
+            (( $# >= 2 )) || invalid_argument "--firmware requires a value"
+            case "$2" in
+                bios|uefi) firmwares=("$2") ;;
+                all) firmwares=(bios uefi) ;;
+                *) invalid_argument "Invalid firmware: $2" ;;
+            esac
+            shift 2 ;;
+        --utility)
+            (( $# >= 2 )) || invalid_argument "--utility requires a name"
+            [[ "$2" =~ ^[a-z][a-z0-9]*$ ]] || invalid_argument "Invalid utility name: $2"
+            [[ " ${selected[*]} " != *" $2 "* ]] || invalid_argument "Duplicate utility: $2"
+            selected+=("$2")
+            shift 2 ;;
+        --output-dir)
+            (( $# >= 2 )) && [[ -n "$2" && "$2" != --* ]] || invalid_argument "--output-dir requires a directory"
+            output_dir=$2
+            shift 2 ;;
+        --help) usage; exit 0 ;;
+        -*) invalid_argument "Unknown option: $1" ;;
+        *) positional+=("$1"); shift ;;
+    esac
+done
+if (( ${#positional[@]} > 3 )); then
+    invalid_argument "Too many positional arguments"
 fi
-binary=$(realpath -e "${1:-target/rootfs/bin/busybox}")
-runner=$(realpath -e "${2:-target/debug/krust}")
-format=${3:-fat}
-[[ "$format" == fat || "$format" == ext4 ]] || { echo "format must be fat or ext4" >&2; exit 2; }
+format=${positional[2]:-fat}
+[[ "$format" == fat || "$format" == ext4 ]] || invalid_argument "format must be fat or ext4"
+binary=$(realpath -e "${positional[0]:-target/rootfs/bin/busybox}")
+runner=$(realpath -e "${positional[1]:-target/debug/krust}")
 for tool in setsid timeout sha256sum gzip tar; do
     command -v "$tool" >/dev/null || { echo "Missing required tool: $tool" >&2; exit 2; }
 done
 source scripts/tests/utility-cases.sh
+mkdir -p -- "$output_dir"
+output_dir=$(realpath -e -- "$output_dir")
+prefix="$output_dir/busybox-utilities-$format"
 work="$PWD/target/busybox-utilities-$$"
 mkdir "$work"
 active=
@@ -22,7 +61,7 @@ input=
 output=
 trace=
 before=
-report="$PWD/target/busybox-utilities-$format.tsv"
+report="$prefix.tsv"
 printf 'firmware\tutility\tresult\texpected_status\tactual_status\tlaunched\n' > "$report"
 stop_guest() {
     [[ -z "$input" ]] || { exec {input}>&-; input=; }
@@ -40,7 +79,7 @@ cleanup() {
     trap - EXIT
     stop_guest
     if [[ "$trace" == "$work"/krust-trace-*.log && -f "$trace" ]]; then
-        cp "$trace" "target/busybox-utilities-$format-$mode-incomplete-kernel.log"
+        cp "$trace" "$prefix-$mode-incomplete-kernel.log"
     fi
     if [[ -n "$before" && "$(sha256sum "$work/disk.vhd")" != "$before" ]]; then
         echo "Source VHD changed!" >&2
@@ -82,20 +121,26 @@ for path in "$work/root/bin/"*; do
     printf '%s\nutility_status=$?\necho\necho KRUST_UTILITY_DONE:%s:$utility_status\n' \
         "$utility_command" "$name" > "$work/root/cases/$name"
 done
+if (( ${#selected[@]} )); then
+    for name in "${selected[@]}"; do
+        [[ -f "$work/root/cases/$name" ]] || invalid_argument "Utility is not installed: $name"
+    done
+    utilities=("${selected[@]}")
+fi
 (( ${#utilities[@]} > 0 )) || { echo "No installed utilities found" >&2; exit 1; }
 "$runner" mkdisk "$work/root" "$work/disk.vhd" --format "$format" > "$work/mkdisk.log" 2>&1
 printf 'syscall_trace = true\n' >> "$work/disk.vhd.boot.toml"
 before=$(sha256sum "$work/disk.vhd")
 failures=0
-for mode in bios uefi; do
-    log="$PWD/target/busybox-utilities-$format-$mode.log"
-    kernel_log="$PWD/target/busybox-utilities-$format-$mode-kernel.log"
+for mode in "${firmwares[@]}"; do
+    log="$prefix-$mode.log"
+    kernel_log="$prefix-$mode-kernel.log"
     : > "$log"
     : > "$kernel_log"
     trace=
     for name in "${utilities[@]}"; do
         utility_case "$name"
-        case_log="target/busybox-utilities-$format-$mode-$name-console.log"
+        case_log="$prefix-$mode-$name-console.log"
         : > "$case_log"
         if [[ -z "$active" ]]; then
             trace=
@@ -145,7 +190,7 @@ for mode in bios uefi; do
             stop_guest
         fi
         cat "$case_log" >> "$log"
-        response_log="target/busybox-utilities-$format-$mode-$name.log"
+        response_log="$prefix-$mode-$name.log"
         tr -d '\r' < "$work/response" |
             sed -E $'s/\033\\[[0-9;]*m//g; s/krust> $//' > "$response_log"
         marker=$(sed -nE "s/^(KRUST_UTILITY_DONE:$name:[0-9]+)$/\\1/p" "$response_log")
@@ -161,7 +206,7 @@ for mode in bios uefi; do
             result=FAIL
         else
             trace_end=$(wc -l < "$trace")
-            case_trace="target/busybox-utilities-$format-$mode-$name-kernel.log"
+            case_trace="$prefix-$mode-$name-kernel.log"
             sed -n "$((trace_start + 1)),${trace_end}p" "$trace" > "$case_trace"
             trace_start=$trace_end
             if grep -Eq "execve: (loading|redirecting|symlink resolved) '/bin/$name'" "$case_trace"; then
@@ -198,9 +243,9 @@ for mode in bios uefi; do
     fi
     trace=
     sed -nE 's/.*syscall entry:.*nr=([0-9]+) \(([^)]+)\).*/\1 \2/p' "$kernel_log" |
-        sort -u > "target/busybox-utilities-$format-$mode-syscalls.log"
+        sort -u > "$prefix-$mode-syscalls.log"
     sed -n '/unimplemented syscall:/p' "$kernel_log" | sort -u \
-        > "target/busybox-utilities-$format-$mode-unimplemented.log"
+        > "$prefix-$mode-unimplemented.log"
 done
-echo "Tested ${#utilities[@]} utilities per firmware; $failures failures; report: $report"
+echo "Tested ${#utilities[@]} utilities per firmware (${firmwares[*]}); $failures failures; report: $report"
 (( failures == 0 ))
