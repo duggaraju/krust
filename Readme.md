@@ -122,9 +122,49 @@ loading, self/two-script loops, over-limit chains, and parent-shell recovery on
 BIOS and UEFI. A freestanding C fixture additionally checks preserved fork
 registers and stack/global/mmap isolation across child exec, exact argv/envp,
 invalid pointers, oversized strings, a vector crossing a page boundary,
-failed-exec recovery, and a canary next to the wait status buffer. The test
+failed-exec recovery, a canary next to the wait status buffer, and parent
+recovery after a fork child deliberately faults. Exactly that one user-mode
+page fault is required; any additional exception fails the regression. The test
 requires a host C compiler and uses an owned temporary image, QEMU snapshots,
 and unchanged-image hash checks.
+
+To exercise **every installed `/bin` utility through the userspace BusyBox
+shell**, rather than similarly named kernel built-ins:
+
+```bash
+bash scripts/tests/test-utility-cases.sh
+scripts/test-busybox-utilities.sh
+scripts/test-busybox-utilities.sh target/rootfs/bin/busybox target/debug/krust ext4
+```
+
+The matrix is derived from the applets actually installed by the rootfs setup
+(40 with the current BusyBox), not every applet compiled into BusyBox. Each case
+runs `/bin/busybox sh /cases/<utility>` and invokes the installed `/bin/<utility>`
+path with functional input/output and exit-status checks. This covers FAT
+wrappers and, with `ext4`, symlinks. `false` must return 1; success-shaped stubs
+for mutations are insufficient because destination contents, metadata, or
+existence are checked too. New-file destinations generally use a RAM-backed
+`/scratch`; removal, metadata and compression cases use owned disk fixtures.
+Compression and `xargs -a` avoid shell redirection so a broken redirection
+syscall cannot prevent those applets from actually launching.
+
+Both BIOS and UEFI run the complete matrix. A hung/crashed case fails after a
+bounded deadline and the next case boots a fresh snapshot, so one broken
+utility cannot prevent the remaining utilities from being attempted. The
+source disk is hash-checked and temporary images/processes are cleaned up.
+Results, including trace-verified applet launches, are in
+`target/busybox-utilities-{fat,ext4}.tsv`; per-case console/kernel
+logs and per-firmware syscall/unimplemented-syscall inventories share that
+prefix. Any functional failure, missing completion marker, exception, timeout,
+or bad shutdown makes the suite exit nonzero.
+
+These are compatibility tests, not a claim that all utilities or Linux syscalls
+already work. Missing filesystem mutations, descriptor duplication, vectored
+reads and other syscall gaps are intentionally reported as failures, not
+skipped or accepted as successful help output. The currently disabled `wget`
+applet requires a guest-reachable HTTP fixture before it can pass if enabled.
+The host-only validator checks positive/negative output and status assertions;
+it does not replace the real QEMU runs.
 
 Each image also gets a `<image>.boot.toml` sidecar selecting its root filesystem
 and device. The launcher reads this automatically and includes it in the boot
