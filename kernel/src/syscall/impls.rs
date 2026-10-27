@@ -408,7 +408,8 @@ fn fork_execve_child_entry() {
     })
     .unwrap_or_default();
 
-    if let Err(_errno) = execve_with_args(exec_path.as_str(), argv, envp) {
+    if let Err(errno) = execve_with_args(exec_path.as_str(), argv, envp) {
+        log::error!("execve: failed to execute '{}': errno {}", exec_path, errno);
         let _ = crate::syscall::handlers::sys_exit(&crate::syscall::dispatch::SyscallArgs {
             number: crate::syscall::numbers::SYS_EXIT,
             arg0: 127,
@@ -462,6 +463,8 @@ pub fn execve_with_args(path: &str, argv: Vec<String>, envp: Vec<String>) -> Res
         envp,
     };
 
+    const MAX_INTERPRETER_REDIRECTS: usize = 4;
+    let mut redirects = 0;
     loop {
         let action = crate::process::binfmt::probe_path(&request).map_err(|err| match err {
             crate::process::binfmt::BinfmtError::Io(errno) => errno,
@@ -473,6 +476,14 @@ pub fn execve_with_args(path: &str, argv: Vec<String>, envp: Vec<String>) -> Res
 
         match action {
             crate::process::binfmt::BinaryFormatAction::Redirect(mut next) => {
+                if redirects >= MAX_INTERPRETER_REDIRECTS {
+                    log::error!(
+                        "execve: interpreter redirect limit exceeded for '{}'",
+                        original_path
+                    );
+                    return Err(-40); // ELOOP
+                }
+                redirects += 1;
                 // The redirect target (e.g. a shebang interpreter) may itself be a symlink.
                 let resolved_next = vfs::resolve_symlink_path(next.path.as_str())
                     .unwrap_or_else(|_| next.path.clone());

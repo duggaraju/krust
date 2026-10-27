@@ -78,8 +78,39 @@ dev      /dev  dev  defaults 0 0
 FAT images use `fat` instead of `ext4`. Filesystem names here are Krust names;
 `dev` is its devfs. The root layout must contain `bin/busybox`, not an extra
 rootfs directory. The existing BusyBox setup script uses this image-creation
-path automatically. FAT still has no symlinks; this does not repair its
-BusyBox shell-wrapper limitation.
+path automatically. FAT has no symlinks: its `sh` and `ash` entrypoints are
+executable BusyBox copies, while other enabled applets use small scripts with
+`#!/bin/busybox sh`. Only compiled applets are installed; no fake `bash` alias
+is generated. Extra copies of the shell binary are the FAT space tradeoff.
+Ext4 continues to use symlinks.
+
+Existing FAT images must be regenerated to replace their recursive `/bin/sh`
+wrapper. Until then, use `/bin/busybox sh` directly. Reinstall applets without
+rebuilding BusyBox, then create a fresh image:
+
+```bash
+scripts/install-busybox-applets.sh target/busybox-build/busybox target/rootfs fat
+cargo run -Z bindeps -- mkdisk target/rootfs target/root-fat.vhd --format fat
+```
+
+The kernel permits up to four interpreter redirects, then rejects the exec with
+`ELOOP` rather than looping forever. This also protects against old recursive
+scripts. Errors when launching from the kernel shell are logged with their
+errno and the child exits with status 127; the parent shell remains responsive.
+This fix does not implement missing userspace fork/exec behavior (#48/#49);
+commands executed *inside* BusyBox's shell and non-shell wrapper applets still
+depend on those separate fixes.
+
+Run the bounded FAT shell regression with an existing native BusyBox binary:
+
+```bash
+scripts/test-fat-shell.sh target/rootfs/bin/busybox
+```
+
+It verifies ext4-to-FAT applet installation, real `sh`/`ash` execution, valid
+one/four-level script loading, self/two-script loops, over-limit chains, and
+parent-shell recovery on BIOS and UEFI. The test uses an owned temporary image,
+QEMU snapshots, and unchanged-image hash checks.
 
 Each image also gets a `<image>.boot.toml` sidecar selecting its root filesystem
 and device. The launcher reads this automatically and includes it in the boot

@@ -265,44 +265,14 @@ mkdir -p \
     "$ROOTFS/proc"  \
     "$ROOTFS/dev"
 
-# Install the busybox binary
-cp "$BUSYBOX_BIN" "$ROOTFS/bin/busybox"
-chmod +x "$ROOTFS/bin/busybox"
-
-# Tools to expose from busybox
-TOOLS=(
-    ash sh bash
-    ls cat echo cp mv rm mkdir rmdir ln touch
-    grep sed awk cut sort uniq head tail wc
-    find xargs
-    stat chmod chown
-    ps kill
-    env printenv
-    date sleep true false
-    hexdump od strings
-    gzip gunzip tar
-    wget
-)
+bash "$(dirname "$0")/install-busybox-applets.sh" "$BUSYBOX_BIN" "$ROOTFS" "$DISK_FORMAT"
 
 if [[ "$DISK_FORMAT" == "ext4" ]]; then
-    # ext4 supports symlinks — use the canonical busybox multi-call approach.
-    info "Creating symlinks for busybox applets..."
-    for tool in "${TOOLS[@]}"; do
-        [[ "$tool" == "busybox" ]] && continue
-        ln -sf /bin/busybox "$ROOTFS/bin/$tool"
-    done
     # /sbin/init → busybox sh
     ln -sf /bin/busybox "$ROOTFS/sbin/init"
 else
-    # FAT has no symlinks — use small wrapper scripts instead.
-    info "Creating wrapper scripts for busybox applets (FAT has no symlinks)..."
-    for tool in "${TOOLS[@]}"; do
-        [[ "$tool" == "busybox" ]] && continue
-        printf '#!/bin/sh\nexec /bin/busybox %s "$@"\n' "$tool" > "$ROOTFS/bin/$tool"
-        chmod +x "$ROOTFS/bin/$tool"
-    done
     # /sbin/init wrapper
-    printf '#!/bin/sh\nexec /bin/busybox sh "$@"\n' > "$ROOTFS/sbin/init"
+    printf '#!/bin/busybox sh\nexec /bin/busybox sh "$@"\n' > "$ROOTFS/sbin/init"
     chmod +x "$ROOTFS/sbin/init"
 fi
 
