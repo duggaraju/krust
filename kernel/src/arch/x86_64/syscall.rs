@@ -201,6 +201,8 @@ extern "C" fn syscall_dispatch_from_regs(number: u64, regs: *const SavedRegs) ->
     if let Some(gs_base) =
         crate::process::with_current_task_mut(|task| task.context.thread_local_base(false))
     {
+        // A faulting child can resume this syscall from an unswapped interrupt entry.
+        GsBase::write(VirtAddr::from_ptr(core::ptr::addr_of!(SYSCALL_CPU_LOCAL)));
         KernelGsBase::write(VirtAddr::new(gs_base));
     }
     result

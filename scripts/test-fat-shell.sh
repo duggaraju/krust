@@ -171,7 +171,11 @@ for mode in bios uefi; do
     [[ "$trace" == "$work"/krust-trace-*.log && -f "$trace" ]]
     [[ "$(grep -c 'interpreter redirect limit exceeded' "$trace")" == 3 ]]
     [[ "$(grep -c 'errno -40' "$trace")" == 3 ]]
-    ! grep -Eq 'Kernel panic|EXCEPTION:' "$trace"
+    ! grep -q 'Kernel panic' "$trace"
+    [[ "$(grep -c 'EXCEPTION:' "$trace")" == 1 ]]
+    [[ "$(grep -c 'EXCEPTION: PAGE FAULT' "$trace")" == 1 ]]
+    [[ "$(grep -c 'Error Code:.*USER_MODE' "$trace")" == 1 ]]
+    [[ "$(grep -c 'page fault in user task' "$trace")" == 1 ]]
     cp "$trace" "target/fat-shell-$mode-kernel.log"
     [[ "$(sha256sum "$work/disk.vhd")" == "$before" ]]
     echo "$mode FAT shell and bounded interpreter redirects passed"

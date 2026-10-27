@@ -115,6 +115,15 @@ __attribute__((noreturn)) void process_main(usize *stack)
         check(result.status == (42 << 8) && result.guard == 0xfeedcafe);
         check(call(61, child, (usize)&result.status, 1, 0, 0, 0) == -10);
     }
+    long child = fork_registers();
+    check(child >= 0);
+    if (child == 0) {
+        __asm__ volatile("movq $1, (%0)" : : "r"(0UL) : "memory");
+        check(0);
+    }
+    check(call(61, child, (usize)&result.status, 0, 0, 0, 0) == child);
+    check(result.status == (139 << 8) && result.guard == 0xfeedcafe);
+    check(call(39, 0, 0, 0, 0, 0, 0) > 0);
     message("KRUST_PROCESS_OK\n");
     finish(0);
 }
