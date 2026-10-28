@@ -54,6 +54,9 @@ cargo run -Z bindeps -- run uefi --vhd ./target/krust-disk-fat.vhd -- --display 
 
 See [storage and boot configuration](storage.md) to create a disk and configure
 root selection or mounts.
+Use `init=/bin/sh` before any raw-QEMU `--` arguments to choose the PID 1
+executable. Without an override, `/sbin/init` is used when present; otherwise
+the kernel shell runs as PID 1. `KRUST_BOOT_INIT` provides a build-time default.
 
 If the VHD is locked, identify and stop the previous QEMU process:
 

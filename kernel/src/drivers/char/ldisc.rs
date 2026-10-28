@@ -24,20 +24,92 @@ use alloc::vec::Vec;
 /// Maximum bytes held in the canonical line buffer before a forced flush.
 const CANON_BUF_MAX: usize = 4096;
 
+pub const TCGETS: usize = 0x5401;
+pub const TCSETS: usize = 0x5402;
+pub const TCSETSW: usize = 0x5403;
+pub const TCSETSF: usize = 0x5404;
+pub const TCGETS2: usize = 0x802C_542A;
+pub const TCSETS2: usize = 0x402C_542B;
+pub const TCSETSW2: usize = 0x402C_542C;
+pub const TCSETSF2: usize = 0x402C_542D;
+
+pub const ISIG: u32 = 1;
+pub const ICANON: u32 = 2;
+pub const ECHO: u32 = 8;
+const ICRNL: u32 = 0x100;
+const OPOST: u32 = 1;
+const ONLCR: u32 = 4;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Termios {
+    pub c_iflag: u32,
+    pub c_oflag: u32,
+    pub c_cflag: u32,
+    pub c_lflag: u32,
+    pub c_line: u8,
+    pub c_cc: [u8; 19],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Termios2 {
+    pub termios: Termios,
+    pub c_ispeed: u32,
+    pub c_ospeed: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<Termios>() == 36);
+const _: () = assert!(core::mem::size_of::<Termios2>() == 44);
+
+impl Termios2 {
+    pub fn as_bytes(&self) -> &[u8] {
+        // Both ABI structures contain only initialized integers and no padding.
+        unsafe {
+            core::slice::from_raw_parts(
+                core::ptr::from_ref(self).cast(),
+                core::mem::size_of::<Self>(),
+            )
+        }
+    }
+
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        // Every bit pattern is valid for these integer-only ABI structures.
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                core::ptr::from_mut(self).cast(),
+                core::mem::size_of::<Self>(),
+            )
+        }
+    }
+}
+
+impl Default for Termios2 {
+    fn default() -> Self {
+        let mut c_cc = [0; 19];
+        c_cc[..7].copy_from_slice(&[3, 28, 127, 21, 4, 0, 1]);
+        c_cc[8] = 17;
+        c_cc[9] = 19;
+        c_cc[10] = 26;
+        Self {
+            termios: Termios {
+                c_iflag: ICRNL,
+                c_oflag: OPOST | ONLCR,
+                c_cflag: 0x8bf, // B38400 | CS8 | CREAD | CLOCAL
+                c_lflag: ISIG | ICANON | ECHO,
+                c_line: 0,
+                c_cc,
+            },
+            c_ispeed: 38400,
+            c_ospeed: 38400,
+        }
+    }
+}
+
 /// A line discipline instance.  One is embedded in each VirtualConsole and in
 /// the `PtyShared` struct so both tty and pty paths share identical semantics.
 pub struct LineDiscipline {
-    // ── flags ─────────────────────────────────────────────────────────────────
-    /// Echo input back to the output side.
-    pub echo: bool,
-    /// Canonical (line-buffered) mode; when false → raw mode.
-    pub canonical: bool,
-    /// Output: translate `\n` → `\r\n`.
-    pub onlcr: bool,
-    /// Input: translate `\r` → `\n`.
-    pub icrnl: bool,
-    /// Input: Ctrl-C sends signal (discard line, echo `^C`).
-    pub isig: bool,
+    settings: Termios2,
 
     // ── buffers ───────────────────────────────────────────────────────────────
     /// Canonical line buffer — bytes accumulate here until a newline.
@@ -50,14 +122,26 @@ impl LineDiscipline {
     /// Create a discipline with standard defaults (canonical, echo, ONLCR, ICRNL).
     pub fn new() -> Self {
         Self {
-            echo: true,
-            canonical: true,
-            onlcr: true,
-            icrnl: true,
-            isig: true,
+            settings: Termios2::default(),
             canon_buf: Vec::new(),
             read_queue: VecDeque::new(),
         }
+    }
+
+    pub fn terminal_settings(&self) -> Termios2 {
+        self.settings
+    }
+
+    pub fn set_terminal_settings(&mut self, settings: Termios2, flush: bool) {
+        if flush {
+            self.canon_buf.clear();
+            self.read_queue.clear();
+        } else if self.settings.termios.c_lflag & ICANON != 0
+            && settings.termios.c_lflag & ICANON == 0
+        {
+            self.read_queue.extend(self.canon_buf.drain(..));
+        }
+        self.settings = settings;
     }
 
     // ── Input path ────────────────────────────────────────────────────────────
@@ -68,15 +152,16 @@ impl LineDiscipline {
     /// (e.g. the screen or the PTY manager's read channel).  The caller is
     /// responsible for delivering any echo bytes to the appropriate sink.
     pub fn process_input(&mut self, byte: u8) -> EchoBytes {
-        let byte = if self.icrnl && byte == b'\r' {
+        let echo = self.settings.termios.c_lflag & ECHO != 0;
+        let byte = if self.settings.termios.c_iflag & ICRNL != 0 && byte == b'\r' {
             b'\n'
         } else {
             byte
         };
 
-        if !self.canonical {
+        if self.settings.termios.c_lflag & ICANON == 0 {
             self.read_queue.push_back(byte);
-            if self.echo {
+            if echo {
                 return EchoBytes::One(byte);
             }
             return EchoBytes::None;
@@ -93,16 +178,16 @@ impl LineDiscipline {
 
             // ERASE — backspace / DEL
             0x08 | 0x7f => {
-                if self.canon_buf.pop().is_some() && self.echo {
+                if self.canon_buf.pop().is_some() && echo {
                     return EchoBytes::Erase; // "\x08 \x08"
                 }
                 return EchoBytes::None;
             }
 
             // INTR — Ctrl-C: send SIGTERM
-            0x03 if self.isig => {
+            0x03 if self.settings.termios.c_lflag & ISIG != 0 => {
                 self.canon_buf.clear();
-                if self.echo {
+                if echo {
                     return EchoBytes::CtrlC; // "^C\n"
                 }
                 return EchoBytes::None;
@@ -112,7 +197,7 @@ impl LineDiscipline {
             0x15 => {
                 let had = !self.canon_buf.is_empty();
                 self.canon_buf.clear();
-                if had && self.echo {
+                if had && echo {
                     return EchoBytes::KillLine;
                 }
                 return EchoBytes::None;
@@ -125,7 +210,7 @@ impl LineDiscipline {
                     self.read_queue.push_back(b);
                 }
                 self.canon_buf.clear();
-                if self.echo {
+                if echo {
                     return EchoBytes::One(b'\n');
                 }
                 return EchoBytes::None;
@@ -136,7 +221,7 @@ impl LineDiscipline {
                 if self.canon_buf.len() < CANON_BUF_MAX {
                     self.canon_buf.push(byte);
                 }
-                if self.echo {
+                if echo {
                     return EchoBytes::One(byte);
                 }
                 return EchoBytes::None;
@@ -164,7 +249,7 @@ impl LineDiscipline {
     /// discipline (e.g. ONLCR) and append them to `out`.
     pub fn process_output(&self, input: &[u8], out: &mut Vec<u8>) {
         for &byte in input {
-            if self.onlcr && byte == b'\n' {
+            if self.settings.termios.c_oflag & (OPOST | ONLCR) == (OPOST | ONLCR) && byte == b'\n' {
                 out.push(b'\r');
             }
             out.push(byte);

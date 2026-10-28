@@ -341,14 +341,20 @@ impl Guest {
     }
     fn try_send(&mut self, command: &str) -> Result<(), String> {
         assert!(!command.contains('\n'));
+        // Interactive serial readers must receive the command and newline together.
+        self.try_send_bytes(format!("{command}\n").as_bytes())
+    }
+    pub fn send_bytes(&mut self, bytes: &[u8]) {
+        self.try_send_bytes(bytes).expect("write guest input");
+    }
+    fn try_send_bytes(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.trace_offset = fs::metadata(&self.trace)
             .map_err(|error| format!("kernel log: {error}"))?
             .len() as usize;
-        // Interactive serial readers must receive the command and newline together.
         self.input
             .as_mut()
             .expect("guest stdin")
-            .write_all(format!("{command}\n").as_bytes())
+            .write_all(bytes)
             .map_err(|error| format!("guest stdin: {error}"))
     }
     pub fn command(&mut self, command: &str) -> String {

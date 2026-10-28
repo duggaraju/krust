@@ -126,8 +126,7 @@ pub fn userspace() {
         return;
     }
     let work = Workspace::new("userspace");
-    let disk = fixture("KRUST_TEST_DISK", "target/krust-disk-ext4.vhd");
-    let _unchanged = UnchangedDisk::new(&disk);
+    let (disk, _unchanged) = copied_disk(&work);
     for firmware in FIRMWARE {
         for probe in &probes {
             smoke(
@@ -208,6 +207,20 @@ pub fn copied_disk(work: &Workspace) -> (std::path::PathBuf, UnchangedDisk) {
     let unchanged = UnchangedDisk::new(&source);
     let disk = work.scratch.join("disk.vhd");
     fs::copy(source, &disk).unwrap();
+    checked(
+        Command::new("debugfs")
+            .args(["-w", "-R", "rm /sbin/init"])
+            .arg(&disk),
+    );
+    let init = checked(
+        Command::new("debugfs")
+            .args(["-R", "stat /sbin/init"])
+            .arg(&disk),
+    );
+    assert!(
+        init.stdout.is_empty(),
+        "kernel-shell fixture still contains /sbin/init"
+    );
     (disk, unchanged)
 }
 
@@ -520,6 +533,206 @@ fn subprocess_listing(output: &str, marker: &str) {
         !matches(r"not found|Usage:|errno|status", output),
         "{output}"
     );
+}
+
+pub fn init_process() {
+    let work = Workspace::new("init");
+    prepare_root(&work);
+    fs::create_dir(work.root().join("sbin")).unwrap();
+    for name in ["initest", "altinit", "exitinit", "faultini"] {
+        fs::copy(
+            env!("CARGO_BIN_FILE_GUEST_init_probe"),
+            work.root().join("bin").join(name),
+        )
+        .unwrap();
+    }
+    fs::write(work.root().join("bin/badinit"), "not an executable\n").unwrap();
+    for format in ["fat", "ext4"] {
+        let init = work.root().join("sbin/init");
+        let default_argv0 = if format == "ext4" {
+            std::os::unix::fs::symlink("/bin/initest", &init).unwrap();
+            "/sbin/init"
+        } else {
+            fs::write(&init, "#!/bin/initest\n").unwrap();
+            "/bin/initest"
+        };
+        let disk = work.mkdisk(format);
+        {
+            let _unchanged = UnchangedDisk::new(&disk);
+            for firmware in FIRMWARE {
+                for (selection, expected) in [
+                    (None, default_argv0),
+                    (Some("init=/bin/altinit"), "/bin/altinit"),
+                ] {
+                    let extra = selection.map(std::ffi::OsStr::new);
+                    let extra = extra.iter().copied().collect::<Vec<_>>();
+                    let mut guest = Guest::start(
+                        &work,
+                        &format!(
+                            "{format}-{firmware}-{}",
+                            if selection.is_some() {
+                                "override"
+                            } else {
+                                "default"
+                            }
+                        ),
+                        firmware,
+                        Some(&disk),
+                        &extra,
+                    );
+                    guest.finish(0);
+                    assert!(
+                        guest
+                            .console
+                            .lines()
+                            .any(|line| line == format!("KRUST_INIT_ARGV0={expected}"))
+                            && guest.console.contains("KRUST_INIT_PID1_OK"),
+                        "{}",
+                        guest.console
+                    );
+                    assert!(!guest.console.contains("krust kernel shell"));
+                    assert!(!has_kernel_errors(&guest.kernel()), "{}", guest.kernel());
+                    assert!(guest.kernel().contains("execve: entering usermode pid=1"));
+                }
+                if format == "ext4" {
+                    for (path, expected) in [
+                        ("/bin/missing", "errno -2"),
+                        ("/bin/badinit", "errno -8"),
+                        ("/bin/exitinit", "PID 1 terminated with status 42"),
+                        ("/bin/faultini", "PID 1 terminated with status 139"),
+                    ] {
+                        let argument = format!("init={path}");
+                        let mut guest = Guest::start(
+                            &work,
+                            &format!("{format}-{firmware}-{}", path.rsplit('/').next().unwrap()),
+                            firmware,
+                            Some(&disk),
+                            &[argument.as_ref()],
+                        );
+                        guest.finish(1);
+                        assert!(guest.kernel().contains(expected), "{}", guest.kernel());
+                        assert!(!guest.console.contains("krust kernel shell"));
+                    }
+                }
+            }
+        }
+        fs::remove_file(init).unwrap();
+        let disk = work.mkdisk(format);
+        let _unchanged = UnchangedDisk::new(&disk);
+        for firmware in FIRMWARE {
+            let mut guest = Guest::start(
+                &work,
+                &format!("{format}-{firmware}-fallback"),
+                firmware,
+                Some(&disk),
+                &[],
+            );
+            guest.boot();
+            let tasks = guest.command("ps");
+            assert!(matches(r"(?m)^1 +0 +Running +shell$", &tasks), "{tasks}");
+            assert!(!matches(r"(?m)^[0-9]+ +[0-9]+ +[^ ]+ +root$", &tasks));
+            assert_eq!(guest.command("/bin/busybox sh -c pwd"), "/");
+            guest.shutdown("exit");
+            assert!(!has_kernel_errors(&guest.kernel()), "{}", guest.kernel());
+        }
+    }
+}
+
+pub fn init_shell() {
+    let work = Workspace::new("init-shell");
+    prepare_root(&work);
+    fs::create_dir(work.root().join("sbin")).unwrap();
+    fs::write(
+        work.root().join("sbin/init"),
+        "#!/bin/busybox sh\nexec /bin/busybox sh \"$@\"\n",
+    )
+    .unwrap();
+    for format in ["fat", "ext4"] {
+        let disk = work.mkdisk(format);
+        let _unchanged = UnchangedDisk::new(&disk);
+        for firmware in FIRMWARE {
+            let mut guest = Guest::start(
+                &work,
+                &format!("{format}-{firmware}"),
+                firmware,
+                Some(&disk),
+                &[],
+            );
+            guest.until("# ").expect("PID 1 userspace shell prompt");
+            guest.send("echo KRUST_INIT_SHELL_PID=$$");
+            let output = guest.until("# ").expect("PID 1 echo response");
+            assert_eq!(
+                output.matches("echo KRUST_INIT_SHELL_PID=$$").count(),
+                1,
+                "{output}"
+            );
+            assert!(
+                output.lines().any(|line| line == "KRUST_INIT_SHELL_PID=1"),
+                "{output}"
+            );
+            guest.send("/bin/busybox pwd");
+            let output = guest.until("# ").expect("PID 1 external command response");
+            assert!(output.lines().any(|line| line == "/"), "{output}");
+            guest.send("exit");
+            guest.finish(1);
+            assert!(guest.kernel().contains("PID 1 terminated with status 0"));
+            assert!(!has_kernel_errors(&guest.kernel()), "{}", guest.kernel());
+        }
+    }
+}
+
+pub fn terminal_console() {
+    let work = Workspace::new("terminal");
+    prepare_root(&work);
+    fs::copy(
+        env!("CARGO_BIN_FILE_GUEST_init_probe"),
+        work.root().join("bin/ttytest"),
+    )
+    .unwrap();
+    for format in ["fat", "ext4"] {
+        let disk = work.mkdisk(format);
+        let _unchanged = UnchangedDisk::new(&disk);
+        for firmware in FIRMWARE {
+            let mut guest = Guest::start(
+                &work,
+                &format!("{format}-{firmware}"),
+                firmware,
+                Some(&disk),
+                &[std::ffi::OsStr::new("init=/bin/ttytest")],
+            );
+            for _ in 0..2 {
+                guest
+                    .until("KRUST_TTY_RAW_READY")
+                    .expect("raw terminal ready");
+                std::thread::sleep(std::time::Duration::from_millis(1200));
+                guest.send_bytes(b"A");
+                let output = guest
+                    .until("KRUST_TTY_COOKED_READY")
+                    .expect("raw read finished");
+                assert!(
+                    !output
+                        .strip_suffix("KRUST_TTY_COOKED_READY")
+                        .unwrap()
+                        .contains('A'),
+                    "{output}"
+                );
+                guest.send_bytes(b"abc");
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                guest.send_bytes(b"\n");
+                let output = guest
+                    .until("KRUST_TTY_QUIET_READY")
+                    .expect("canonical read finished");
+                assert_eq!(output.matches("abc").count(), 1, "{output}");
+                guest.send_bytes(b"secret\n");
+                let output = guest
+                    .until("KRUST_TTY_DEVICE_OK")
+                    .expect("quiet read finished");
+                assert!(!output.contains("secret"), "{output}");
+            }
+            guest.finish(0);
+            assert!(!has_kernel_errors(&guest.kernel()), "{}", guest.kernel());
+        }
+    }
 }
 
 pub fn boot_mounts() {

@@ -5,6 +5,10 @@ use core::{ptr, slice, str};
 use log::{info, warn};
 use x86_64::instructions::hlt;
 
+#[cfg(feature = "drivers")]
+use crate::drivers::char::ldisc::{
+    TCGETS, TCGETS2, TCSETS, TCSETS2, TCSETSF, TCSETSF2, TCSETSW, TCSETSW2, Termios, Termios2,
+};
 use crate::syscall::dispatch::SyscallArgs;
 use crate::syscall::impls;
 
@@ -41,28 +45,6 @@ struct WinSize {
     ws_col: u16,
     ws_xpixel: u16,
     ws_ypixel: u16,
-}
-
-#[repr(C)]
-struct Termios2 {
-    c_iflag: u32,
-    c_oflag: u32,
-    c_cflag: u32,
-    c_lflag: u32,
-    c_line: u8,
-    c_cc: [u8; 19],
-    c_ispeed: u32,
-    c_ospeed: u32,
-}
-
-#[repr(C)]
-struct Termios {
-    c_iflag: u32,
-    c_oflag: u32,
-    c_cflag: u32,
-    c_lflag: u32,
-    c_line: u8,
-    c_cc: [u8; 19],
 }
 
 #[repr(C)]
@@ -108,8 +90,6 @@ struct KernelSigaction {
 const TIOCGWINSZ: usize = 0x5413;
 const TIOCGPGRP: usize = 0x540F;
 const TIOCSPGRP: usize = 0x5410;
-const TCGETS: usize = 0x5401;
-const TCGETS2: usize = 0x802C_542A;
 const AT_FDCWD: i32 = -100;
 const POLLIN: i16 = 0x0001;
 const POLLOUT: i16 = 0x0004;
@@ -415,48 +395,38 @@ pub fn sys_ioctl(args: &SyscallArgs) -> isize {
                 .map(|_| 0)
                 .unwrap_or_else(|errno| errno)
         }
-        TCGETS => {
-            if argp == 0 {
-                return -14;
-            }
-            unsafe {
-                ptr::write(
-                    argp as *mut Termios,
-                    Termios {
-                        c_iflag: 0,
-                        c_oflag: 0,
-                        c_cflag: 0,
-                        c_lflag: 0,
-                        c_line: 0,
-                        c_cc: [0; 19],
-                    },
-                );
-            }
-            0
-        }
-        TCGETS2 => {
-            if argp == 0 {
-                return -14;
-            }
-            unsafe {
-                ptr::write(
-                    argp as *mut Termios2,
-                    Termios2 {
-                        c_iflag: 0,
-                        c_oflag: 0,
-                        c_cflag: 0,
-                        c_lflag: 0,
-                        c_line: 0,
-                        c_cc: [0; 19],
-                        c_ispeed: 0,
-                        c_ospeed: 0,
-                    },
-                );
-            }
-            0
+        #[cfg(feature = "drivers")]
+        TCGETS | TCGETS2 | TCSETS | TCSETSW | TCSETSF | TCSETS2 | TCSETSW2 | TCSETSF2 => {
+            terminal_ioctl(args.arg0, request, argp).unwrap_or_else(|errno| errno)
         }
         _ => -25,
     }
+}
+
+#[cfg(feature = "drivers")]
+fn terminal_ioctl(fd: usize, request: usize, address: usize) -> Result<isize, isize> {
+    use crate::fs::vfs::FsError;
+    let errno = |error| match error {
+        FsError::NotSupported => -25,
+        other => impls::errno_from_fs(other),
+    };
+    let mut settings = crate::process::with_fd(fd, |file| file.terminal_settings().map_err(errno))?;
+    let extended = matches!(request, TCGETS2 | TCSETS2 | TCSETSW2 | TCSETSF2);
+    let length = if extended {
+        core::mem::size_of::<Termios2>()
+    } else {
+        core::mem::size_of::<Termios>()
+    };
+    if matches!(request, TCGETS | TCGETS2) {
+        super::user_memory::copy_to(address, &settings.as_bytes()[..length])?;
+    } else {
+        super::user_memory::copy_from(address, &mut settings.as_bytes_mut()[..length])?;
+        let flush = matches!(request, TCSETSF | TCSETSF2);
+        crate::process::with_fd(fd, |file| {
+            file.set_terminal_settings(settings, flush).map_err(errno)
+        })?;
+    }
+    Ok(0)
 }
 
 pub fn sys_close(args: &SyscallArgs) -> isize {

@@ -5,6 +5,58 @@
 
 Run all commands from the repository root.
 
+## Init selection and PID 1
+
+```bash
+cargo test -Z bindeps --locked -p krust --test qemu init_process -- --ignored --exact --nocapture
+```
+
+The init fixture checks PID 1, parent PID 0, process group, cwd, initial argv,
+environment, and inherited console output. FAT/shebang and ext4/symlink init
+selection and explicit `init=` overrides run on BIOS and UEFI. The suite also
+checks missing/invalid explicit init failures, PID 1 exit/fault failures, and
+the kernel-shell PID 1 fallback when `/sbin/init` is absent. All images are
+owned test fixtures; there is no placeholder supervisor task.
+
+The real BusyBox init-wrapper regression boots FAT and ext4 fixtures on both
+firmware modes, checks `$$` is 1, runs an external applet, and verifies that
+exiting PID 1 stops the kernel with failure. Syscall tracing stays disabled so
+an idle serial console cannot accidentally appear as EOF between commands.
+
+```bash
+cargo test -Z bindeps --locked -p krust --test qemu init_shell -- --ignored --exact --nocapture
+KRUST_TEST_BUSYBOX=target/rootfs-glibc/bin/busybox \
+  cargo test -Z bindeps --locked -p krust --test qemu init_shell -- --ignored --exact --nocapture
+```
+
+Serial and virtual-console file reads wait for input; internal hardware polling
+stays nonblocking. Empty console reads use the existing interrupt/HLT idle wait,
+not a CPU spin loop. The PIT currently wakes idle reads every 10 ms to check for
+input, so this is not yet a per-device interrupt-driven scheduler wait queue.
+The init probe also checks that zero-length terminal reads still return immediately.
+
+## Terminal echo and idle reads
+
+```bash
+cargo test -Z bindeps --locked -p krust --test terminal
+cargo test -Z bindeps --locked -p krust --test qemu terminal_console -- --ignored --exact --nocapture
+```
+
+The host tests exercise the Linux termios layouts, raw/canonical transitions,
+echo suppression/restoration, pending-input flushing, and output translation.
+The guest probe checks real serial and virtual-console devices on FAT/ext4 and
+BIOS/UEFI: all `TCGETS`/`TCSETS*` and extended variants, invalid descriptors and
+user buffers, raw reads before newline, canonical reads through newline, and
+single/no echo as configured. Delayed input must wait at least 50 guest ticks,
+with CPU usage bounded to one quarter of elapsed ticks plus two rounding ticks.
+The BusyBox init-shell test also requires exactly one echo of its typed command.
+
+Terminal settings belong to the device and are shared by aliases such as
+`/dev/console`; the shell can disable `ECHO` and `ICANON` while its line editor
+is active and restore them afterward. This implements the existing line
+discipline flags, not complete termios support (for example, baud changes and
+`VMIN`/`VTIME` timeout semantics are not implemented).
+
 ## BusyBox shell and process regression
 
 ```bash
@@ -116,6 +168,8 @@ period, then kills remaining group members and reaps the runner. Generated boot
 images, ramdisks, and traces are confined to an exclusively created directory
 under the owned test workspace, removed on success, assertion failure, or timeout.
 Abrupt termination of the entire test process does not run Rust destructors.
+Kernel-shell suites make an owned ext4 copy with `/sbin/init` removed so that
+the kernel-shell fallback, rather than a rootfs's userspace init, is exercised.
 The source VHD hash is checked on every exit after its initial hash, including
 failures; a changed/unreadable VHD fails even an otherwise successful suite.
 Serial logs and copied kernel traces remain in the unique `userspace-*` directory

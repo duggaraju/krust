@@ -267,14 +267,9 @@ mkdir -p \
 
 bash "$(dirname "$0")/install-busybox-applets.sh" "$BUSYBOX_BIN" "$ROOTFS" "$DISK_FORMAT"
 
-if [[ "$DISK_FORMAT" == "ext4" ]]; then
-    # /sbin/init → busybox sh
-    ln -sf /bin/busybox "$ROOTFS/sbin/init"
-else
-    # /sbin/init wrapper
-    printf '#!/bin/busybox sh\nexec /bin/busybox sh "$@"\n' > "$ROOTFS/sbin/init"
-    chmod +x "$ROOTFS/sbin/init"
-fi
+# The BusyBox init applet is disabled; boot a userspace shell instead.
+printf '#!/bin/busybox sh\nexec /bin/busybox sh "$@"\n' > "$ROOTFS/sbin/init"
+chmod +x "$ROOTFS/sbin/init"
 
 # Minimal /etc/passwd and /etc/group
 cat > "$ROOTFS/etc/passwd" <<'EOF'

@@ -1,5 +1,6 @@
 extern crate alloc;
 
+use super::char::ldisc::Termios2;
 use crate::fs::vfs::SeekFrom;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -85,6 +86,16 @@ pub trait Device: Send + Sync {
         Ok(())
     }
     fn read(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize, DeviceError> {
+        Err(DeviceError::NotSupported)
+    }
+    /// File reads may block on terminals; hardware polling must use `read`.
+    fn read_blocking(&self, offset: usize, buf: &mut [u8]) -> Result<usize, DeviceError> {
+        self.read(offset, buf)
+    }
+    fn terminal_settings(&self) -> Result<Termios2, DeviceError> {
+        Err(DeviceError::NotSupported)
+    }
+    fn set_terminal_settings(&self, _settings: Termios2, _flush: bool) -> Result<(), DeviceError> {
         Err(DeviceError::NotSupported)
     }
     fn write(&self, _offset: usize, _buf: &[u8]) -> Result<usize, DeviceError> {

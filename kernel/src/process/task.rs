@@ -462,6 +462,13 @@ impl Task {
     }
 
     pub fn set_exit_code(&mut self, code: i32) {
+        if self.pid == super::ROOT_PID && self.userland {
+            log::error!(
+                "init: PID 1 terminated with status {}; shutting down kernel",
+                code
+            );
+            crate::arch::shutdown(crate::arch::ShutdownStatus::Failure);
+        }
         self.exit_code = code;
         let address = core::mem::take(&mut self.clear_child_tid);
         if address != 0 {

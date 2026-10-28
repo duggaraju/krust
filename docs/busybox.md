@@ -20,7 +20,9 @@ cargo run -Z bindeps -- run uefi --headless --vhd target/krust-disk-glibc-ext4.v
 The binary must be a static, non-PIE x86-64 ELF executable (`readelf -h` reports
 `EXEC`, and `readelf -l` has no `INTERP`). No shared libc or dynamic linker needs
 to be installed in the rootfs. From the kernel shell, invoke `/bin/busybox`
-with an applet name or `/bin/busybox sh`.
+with an applet name or `/bin/busybox sh` when using a kernel-shell root.
+Generated images instead boot the shell-based `/sbin/init` as PID 1; see
+[init selection](storage.md#pid-1-and-init).
 
 The initial stack keeps argc/argv/envp/auxv contiguous and 16-byte aligned, and
 the kernel clears the dynamic-linker finalizer register (`RDX`) on static exec.
@@ -55,6 +57,13 @@ FAT has no symlinks: its `sh` and `ash` entrypoints are executable BusyBox
 copies, while other enabled applets use small scripts with `#!/bin/busybox sh`.
 Only compiled applets are installed; no fake `bash` alias is generated. Extra
 copies of the shell binary are the FAT space tradeoff. Ext4 uses symlinks.
+
+The setup script writes `/sbin/init` as a small `exec /bin/busybox sh` script on
+**both** filesystems. The BusyBox `init` applet is disabled, so a symlink named
+`/sbin/init` to BusyBox would select an unavailable applet, not `sh`. Rebuild
+older ext4 images containing that symlink before using automatic init startup.
+This shell-based init is not BusyBox's full service-managing init, and exiting
+it terminates PID 1 and stops the kernel.
 
 Existing FAT images must be regenerated to replace their recursive `/bin/sh`
 wrapper. Until then, use `/bin/busybox sh` directly. Reinstall applets without

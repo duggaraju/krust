@@ -899,6 +899,28 @@ impl OpenFile {
         self.append
     }
 
+    #[cfg(feature = "drivers")]
+    pub fn terminal_settings(&self) -> Result<crate::drivers::char::ldisc::Termios2, FsError> {
+        self.lookup_device()
+            .ok_or(FsError::NotSupported)?
+            .device
+            .terminal_settings()
+            .map_err(fs_error_from_device)
+    }
+
+    #[cfg(feature = "drivers")]
+    pub fn set_terminal_settings(
+        &self,
+        settings: crate::drivers::char::ldisc::Termios2,
+        flush: bool,
+    ) -> Result<(), FsError> {
+        self.lookup_device()
+            .ok_or(FsError::NotSupported)?
+            .device
+            .set_terminal_settings(settings, flush)
+            .map_err(fs_error_from_device)
+    }
+
     pub fn descriptor(&self, mode: FileOpenMode) -> FileDescriptor {
         let (major, minor) = self.inode.device_numbers().unwrap_or((0, 0));
         FileDescriptor {
@@ -988,7 +1010,7 @@ impl File for OpenFile {
         let bytes_read = if let Some(device) = self.lookup_device() {
             device
                 .device
-                .read(self.cursor, buf)
+                .read_blocking(self.cursor, buf)
                 .map_err(fs_error_from_device)?
         } else {
             self.inode.read(self.cursor, buf)?

@@ -43,3 +43,9 @@ name = "process"
 path = "src/process.rs"
 test = false
 bench = false
+
+[[bin]]
+name = "init_probe"
+path = "src/init.rs"
+test = false
+bench = false

@@ -1,6 +1,4 @@
-use super::qemu::{
-    Guest, UnchangedDisk, Workspace, clean_response, fixture, has_kernel_errors, matches,
-};
+use super::qemu::{Guest, Workspace, clean_response, has_kernel_errors, matches};
 
 #[derive(Clone, Debug)]
 pub enum Check {
@@ -230,9 +228,8 @@ pub fn cases(ramfs: bool) -> Vec<Case> {
 }
 
 pub fn run() {
-    let disk = fixture("KRUST_TEST_DISK", "target/krust-disk-ext4.vhd");
-    let _unchanged = UnchangedDisk::new(&disk);
     let work = Workspace::new("shell");
+    let (disk, _unchanged) = super::suites::copied_disk(&work);
     for firmware in ["bios", "uefi"] {
         for ramfs in [false, true] {
             let label = format!("{firmware}-{}", if ramfs { "ramfs" } else { "disk" });

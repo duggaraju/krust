@@ -1,6 +1,6 @@
 mod support;
 
-const GUEST_BINARIES: [(&str, &str); 6] = [
+const GUEST_BINARIES: [(&str, &str); 7] = [
     ("KRUST_GUEST_TMPFS", env!("CARGO_BIN_FILE_GUEST_tmpfs")),
     (
         "KRUST_GUEST_CLOEXEC_BEFORE",
@@ -16,6 +16,7 @@ const GUEST_BINARIES: [(&str, &str); 6] = [
         env!("CARGO_BIN_FILE_GUEST_mmap_protection"),
     ),
     ("KRUST_GUEST_PROCESS", env!("CARGO_BIN_FILE_GUEST_process")),
+    ("KRUST_GUEST_INIT", env!("CARGO_BIN_FILE_GUEST_init_probe")),
 ];
 
 #[test]
@@ -95,6 +96,9 @@ macro_rules! guest_suite {
 }
 
 guest_suite!(shell_process, support::suites::shell_process);
+guest_suite!(init_process, support::suites::init_process);
+guest_suite!(init_shell, support::suites::init_shell);
+guest_suite!(terminal_console, support::suites::terminal_console);
 guest_suite!(boot_mounts, support::suites::boot_mounts);
 guest_suite!(tmpfs, support::suites::tmpfs);
 guest_suite!(shell_commands, support::shell::run);

@@ -52,13 +52,13 @@ struct RunArgs {
     #[arg(long, value_name = "PATH")]
     boot_config: Option<PathBuf>,
 
+    /// Initial PID 1 executable, overriding boot settings (e.g. init=/bin/sh).
+    #[arg(value_name = "init=/PATH", value_parser = parse_init_argument)]
+    init: Option<String>,
+
     /// Extra raw arguments passed directly to qemu-system-x86_64.
     /// Usage: krust run <mode> [options] -- <qemu args...>
-    #[arg(
-        trailing_var_arg = true,
-        allow_hyphen_values = true,
-        value_name = "QEMU_ARGS"
-    )]
+    #[arg(last = true, allow_hyphen_values = true, value_name = "QEMU_ARGS")]
     qemu_args: Vec<String>,
 }
 
@@ -305,6 +305,15 @@ fn load_boot_settings(
     disk: Option<&std::path::Path>,
 ) -> Result<BootSettings, String> {
     let defaults = BootSettings::parse(include_str!(env!("BOOT_CONFIG_PATH")))?;
+    let mut settings = if disk.is_none() {
+        BootSettings {
+            root_fs: "ramfs".into(),
+            root_device: "none".into(),
+            ..defaults.clone()
+        }
+    } else {
+        defaults.clone()
+    };
     let path = cli
         .boot_config
         .clone()
@@ -312,8 +321,8 @@ fn load_boot_settings(
     if let Some(path) = path {
         match fs::read_to_string(&path) {
             Ok(contents) => {
-                return BootSettings::parse_with_defaults(&contents, defaults)
-                    .map_err(|e| format!("{}: {e}", path.display()));
+                settings = BootSettings::parse_with_defaults(&contents, defaults)
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
             }
             Err(e) if cli.boot_config.is_none() && e.kind() == std::io::ErrorKind::NotFound => {
                 eprintln!(
@@ -324,15 +333,23 @@ fn load_boot_settings(
             Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
         }
     }
-    if disk.is_none() {
-        Ok(BootSettings {
-            root_fs: "ramfs".into(),
-            root_device: "none".into(),
-            ..defaults
-        })
-    } else {
-        Ok(defaults)
+    if let Some(path) = &cli.init {
+        settings.init = Some(path.clone());
     }
+    settings.validate()?;
+    Ok(settings)
+}
+
+fn parse_init_argument(argument: &str) -> Result<String, String> {
+    let path = argument
+        .strip_prefix("init=")
+        .ok_or("expected init=/absolute/path")?;
+    let settings = BootSettings {
+        init: Some(path.into()),
+        ..Default::default()
+    };
+    settings.validate()?;
+    Ok(path.into())
 }
 
 fn run_qemu(cmd: &mut Command) -> Result<(), String> {
@@ -477,6 +494,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn init_argument_overrides_boot_settings_without_consuming_qemu_arguments() {
+        for mode in ["bios", "uefi"] {
+            let cli = Cli::parse_from([
+                "krust",
+                "run",
+                mode,
+                "init=/bin/sh",
+                "--headless",
+                "--no-vhd",
+                "--",
+                "-no-reboot",
+                "-display",
+                "none",
+            ]);
+            let Commands::Run(args) = cli.command else {
+                unreachable!()
+            };
+            let settings = load_boot_settings(&args, None).unwrap();
+            assert_eq!(settings.init.as_deref(), Some("/bin/sh"));
+            assert_eq!(settings.root_fs, "ramfs");
+            assert_eq!(args.qemu_args, ["-no-reboot", "-display", "none"]);
+        }
+        for argument in ["init=", "init=relative", "init=/bin/../sh", "other=/bin/sh"] {
+            assert!(Cli::try_parse_from(["krust", "run", "bios", argument]).is_err());
+        }
+    }
+
+    #[test]
     fn headless_boot_config_preserves_trace_and_ports() {
         for mode in ["bios", "uefi"] {
             for trace in ["true", "false"] {
@@ -605,7 +650,11 @@ mod tests {
         let sidecar = boot_sidecar_path(&disk);
         let custom = directory.join("custom.toml");
         fs::write(&sidecar, "root_fs = \"fat\"\n").unwrap();
-        fs::write(&custom, "root_fs = \"ramfs\"\nroot_device = \"none\"\n").unwrap();
+        fs::write(
+            &custom,
+            "root_fs = \"ramfs\"\nroot_device = \"none\"\ninit = \"/sbin/custom-init\"\n",
+        )
+        .unwrap();
         let cli = Cli::parse_from(["krust", "run", "bios"]);
         let Commands::Run(args) = cli.command else {
             unreachable!()
@@ -627,6 +676,31 @@ mod tests {
         assert_eq!(
             load_boot_settings(&args, Some(&disk)).unwrap().root_fs,
             "ramfs"
+        );
+        assert_eq!(
+            load_boot_settings(&args, Some(&disk))
+                .unwrap()
+                .init
+                .as_deref(),
+            Some("/sbin/custom-init")
+        );
+        let cli = Cli::parse_from([
+            "krust",
+            "run",
+            "bios",
+            "--boot-config",
+            custom.to_str().unwrap(),
+            "init=/bin/sh",
+        ]);
+        let Commands::Run(overridden) = cli.command else {
+            unreachable!()
+        };
+        assert_eq!(
+            load_boot_settings(&overridden, Some(&disk))
+                .unwrap()
+                .init
+                .as_deref(),
+            Some("/bin/sh")
         );
         fs::write(&custom, "root_fs = \"bad\"\n").unwrap();
         assert!(load_boot_settings(&args, Some(&disk)).is_err());

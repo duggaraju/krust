@@ -106,6 +106,44 @@ roots without `/etc/fstab` use the ramdisk fallback with a warning. An explicitl
 requested missing disk root never silently falls back to RAM. Move/copy the
 sidecar along with newly generated images.
 
+## PID 1 and `init=`
+
+After mounting root and the configured filesystems, the kernel starts PID 1:
+
+1. If `init` is specified, execute that path.
+2. Otherwise, execute `/sbin/init` if it exists.
+3. If `/sbin/init` is absent, run the built-in kernel shell itself as PID 1.
+
+There is no placeholder PID 1 supervisor or separate PID 2 kernel shell.
+PID 1 has parent PID 0. Userspace init starts in `/` with root credentials,
+console-backed stdin/stdout/stderr, and `HOME=/`, `TERM=linux`, and
+`PATH=/sbin:/bin:/usr/sbin:/usr/bin`. Its initial argv contains its executable
+path; ELF and shebang loading use the normal exec path.
+
+Supply a Linux-style parameter to the runner, **before** the `--` introducing
+raw QEMU arguments:
+
+```bash
+cargo run -Z bindeps -- run uefi --headless --vhd target/root.vhd init=/bin/sh
+```
+
+Alternatively, add `init = "/bin/sh"` to boot TOML, or set `KRUST_BOOT_INIT`
+at build time. The runner parameter overrides the boot TOML value, which
+overrides the build-time default. Omit the setting for automatic selection;
+empty, relative, or noncanonical paths are rejected. Only the executable path,
+not an init command line or arguments, is supported.
+
+An explicitly selected init never silently falls back. An existing but
+unexecutable `/sbin/init` also fails boot, including broken symlinks. Missing
+or invalid executables report their path and errno. Userspace PID 1 exiting
+or suffering a fatal fault/signal stops the kernel with failure; the fallback
+kernel shell retains its normal successful `exit`/`shutdown` behavior.
+If the kernel shell is disabled and no init exists, boot fails.
+
+This selects and launches init; it does not add Linux orphan adoption or a
+service manager. Userspace init must reap its children and implement its own
+startup policy.
+
 ## RAM filesystems
 
 `ramfs` and `tmpfs` share the in-memory inode/directory implementation, including

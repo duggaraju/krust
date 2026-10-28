@@ -14,7 +14,7 @@ use pc_keyboard::{
 use spin::{Mutex, Once};
 use x86_64::instructions::port::Port;
 
-use crate::drivers::char::ldisc::LineDiscipline;
+use crate::drivers::char::ldisc::{LineDiscipline, Termios2};
 use crate::drivers::registry;
 use crate::drivers::traits::{Device, DeviceError, DeviceType};
 use crate::process::task::ControllingTerminal;
@@ -442,7 +442,7 @@ pub(crate) fn tty_read(vc_index: usize, buf: &mut [u8]) -> usize {
         if read != 0 {
             return read;
         }
-        core::hint::spin_loop();
+        crate::process::idle_until_interrupt();
     }
 }
 
@@ -532,6 +532,33 @@ impl Device for TtyDevice {
         }
     }
 
+    fn read_blocking(&self, _offset: usize, buf: &mut [u8]) -> Result<usize, DeviceError> {
+        match self.current_target()? {
+            ControllingTerminal::VirtualConsole(index) => Ok(tty_read(index, buf)),
+            ControllingTerminal::Serial(index) => Self::serial_device(index)?.read_blocking(0, buf),
+        }
+    }
+
+    fn terminal_settings(&self) -> Result<Termios2, DeviceError> {
+        match self.current_target()? {
+            ControllingTerminal::VirtualConsole(index) => {
+                VirtualConsoleDevice::new(index).terminal_settings()
+            }
+            ControllingTerminal::Serial(index) => Self::serial_device(index)?.terminal_settings(),
+        }
+    }
+
+    fn set_terminal_settings(&self, settings: Termios2, flush: bool) -> Result<(), DeviceError> {
+        match self.current_target()? {
+            ControllingTerminal::VirtualConsole(index) => {
+                VirtualConsoleDevice::new(index).set_terminal_settings(settings, flush)
+            }
+            ControllingTerminal::Serial(index) => {
+                Self::serial_device(index)?.set_terminal_settings(settings, flush)
+            }
+        }
+    }
+
     fn write(&self, _offset: usize, buf: &[u8]) -> Result<usize, DeviceError> {
         match self.current_target()? {
             ControllingTerminal::VirtualConsole(index) => {
@@ -558,6 +585,26 @@ impl Device for VirtualConsoleDevice {
 
     fn read(&self, _offset: usize, buf: &mut [u8]) -> Result<usize, DeviceError> {
         Ok(tty_read(self.index, buf))
+    }
+
+    fn read_blocking(&self, _offset: usize, buf: &mut [u8]) -> Result<usize, DeviceError> {
+        Ok(tty_read(self.index, buf))
+    }
+
+    fn terminal_settings(&self) -> Result<Termios2, DeviceError> {
+        let mgr = manager().lock();
+        let index = mgr.resolve_index(self.index);
+        Ok(mgr.vcs[index].ldisc.terminal_settings())
+    }
+
+    fn set_terminal_settings(&self, settings: Termios2, flush: bool) -> Result<(), DeviceError> {
+        if flush {
+            poll_input();
+        }
+        let mut mgr = manager().lock();
+        let index = mgr.resolve_index(self.index);
+        mgr.vcs[index].ldisc.set_terminal_settings(settings, flush);
+        Ok(())
     }
 
     fn write(&self, _offset: usize, buf: &[u8]) -> Result<usize, DeviceError> {

@@ -1,13 +1,13 @@
 extern crate alloc;
 
 use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 use spin::Mutex;
 use uart_16550::backend::PioBackend;
 use uart_16550::{Config, Uart16550};
 
-use crate::drivers::char::ldisc::LineDiscipline;
+use crate::drivers::char::ldisc::{LineDiscipline, Termios2};
 use crate::drivers::traits::{Device, DeviceError, DeviceType};
-use crate::process::task::Signal;
 
 /// Standard x86 COM port addresses.
 const COM_PORTS: [u16; 2] = [0x3F8, 0x2F8];
@@ -15,6 +15,7 @@ const COM_PORTS: [u16; 2] = [0x3F8, 0x2F8];
 pub struct SerialPortDevice {
     name: String,
     uart: Mutex<Uart16550<PioBackend>>,
+    ldisc: Mutex<LineDiscipline>,
 }
 
 impl SerialPortDevice {
@@ -22,6 +23,48 @@ impl SerialPortDevice {
         Self {
             name,
             uart: Mutex::new(uart),
+            ldisc: Mutex::new(LineDiscipline::new()),
+        }
+    }
+
+    fn write_raw(&self, bytes: &[u8]) {
+        self.uart.lock().send_bytes_exact(bytes);
+    }
+
+    fn read_cooked(
+        &self,
+        discipline: &Mutex<LineDiscipline>,
+        buf: &mut [u8],
+    ) -> Result<usize, DeviceError> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let mut raw = [0; 64];
+            let received = self.read(0, &mut raw)?;
+            let mut output = Vec::new();
+            let mut signal = None;
+            let count = {
+                let mut ldisc = discipline.lock();
+                for &byte in &raw[..received] {
+                    let echo = ldisc.process_input(byte);
+                    if let Some(value) = echo.signal() {
+                        signal = Some(value.to_kernel_signal());
+                    }
+                    echo.emit(|bytes| ldisc.process_output(bytes, &mut output));
+                }
+                ldisc.read(buf)
+            };
+            self.write_raw(&output);
+            if let Some(signal) = signal {
+                let _ = crate::process::with_current_task_mut(|task| {
+                    task.deliver_signal(signal);
+                });
+            }
+            if count != 0 {
+                return Ok(count);
+            }
+            crate::process::idle_until_interrupt();
         }
     }
 }
@@ -52,15 +95,27 @@ impl Device for SerialPortDevice {
         Ok(count)
     }
 
-    /// Write bytes to the serial port, translating bare `\n` to `\r\n`.
-    fn write(&self, _offset: usize, buf: &[u8]) -> Result<usize, DeviceError> {
-        let mut uart = self.uart.lock();
-        for &byte in buf {
-            match byte {
-                b'\n' => uart.send_bytes_exact(b"\r\n"),
-                _ => uart.send_bytes_exact(&[byte]),
-            }
+    fn read_blocking(&self, _offset: usize, buf: &mut [u8]) -> Result<usize, DeviceError> {
+        self.read_cooked(&self.ldisc, buf)
+    }
+
+    fn terminal_settings(&self) -> Result<Termios2, DeviceError> {
+        Ok(self.ldisc.lock().terminal_settings())
+    }
+
+    fn set_terminal_settings(&self, settings: Termios2, flush: bool) -> Result<(), DeviceError> {
+        if flush {
+            let mut raw = [0; 64];
+            while self.read(0, &mut raw)? != 0 {}
         }
+        self.ldisc.lock().set_terminal_settings(settings, flush);
+        Ok(())
+    }
+
+    fn write(&self, _offset: usize, buf: &[u8]) -> Result<usize, DeviceError> {
+        let mut output = Vec::new();
+        self.ldisc.lock().process_output(buf, &mut output);
+        self.write_raw(&output);
         Ok(buf.len())
     }
 }
@@ -82,13 +137,6 @@ impl SerialConsoleDevice {
             ldisc: Mutex::new(LineDiscipline::new()),
         }
     }
-
-    /// Deliver a signal to the current task
-    fn deliver_signal(signal: Signal) {
-        let _ = crate::process::with_current_task_mut(|task| {
-            task.deliver_signal(signal);
-        });
-    }
 }
 
 impl Device for SerialConsoleDevice {
@@ -103,52 +151,24 @@ impl Device for SerialConsoleDevice {
     /// Read from the serial console with line discipline processing.
     /// Processes raw bytes through the line discipline (canonical mode, echo, signals).
     fn read(&self, _offset: usize, buf: &mut [u8]) -> Result<usize, DeviceError> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
+        self.device.read_cooked(&self.ldisc, buf)
+    }
 
-        loop {
-            // Read raw bytes from the serial port
-            let mut raw_buf = [0u8; 64];
-            let n = self.device.read(0, &mut raw_buf)?;
+    fn terminal_settings(&self) -> Result<Termios2, DeviceError> {
+        Ok(self.ldisc.lock().terminal_settings())
+    }
 
-            let mut ldisc = self.ldisc.lock();
-            let mut signal_to_deliver: Option<Signal> = None;
-
-            // Process each byte through the line discipline
-            for &byte in &raw_buf[..n] {
-                let echo = ldisc.process_input(byte);
-
-                // Check if a signal was generated and queue it
-                if let Some(ldisc_signal) = echo.signal() {
-                    signal_to_deliver = Some(ldisc_signal.to_kernel_signal());
-                }
-
-                // Echo the byte back to the console (optional, like a real terminal)
-                echo.emit(|echo_bytes| {
-                    let _ = self.device.write(0, echo_bytes);
-                });
-            }
-
-            // Deliver signal to current task if one was generated
-            if let Some(signal) = signal_to_deliver {
-                Self::deliver_signal(signal);
-            }
-
-            // Read cooked bytes from the line discipline
-            let bytes_read = ldisc.read(buf);
-            if bytes_read != 0 {
-                return Ok(bytes_read);
-            }
-
-            drop(ldisc);
-            core::hint::spin_loop();
-        }
+    fn set_terminal_settings(&self, settings: Termios2, flush: bool) -> Result<(), DeviceError> {
+        self.ldisc.lock().set_terminal_settings(settings, flush);
+        Ok(())
     }
 
     /// Write bytes to the serial console.
     fn write(&self, _offset: usize, buf: &[u8]) -> Result<usize, DeviceError> {
-        self.device.write(_offset, buf)
+        let mut output = Vec::new();
+        self.ldisc.lock().process_output(buf, &mut output);
+        self.device.write_raw(&output);
+        Ok(buf.len())
     }
 }
 

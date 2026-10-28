@@ -22,11 +22,10 @@ use crate::fs::vfs::FileDescriptor;
 use crate::fs::vfs::{File, FileType, FsError, Inode, OpenFile};
 
 pub const ROOT_PID: u64 = 1;
-pub const SHELL_PID: u64 = 2;
-pub const KERNEL_IO_TASK_PID: u64 = 3;
+pub const KERNEL_IO_TASK_PID: u64 = 2;
 
 static CURRENT_PID: AtomicU64 = AtomicU64::new(ROOT_PID);
-static NEXT_PID: AtomicU64 = AtomicU64::new(4);
+static NEXT_PID: AtomicU64 = AtomicU64::new(3);
 
 #[cfg(feature = "drivers")]
 static TTY_FOREGROUND_PGRP: Once<Mutex<BTreeMap<ControllingTerminal, u64>>> = Once::new();
@@ -51,56 +50,40 @@ pub fn init() {
     binfmt::init();
 }
 
-pub fn register_boot_processes(root_cwd: Arc<dyn Inode>) {
+pub fn register_boot_processes(root_cwd: Arc<dyn Inode>, kernel_shell: bool) {
     let root_credentials = Credentials::root();
-    let shell_credentials = Credentials::root();
-    let shell_home = shell_credentials.home_dir.clone();
-    let (shell_cwd, shell_cwd_path) = resolve_boot_home(&shell_home, Arc::clone(&root_cwd));
-
-    let mut scheduler = SCHEDULER.lock();
-    let Some(scheduler) = scheduler.as_mut() else {
-        return;
+    let (cwd, cwd_path) = if kernel_shell {
+        resolve_boot_home(&root_credentials.home_dir, Arc::clone(&root_cwd))
+    } else {
+        (Arc::clone(&root_cwd), String::from("/"))
     };
 
-    if scheduler.task_by_pid(ROOT_PID).is_none() {
-        scheduler.add_task(Task::new_with_credentials(
-            ROOT_PID,
-            ROOT_PID,
-            Arc::clone(&root_cwd),
-            String::from("/"),
-            "root",
-            dummy_entry,
-            root_credentials.clone(),
-        ));
-    }
-    if scheduler.task_by_pid(SHELL_PID).is_none() {
-        let parent_pid = scheduler
-            .task_by_pid(ROOT_PID)
-            .map(|task| task.pid)
-            .unwrap_or(ROOT_PID);
-        let mut shell = Task::new_with_credentials(
-            SHELL_PID,
-            parent_pid,
-            shell_cwd,
-            shell_cwd_path.clone(),
-            "shell",
-            dummy_entry,
-            shell_credentials,
-        );
-        shell.set_env(String::from("HOME"), shell_cwd_path);
-        scheduler.add_task(shell);
-    } else if let Some(shell) = scheduler.task_by_pid_mut(SHELL_PID) {
-        shell.set_home_dir(shell_cwd_path.clone());
-        shell.set_cwd(shell_cwd, shell_cwd_path.clone());
-        shell.set_env(String::from("HOME"), shell_cwd_path);
-    }
+    let mut scheduler = SCHEDULER.lock();
+    let scheduler = scheduler.as_mut().expect("scheduler must be initialized");
 
-    // Create kernel I/O task (part of root process) to handle TTY input and wake sleepers
+    let mut init = Task::new_with_credentials(
+        ROOT_PID,
+        0,
+        cwd,
+        cwd_path.clone(),
+        if kernel_shell { "shell" } else { "init" },
+        dummy_entry,
+        root_credentials.clone(),
+    );
+    init.set_env(String::from("HOME"), cwd_path);
+    init.set_env(
+        String::from("PATH"),
+        String::from("/sbin:/bin:/usr/sbin:/usr/bin"),
+    );
+    init.set_env(String::from("TERM"), String::from("linux"));
+    scheduler.add_task(init);
+
+    // Kernel workers are not userspace children for PID 1 to wait on.
     #[cfg(feature = "drivers")]
     if scheduler.task_by_pid(KERNEL_IO_TASK_PID).is_none() {
         let kio_task = Task::new_with_credentials(
             KERNEL_IO_TASK_PID,
-            ROOT_PID,
+            0,
             Arc::clone(&root_cwd),
             String::from("/"),
             "kernel-io",
@@ -111,7 +94,6 @@ pub fn register_boot_processes(root_cwd: Arc<dyn Inode>) {
     }
 
     let _ = scheduler.set_task_state(ROOT_PID, TaskState::Running);
-    let _ = scheduler.set_task_state(SHELL_PID, TaskState::Running);
     #[cfg(feature = "drivers")]
     let _ = scheduler.set_task_state(KERNEL_IO_TASK_PID, TaskState::Ready);
 }
@@ -410,12 +392,6 @@ pub fn dup_fd(old_fd: usize, min_fd: usize, cloexec: bool) -> Result<usize, isiz
     task.dup_fd(old_fd, min_fd, cloexec)
 }
 
-pub fn mark_shell_exited() {
-    if let Some(scheduler) = SCHEDULER.lock().as_mut() {
-        let _ = scheduler.set_task_state(SHELL_PID, TaskState::Zombie);
-    }
-}
-
 pub fn terminate_root_process() -> bool {
     if let Some(scheduler) = SCHEDULER.lock().as_mut() {
         return scheduler.set_task_state(ROOT_PID, TaskState::Zombie);
@@ -651,7 +627,7 @@ pub fn wake_one_tty_waiter() -> Option<u64> {
 
 #[cfg(feature = "drivers")]
 /// Kernel I/O task that monitors for TTY input and wakes sleeping tasks.
-/// This runs as a background kernel task, part of the root process.
+/// This runs as a background kernel task.
 pub fn kernel_io_task_entry() {
     loop {
         // Poll for TTY input

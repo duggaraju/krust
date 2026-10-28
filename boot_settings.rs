@@ -80,6 +80,7 @@ pub struct BootSettings {
     pub syscall_trace: bool,
     pub root_fs: String,
     pub root_device: String,
+    pub init: Option<String>,
 }
 
 impl Default for BootSettings {
@@ -92,6 +93,7 @@ impl Default for BootSettings {
             syscall_trace: false,
             root_fs: "ext4".into(),
             root_device: "/dev/sda".into(),
+            init: None,
         }
     }
 }
@@ -167,6 +169,7 @@ impl BootSettings {
                     settings.root_fs = value.into()
                 }
                 "root_device" => settings.root_device = value.into(),
+                "init" => settings.init = Some(value.into()),
                 _ => return Err(error("unknown setting or invalid value")),
             }
         }
@@ -175,6 +178,16 @@ impl BootSettings {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(path) = &self.init {
+            if !canonical_path(path)
+                || path == "/"
+                || path
+                    .chars()
+                    .any(|ch| ch.is_control() || matches!(ch, '"' | '\\'))
+            {
+                return Err("init requires a canonical absolute executable path".into());
+            }
+        }
         match self.root_fs.as_str() {
             "ramfs" => {
                 if !self.root_device.is_empty() && self.root_device != "none" {
@@ -193,14 +206,18 @@ impl BootSettings {
 
     pub fn to_toml(&self) -> String {
         format!(
-            "log_level = \"{}\"\nshell_port = {}\nshell_console = \"{}\"\nvirtual_consoles = {}\nsyscall_trace = {}\nroot_fs = \"{}\"\nroot_device = \"{}\"\n",
+            "log_level = \"{}\"\nshell_port = {}\nshell_console = \"{}\"\nvirtual_consoles = {}\nsyscall_trace = {}\nroot_fs = \"{}\"\nroot_device = \"{}\"\n{}",
             self.log_level,
             self.shell_port,
             self.shell_console,
             self.virtual_consoles,
             self.syscall_trace,
             self.root_fs,
-            self.root_device
+            self.root_device,
+            self.init
+                .as_ref()
+                .map(|path| format!("init = \"{path}\"\n"))
+                .unwrap_or_default()
         )
     }
 
@@ -500,5 +517,29 @@ mod tests {
         let settings = BootSettings::parse("root_device = \"/dev/my disk\"").unwrap();
         validate_fstab_root(&parse_fstab(&settings.default_fstab()).unwrap(), &settings).unwrap();
         assert!(parse_fstab("none /mount\\040 ramfs defaults 0 0").is_err());
+    }
+    #[test]
+    fn init_paths_are_optional_validated_and_round_trip() {
+        assert_eq!(BootSettings::default().init, None);
+        assert_eq!(BootSettings::parse("").unwrap().init, None);
+        let settings = BootSettings::parse("init = \"/bin/sh\"").unwrap();
+        assert_eq!(settings.init.as_deref(), Some("/bin/sh"));
+        assert_eq!(BootSettings::parse(&settings.to_toml()).unwrap(), settings);
+        for path in [
+            "",
+            "/",
+            "bin/sh",
+            "/bin/../sh",
+            "/bin//sh",
+            "/bin/sh/",
+            "/bin/\0sh",
+        ] {
+            let settings = BootSettings {
+                init: Some(path.into()),
+                ..Default::default()
+            };
+            assert!(settings.validate().is_err(), "{path:?}");
+        }
+        assert!(BootSettings::parse("init = \"/bin/sh\"\ninit = \"/sbin/init\"").is_err());
     }
 }

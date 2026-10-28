@@ -29,6 +29,15 @@ cargo test -Z bindeps --locked -p krust --test busybox ::cat -- --ignored
 # Fork/exec/wait + interactive shell regression, both firmware modes.
 cargo test -Z bindeps --locked -p krust --test qemu shell_process -- --ignored --exact --nocapture
 
+# Explicit/default userspace init and kernel-shell PID 1 fallback.
+cargo test -Z bindeps --locked -p krust --test qemu init_process -- --ignored --exact --nocapture
+
+# Real BusyBox PID 1 shell startup and interactive console reads, without tracing.
+cargo test -Z bindeps --locked -p krust --test qemu init_shell -- --ignored --exact --nocapture
+
+# Serial/virtual-console termios, echo and low-CPU idle reads.
+cargo test -Z bindeps --locked -p krust --test qemu terminal_console -- --ignored --exact --nocapture
+
 # Bounded tmpfs syscalls, sparse files and reclamation on BIOS/UEFI.
 cargo test -Z bindeps --locked -p krust --test qemu tmpfs -- --ignored --exact --nocapture
 
@@ -45,7 +54,7 @@ cargo test -Z bindeps --locked -p krust --test qemu -- --ignored --nocapture
 cargo test -Z bindeps --locked -p krust --test harnesses installed_utility_validators -- --ignored --exact
 ```
 
-`accounting`, `cloexec`, `mmap`, `memfs`, and `pci` compile the Rust test sources directly as
+`accounting`, `cloexec`, `mmap`, `memfs`, `terminal`, and `pci` compile the Rust test sources directly as
 native Cargo targets; their individual assertions are not hidden behind a shell
 wrapper. Host integration tests live directly under `tests/`, with shared helpers
 and compile-only fixtures under `tests/support/`. Cargo discovers `cloexec`,
@@ -57,14 +66,15 @@ exit waits, shutdown diagnostics, process-group cleanup, unchanged-disk guards,
 shell state/content assertions, utility completion markers, and exact fault
 validation without QEMU. The freestanding Rust guest
 fixtures live in the workspace's `tests/guest` package. An artifact dev-dependency
-builds six static `no_std`/`no_main` x86_64 executables: tmpfs, both CLOEXEC
-images, mmap ranges, mmap protections, and process/fork/exec/wait.
+builds seven static `no_std`/`no_main` x86_64 executables: tmpfs, both CLOEXEC
+images, mmap ranges, mmap protections, process/fork/exec/wait, and init/PID 1.
 The default `qemu::guest_artifacts_are_static_user_executables` test checks their
 ELF layout, user-space entry points, segment permissions, and lack of a dynamic
 loader without booting QEMU.
 
 Actual guest execution remains in named, ignored-by-default Cargo integration
-tests: `tmpfs`, `cloexec`, `mmap` (including protections), and `shell_process`
+tests: `tmpfs`, `cloexec`, `mmap` (including protections), `init_process`, `init_shell`,
+`terminal_console`, and `shell_process`
 (including the process fixture). The shared Rust harness in `tests/support/qemu.rs`
 launches the runner, waits for serial prompts, applies deadlines, retains logs,
 and cleans up owned process groups. Assertions, fixture creation, and guest
@@ -99,6 +109,8 @@ create the external disk fixture. Each test claims a unique workspace and uses
 QEMU snapshots. Serial output, kernel logs, and utility reports do not share
 filenames between tests, so there is no global script lock. Limit parallel boots
 with `--test-threads=2` on resource-constrained hosts.
+Kernel-shell suites using an external ext4 VHD copy it and remove `/sbin/init`
+from the owned copy to select the fallback; the source image is unchanged.
 
 Logs are retained under unique `target/cargo-tests/native/<suite>-<id>/`
 directories; the exact path is printed when each test starts. Each boot has

@@ -7,7 +7,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use spin::Mutex;
 
-use super::ldisc::LineDiscipline;
+use super::ldisc::{LineDiscipline, Termios2};
 use crate::drivers::traits::{Device, DeviceError, DeviceType};
 
 /// Maximum number of bytes that can be queued in either direction of a PTY pipe.
@@ -61,6 +61,18 @@ impl Device for PtyManagerDevice {
 
     fn device_type(&self) -> DeviceType {
         DeviceType::Char
+    }
+
+    fn terminal_settings(&self) -> Result<Termios2, DeviceError> {
+        Ok(self.shared.lock().ldisc.terminal_settings())
+    }
+
+    fn set_terminal_settings(&self, settings: Termios2, flush: bool) -> Result<(), DeviceError> {
+        self.shared
+            .lock()
+            .ldisc
+            .set_terminal_settings(settings, flush);
+        Ok(())
     }
 
     /// Manager reads: drain echo bytes first (keyboard echo), then any output
@@ -131,6 +143,18 @@ impl Device for PtySubsidiaryDevice {
 
     fn device_type(&self) -> DeviceType {
         DeviceType::Char
+    }
+
+    fn terminal_settings(&self) -> Result<Termios2, DeviceError> {
+        Ok(self.shared.lock().ldisc.terminal_settings())
+    }
+
+    fn set_terminal_settings(&self, settings: Termios2, flush: bool) -> Result<(), DeviceError> {
+        self.shared
+            .lock()
+            .ldisc
+            .set_terminal_settings(settings, flush);
+        Ok(())
     }
 
     /// Subsidiary reads: return cooked bytes from the line discipline's read queue.

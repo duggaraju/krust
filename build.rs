@@ -12,6 +12,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=KRUST_BOOT_LOG_LEVEL");
     println!("cargo:rerun-if-env-changed=KRUST_BOOT_SHELL_CONSOLE");
     println!("cargo:rerun-if-env-changed=KRUST_BOOT_SYSCALL_TRACE");
+    println!("cargo:rerun-if-env-changed=KRUST_BOOT_INIT");
 
     // set by cargo, build scripts should use this directory for output files
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
@@ -27,8 +28,16 @@ fn main() {
         "log_level = \"{}\"\nshell_port = 1\nshell_console = \"{}\"\nsyscall_trace = {}\n",
         boot_log_level, boot_shell_console, boot_syscall_trace
     );
-    let settings =
+    let mut settings =
         boot_settings::BootSettings::parse(&boot_toml).expect("invalid build-time boot settings");
+    match std::env::var("KRUST_BOOT_INIT") {
+        Ok(path) => settings.init = Some(path),
+        Err(std::env::VarError::NotPresent) => {}
+        Err(error) => panic!("invalid KRUST_BOOT_INIT: {error}"),
+    }
+    settings
+        .validate()
+        .expect("invalid build-time init setting");
     let boot_toml = settings.to_toml();
     let boot_config_path = out_dir.join("boot.toml");
     fs::write(&boot_config_path, &boot_toml).expect("failed to write boot configuration");

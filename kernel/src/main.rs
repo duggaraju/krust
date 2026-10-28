@@ -147,23 +147,38 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     info!("Kernel initialization complete.");
 
-    // Start the kernel shell.
-    #[cfg(feature = "shell")]
     {
         let root_cwd_inode = {
             #[cfg(feature = "fs")]
             {
-                crate::fs::vfs::root_inode().expect("root inode must exist before shell startup")
+                crate::fs::vfs::root_inode().expect("root inode must exist before init startup")
             }
             #[cfg(not(feature = "fs"))]
             {
-                unreachable!("process feature requires fs for shell startup")
+                unreachable!("process feature requires fs for init startup")
             }
         };
 
-        process::register_boot_processes(root_cwd_inode);
+        let init_path = match boot_config.settings.init.as_deref() {
+            Some(path) => Some(alloc::string::String::from(path)),
+            None => {
+                #[cfg(feature = "fs")]
+                {
+                    match fs::vfs::lookup_path("/sbin/init") {
+                        Ok(_) => Some(alloc::string::String::from("/sbin/init")),
+                        Err(fs::vfs::FsError::NotFound) => None,
+                        Err(error) => panic!("init: cannot check /sbin/init: {error:?}"),
+                    }
+                }
+                #[cfg(not(feature = "fs"))]
+                {
+                    None::<alloc::string::String>
+                }
+            }
+        };
+        process::register_boot_processes(root_cwd_inode, init_path.is_none());
 
-        process::set_current_pid(crate::process::SHELL_PID);
+        process::set_current_pid(crate::process::ROOT_PID);
         process::resume_cpu_accounting();
 
         // Init framebuffer console output if needed.
@@ -178,7 +193,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             }
         }
 
-        // Assign the controlling terminal for the shell process.
+        // Assign the controlling terminal before exec so PID 1 inherits stdio.
         // Framebuffer mode → tty0 (virtual console); serial mode → ttyS0.
         #[cfg(feature = "drivers")]
         {
@@ -189,28 +204,39 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                     boot_config.shell_port().saturating_sub(1) as usize,
                 )
             };
-            process::set_controlling_terminal(crate::process::SHELL_PID, ctty);
+            process::set_controlling_terminal(crate::process::ROOT_PID, ctty);
         }
 
-        let _reason = shell::run();
+        if let Some(path) = init_path {
+            let envp = process::with_current_task_mut(|task| {
+                task.env
+                    .iter()
+                    .map(|(key, value)| alloc::format!("{key}={value}"))
+                    .collect()
+            })
+            .expect("PID 1 must be registered");
+            info!("init: starting '{}' as PID 1", path);
+            if let Err(errno) =
+                syscall::impls::execve_with_args(&path, alloc::vec![path.clone()], envp)
+            {
+                panic!("init: failed to execute '{path}' as PID 1: errno {errno}");
+            }
+            unreachable!("successful init exec does not return");
+        }
 
+        #[cfg(feature = "shell")]
         {
-            process::mark_shell_exited();
+            info!("init: /sbin/init not found; starting kernel shell as PID 1");
+            let _reason = shell::run();
             if process::terminate_root_process() {
-                info!("root process terminated; shutting down kernel");
+                info!("PID 1 kernel shell exited; shutting down kernel");
                 arch::shutdown(arch::ShutdownStatus::Success);
             }
+            arch::shutdown(arch::ShutdownStatus::Success);
         }
 
-        arch::shutdown(arch::ShutdownStatus::Success);
-    }
-
-    // If shell is disabled, just show VGA output and exit
-    #[cfg(not(feature = "shell"))]
-    {
-        #[cfg(feature = "drivers")]
-        drivers::video::print_something();
-        arch::shutdown(arch::ShutdownStatus::Success);
+        #[cfg(not(feature = "shell"))]
+        panic!("init: /sbin/init not found and kernel shell is disabled");
     }
 }
 
