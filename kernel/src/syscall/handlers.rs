@@ -193,8 +193,136 @@ pub fn sys_open(args: &SyscallArgs) -> isize {
         return -14;
     };
 
-    match impls::open(path, args.arg1) {
+    match impls::open_with_mode(path, args.arg1, args.arg2 as u16) {
         Ok(fd) => fd as isize,
+        Err(errno) => errno,
+    }
+}
+
+#[repr(C)]
+struct LinuxStatFs {
+    f_type: u64,
+    f_bsize: u64,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: u64,
+    f_files: u64,
+    f_ffree: u64,
+    f_fsid: [i32; 2],
+    f_namelen: u64,
+    f_frsize: u64,
+    f_flags: u64,
+    f_spare: [u64; 4],
+}
+
+fn checked_at_path(dirfd: usize, address: usize) -> Result<alloc::string::String, isize> {
+    let path = super::user_memory::cstring(address, MAX_PATH_LEN)?;
+    if dirfd as isize != AT_FDCWD && !path.starts_with('/') {
+        return Err(-95);
+    }
+    if path.is_empty() {
+        return Err(-2);
+    }
+    Ok(path)
+}
+
+pub fn sys_fs_operation(args: &SyscallArgs) -> isize {
+    use super::numbers::*;
+    use crate::fs::vfs::SetMetadata;
+
+    let result = (|| -> Result<(), isize> {
+        let path = |address| checked_at_path(AT_FDCWD as usize, address);
+        match args.number {
+            SYS_TRUNCATE | SYS_FTRUNCATE => {
+                if args.arg1 > isize::MAX as usize {
+                    return Err(-22);
+                }
+                if args.number == SYS_TRUNCATE {
+                    impls::truncate(&path(args.arg0)?, args.arg1)?;
+                } else {
+                    impls::ftruncate(args.arg0, args.arg1)?;
+                }
+            }
+            SYS_MKDIR => impls::mkdir_with_mode(&path(args.arg0)?, args.arg1 as u16)?,
+            SYS_MKDIRAT => {
+                let path = checked_at_path(args.arg0, args.arg1)?;
+                impls::mkdir_with_mode(&path, args.arg2 as u16)?;
+            }
+            SYS_UNLINK | SYS_RMDIR => impls::unlink(&path(args.arg0)?, args.number == SYS_RMDIR)?,
+            SYS_UNLINKAT => {
+                if args.arg2 & !0x200 != 0 {
+                    return Err(-22);
+                }
+                let path = checked_at_path(args.arg0, args.arg1)?;
+                impls::unlink(&path, args.arg2 == 0x200)?;
+            }
+            SYS_RENAME => impls::rename(&path(args.arg0)?, &path(args.arg1)?)?,
+            SYS_RENAMEAT => {
+                let old = checked_at_path(args.arg0, args.arg1)?;
+                let new = checked_at_path(args.arg2, args.arg3)?;
+                impls::rename(&old, &new)?;
+            }
+            SYS_CHMOD | SYS_FCHMOD => {
+                let metadata = SetMetadata {
+                    mode: Some(args.arg1 as u16 & 0o7777),
+                    ..SetMetadata::default()
+                };
+                if args.number == SYS_CHMOD {
+                    impls::set_metadata(&path(args.arg0)?, metadata)?;
+                } else {
+                    impls::fset_metadata(args.arg0, metadata)?;
+                }
+            }
+            SYS_CHOWN | SYS_FCHOWN => {
+                let uid = args.arg1 as u32;
+                let gid = args.arg2 as u32;
+                let metadata = SetMetadata {
+                    uid: (uid != u32::MAX).then_some(uid),
+                    gid: (gid != u32::MAX).then_some(gid),
+                    mode: None,
+                };
+                if args.number == SYS_CHOWN {
+                    impls::set_metadata(&path(args.arg0)?, metadata)?;
+                } else {
+                    impls::fset_metadata(args.arg0, metadata)?;
+                }
+            }
+            SYS_STATFS | SYS_FSTATFS => {
+                super::user_memory::validate_write(args.arg1, core::mem::size_of::<LinuxStatFs>())?;
+                let stats = if args.number == SYS_STATFS {
+                    impls::statfs(&path(args.arg0)?)?
+                } else {
+                    impls::fstatfs(args.arg0)?
+                };
+                let output = LinuxStatFs {
+                    f_type: stats.magic,
+                    f_bsize: stats.block_size,
+                    f_blocks: stats.blocks,
+                    f_bfree: stats.blocks_free,
+                    f_bavail: stats.blocks_free,
+                    f_files: stats.files,
+                    f_ffree: stats.files_free,
+                    f_fsid: [0; 2],
+                    f_namelen: stats.name_max,
+                    f_frsize: stats.block_size,
+                    f_flags: 0,
+                    f_spare: [0; 4],
+                };
+                // SAFETY: this ABI structure has no padding and every field is initialized.
+                let bytes = unsafe {
+                    slice::from_raw_parts(
+                        (&output as *const LinuxStatFs).cast::<u8>(),
+                        core::mem::size_of::<LinuxStatFs>(),
+                    )
+                };
+                super::user_memory::copy_to(args.arg1, bytes)?;
+            }
+            _ => return Err(-38),
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => 0,
         Err(errno) => errno,
     }
 }
@@ -423,16 +551,16 @@ pub fn sys_getdents64(args: &SyscallArgs) -> isize {
 
 fn to_linux_stat(st: impls::Stat) -> LinuxStat {
     let mode = match st.file_type {
-        impls::STAT_TYPE_DIRECTORY => 0o040755,
-        impls::STAT_TYPE_CHAR_DEVICE => 0o020666,
-        impls::STAT_TYPE_BLOCK_DEVICE => 0o060660,
-        impls::STAT_TYPE_SYMLINK => 0o120777,
-        _ => 0o100755,
-    };
+        impls::STAT_TYPE_DIRECTORY => 0o040000,
+        impls::STAT_TYPE_CHAR_DEVICE => 0o020000,
+        impls::STAT_TYPE_BLOCK_DEVICE => 0o060000,
+        impls::STAT_TYPE_SYMLINK => 0o120000,
+        _ => 0o100000,
+    } | st.mode;
     LinuxStat {
         st_dev: 0,
         st_ino: st.ino,
-        st_nlink: 1,
+        st_nlink: st.links,
         st_mode: mode,
         st_uid: st.uid,
         st_gid: st.gid,
@@ -440,7 +568,7 @@ fn to_linux_stat(st: impls::Stat) -> LinuxStat {
         st_rdev: 0,
         st_size: st.size as i64,
         st_blksize: 4096,
-        st_blocks: (st.size as i64 + 511) / 512,
+        st_blocks: st.blocks as i64,
         st_atime: 0,
         st_atime_nsec: 0,
         st_mtime: 0,
@@ -709,7 +837,10 @@ pub fn sys_execve(args: &SyscallArgs) -> isize {
     let (path, argv, envp) = match arguments {
         Ok(arguments) => arguments,
         Err(errno) => {
-            warn!("execve: cannot copy user arguments: errno {}, path=0x{:x} argv=0x{:x} envp=0x{:x}", errno, args.arg0, args.arg1, args.arg2);
+            warn!(
+                "execve: cannot copy user arguments: errno {}, path=0x{:x} argv=0x{:x} envp=0x{:x}",
+                errno, args.arg0, args.arg1, args.arg2
+            );
             return errno;
         }
     };
@@ -735,7 +866,9 @@ pub fn sys_wait4(args: &SyscallArgs) -> isize {
         Some(args.arg0 as u64)
     };
     if args.arg1 != 0 {
-        if let Err(errno) = super::user_memory::validate_write(args.arg1, core::mem::size_of::<i32>()) {
+        if let Err(errno) =
+            super::user_memory::validate_write(args.arg1, core::mem::size_of::<i32>())
+        {
             return errno;
         }
     }
@@ -828,11 +961,7 @@ pub fn sys_mmap(args: &SyscallArgs) -> isize {
             return Err(-12);
         }
         task.address_space
-            .map_zeroed_region(
-                range.base,
-                range.len,
-                page_flags,
-            )
+            .map_zeroed_region(range.base, range.len, page_flags)
             .map_err(|_| -12isize)?;
         if addr == 0 {
             task.mmap_end = range.end;
@@ -866,41 +995,56 @@ pub fn sys_fcntl(args: &SyscallArgs) -> isize {
     let arg = args.arg2;
     // F_DUPFD=0, F_GETFD=1, F_SETFD=2, F_GETFL=3, F_SETFL=4, F_DUPFD_CLOEXEC=1030
     match cmd {
-        0 | 1030 => {
-            match crate::process::dup_fd(fd, arg, cmd == 1030) {
-                Ok(new_fd) => new_fd as isize,
-                Err(errno) => errno,
-            }
-        }
-        1 => crate::process::fd_flags(fd).map(|flags| flags as isize).unwrap_or_else(|errno| errno),
-        2 => crate::process::set_fd_flags(fd, arg).map(|()| 0).unwrap_or_else(|errno| errno),
+        0 | 1030 => match crate::process::dup_fd(fd, arg, cmd == 1030) {
+            Ok(new_fd) => new_fd as isize,
+            Err(errno) => errno,
+        },
+        1 => crate::process::fd_flags(fd)
+            .map(|flags| flags as isize)
+            .unwrap_or_else(|errno| errno),
+        2 => crate::process::set_fd_flags(fd, arg)
+            .map(|()| 0)
+            .unwrap_or_else(|errno| errno),
         3 => {
             // Return open access mode bits in Linux O_* layout.
             match crate::process::fd_descriptor(fd) {
-                Ok(desc) => match desc.mode {
-                    crate::fs::vfs::FileOpenMode::ReadOnly => 0,
-                    crate::fs::vfs::FileOpenMode::WriteOnly => 1,
-                    crate::fs::vfs::FileOpenMode::ReadWrite => 2,
-                },
+                Ok(desc) => {
+                    let access = match desc.mode {
+                        crate::fs::vfs::FileOpenMode::ReadOnly => 0,
+                        crate::fs::vfs::FileOpenMode::WriteOnly => 1,
+                        crate::fs::vfs::FileOpenMode::ReadWrite => 2,
+                    };
+                    crate::process::with_fd(fd, |file| {
+                        Ok(access | if file.is_append() { 0x400 } else { 0 })
+                    })
+                    .unwrap_or_else(|errno| errno)
+                }
                 Err(errno) => errno,
             }
         }
-        4 => 0,   // F_SETFL: ignore
+        4 => crate::process::with_fd(fd, |file| {
+            file.set_append(arg & 0x400 != 0);
+            Ok(0)
+        })
+        .unwrap_or_else(|errno| errno),
         _ => -22, // EINVAL
     }
 }
 
 pub fn sys_openat(args: &SyscallArgs) -> isize {
-    let _dirfd = args.arg0 as isize;
+    let dirfd = args.arg0 as isize;
     let path_ptr = args.arg1 as *const u8;
     let flags = args.arg2;
-    let _mode = args.arg3;
+    let mode = args.arg3;
 
     let Some(path) = (unsafe { read_cstr(path_ptr) }) else {
         return -14;
     };
 
-    match impls::open(&path, flags) {
+    if dirfd != AT_FDCWD && !path.starts_with('/') {
+        return -95;
+    }
+    match impls::open_with_mode(&path, flags, mode as u16) {
         Ok(fd) => fd as isize,
         Err(errno) => errno,
     }

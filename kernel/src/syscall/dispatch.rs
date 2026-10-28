@@ -64,6 +64,21 @@ pub fn dispatch(args: &SyscallArgs) -> isize {
     }
 
     let handler: Option<SyscallHandler> = match args.number {
+        super::numbers::SYS_TRUNCATE
+        | super::numbers::SYS_FTRUNCATE
+        | super::numbers::SYS_RENAME
+        | super::numbers::SYS_MKDIR
+        | super::numbers::SYS_RMDIR
+        | super::numbers::SYS_UNLINK
+        | super::numbers::SYS_CHMOD
+        | super::numbers::SYS_FCHMOD
+        | super::numbers::SYS_CHOWN
+        | super::numbers::SYS_FCHOWN
+        | super::numbers::SYS_STATFS
+        | super::numbers::SYS_FSTATFS
+        | super::numbers::SYS_MKDIRAT
+        | super::numbers::SYS_UNLINKAT
+        | super::numbers::SYS_RENAMEAT => Some(handlers::sys_fs_operation),
         SYS_READ => Some(handlers::sys_read),
         SYS_WRITE => Some(handlers::sys_write),
         SYS_WRITEV => Some(handlers::sys_writev),

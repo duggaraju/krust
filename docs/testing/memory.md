@@ -5,17 +5,15 @@
 Run all commands from the repository root. These cover the #9 and #8 regressions.
 
 ```bash
-scripts/test-mmap.sh
-scripts/test-mmap-protection-harness.sh
-cargo check -p kernel --target x86_64-unknown-none --locked
-cargo build -Z bindeps --locked
-scripts/test-mmap-guest.sh target/krust-disk-ext4.vhd
-scripts/smoke-userspace.sh target/krust-disk-ext4.vhd
+cargo test -Z bindeps --locked -p krust --test mmap
+cargo test -Z bindeps --locked -p krust --test harnesses mmap_protection_validators -- --exact
+cargo test -Z bindeps --locked -p krust --test qemu mmap -- --ignored --exact --nocapture
+cargo test -Z bindeps --locked -p krust --test qemu userspace_smoke -- --ignored --exact --nocapture
 ```
 
 Cargo exposes the native `mmap` target and the ignored `qemu` target's `mmap`
 case; see [test selection](README.md#cargo-targets-and-filtering).
-`scripts/test-mmap.sh` additionally performs the cross-target compile check.
+The native `mmap` target also performs the ARM64 compile-only check.
 
 ## Range validation and supervisor overlap
 
@@ -42,8 +40,9 @@ length validation.
 
 ## Range guest fixture
 
-The guest test compiles a static, no-libc x86_64 C syscall fixture with the
-installed `cc`, injects it with `debugfs` into an owned **copy** of the ext4 VHD,
+Cargo builds static, `no_std` Rust x86_64 range and protection syscall fixtures
+from [the guest package](../../tests/guest/Cargo.toml). The guest harness
+injects them with `debugfs` into an owned **copy** of the ext4 VHD,
 and runs the prompt-driven BIOS/UEFI smoke harness with QEMU `-snapshot`.
 Invalid calls are interleaved with healthy zero-filled allocations; unchanged
 placement and sentinel pages check that rejected ranges do not change existing
@@ -63,8 +62,9 @@ collision policy.
 The complete BusyBox smoke runs **after** the fixture in each boot.
 Both the copied disk and source disk are hash-checked; owned fixture binaries,
 disk copies, and scratch directories are removed. Logs remain in
-`target/mmap-guest-{bios,uefi}{,-kernel}.log`. Requires `cc` and `debugfs`
-in addition to the smoke prerequisites; no libc or new dependencies are needed.
+the unique `target/cargo-tests/native/mmap-*/` directory printed by the harness.
+Requires `debugfs` and the pinned
+Rust toolchain in addition to the smoke prerequisites; no C compiler or libc.
 
 ## Existing placement and architecture limitations
 
@@ -97,7 +97,7 @@ but valid protections return `ENOSYS`: this is not ARM64 runtime support.
 
 ## Protection guest and harness coverage
 
-The guest script boots BIOS and UEFI protection probes in separate
+The `qemu::mmap` test boots BIOS and UEFI protection probes in separate
 kernel-shell-launched processes, independently of the userspace fork regression.
 It exercises all eight combinations (including executing EXEC-only/RX zero-page
 tails into an adjacent executable RET), then attempts nine forbidden writes,
@@ -106,7 +106,8 @@ user-mode page-fault class and task status 139; the shell must run a healthy
 BusyBox child after every fault. Missing faults/statuses fail the focused harness.
 Expected faults are allowed only there, never in the standard smoke harness.
 
-Logs are in `target/mmap-protections-{bios,uefi}{,-kernel}.log`. The host-only
+Logs are in the printed `target/cargo-tests/native/mmap-*/` directory, with
+separate protection and ordinary smoke logs for each firmware. The host-only
 protection harness tests reject missing/wrong faults, missing statuses, and
 unrelated faults. See the [shell harness guide](shell.md#host-only-harness-checks)
 for shared tool requirements and mock-runner cleanup assertions.

@@ -23,8 +23,6 @@ Run synthetic config header tests without QEMU or kernel I/O:
 
 ```bash
 cargo test -Z bindeps --locked -p krust --test pci
-# Original standalone entrypoint:
-scripts/test-pci.sh
 ```
 
 ## QEMU inspection

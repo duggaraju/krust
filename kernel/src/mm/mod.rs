@@ -1,6 +1,7 @@
 pub mod address_space;
 pub mod frame_allocator;
 pub mod heap;
+pub mod page;
 pub mod stats;
 
 use bootloader_api::info::MemoryRegion;
@@ -28,6 +29,7 @@ pub fn init_with(physical_memory_offset: u64, memory_regions: &'static [MemoryRe
 
     stats::init(memory_regions);
     heap::init(&mut mapper, &mut frame_allocator);
+    frame_allocator.enable_recycling();
     *FRAME_ALLOCATOR.lock() = Some(frame_allocator);
     let (root_frame, _) = Cr3::read();
     KERNEL_ROOT_FRAME.call_once(|| root_frame);

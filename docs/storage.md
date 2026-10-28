@@ -82,14 +82,15 @@ Only root selection must live in the boot ramdisk: the kernel cannot read a
 disk's `/etc/fstab` until that root is mounted. A root fstab entry, if supplied,
 must agree with the early settings; it is checked, not mounted twice.
 Other fstab entries are validated before mounting, with parents before children.
-Supported types are `ext4`, `fat`, `ramfs`, `proc`, and `dev`, subject to compiled
+Supported types are `ext4`, `fat`, `ramfs`, `tmpfs`, `proc`, and `dev`, subject to compiled
 features. Disk sources must be explicit `/dev/...` paths; UUID/LABEL lookup and
 automatic filesystem probing are not implemented.
 
 ## Fstab validation and fallback behavior
 
 Use six fstab fields, with final fields `0 0` (dump/fsck are not implemented).
-Only `defaults` and `noauto` options are supported; unsupported options such as
+Except for the tmpfs-specific options below, only `defaults` and `noauto` options
+are supported; unsupported options such as
 `ro`, `rw`, `nofail`, or `bind` are rejected rather than silently ignored.
 `defaults` uses the driver's current behavior, not the full Linux option set.
 Blank lines, comments, and interior spaces escaped as `\040` are supported.
@@ -105,13 +106,82 @@ roots without `/etc/fstab` use the ramdisk fallback with a warning. An explicitl
 requested missing disk root never silently falls back to RAM. Move/copy the
 sidecar along with newly generated images.
 
+## RAM filesystems
+
+`ramfs` and `tmpfs` share the in-memory inode/directory implementation, including
+metadata, rename, truncation, removal, and open-unlinked file lifetimes. They
+use different storage policies: ramfs retains contiguous heap-backed file data
+with no filesystem quota; tmpfs uses sparse, zero-filled 4 KiB physical pages
+outside the kernel heap, with independent limits for each mount.
+
+Enable `fs-tmpfs` (included in the default `fs` umbrella) and add entries to
+the root image's `/etc/fstab`, for example:
+
+```fstab
+tmpfs /tmp tmpfs size=16M,nr_inodes=1024,mode=1777 0 0
+none  /run tmpfs size=4M,nr_inodes=256,mode=0755,uid=0,gid=0 0 0
+```
+
+Tmpfs is currently a non-root mount; early root selection remains
+`ext4`, `fat`, or `ramfs`. No tmpfs mounts are installed automatically.
+
+| Option | Default | Meaning |
+|--------|---------|---------|
+| `size` | `16M` | Positive byte limit, rounded up to 4 KiB; optional `K`, `M`, `G` suffix (case-insensitive) |
+| `nr_inodes` | `1024` | Positive inode limit, including the root directory |
+| `mode` | `0755` | Root directory permission bits, in octal |
+| `uid`, `gid` | `0`, `0` | Root ownership and initial ownership of directly created VFS inodes |
+
+Limits do not reserve memory upfront. Only allocated file pages consume the
+byte quota: seeking or extending with truncate leaves holes without allocating
+pages. Inode and page-index metadata still use the kernel heap; the inode limit
+also bounds directory entries (names are limited to 255 bytes). Quota exhaustion
+returns `ENOSPC`; tmpfs data/metadata allocation failures return `ENOMEM`.
+Writes may return a short count if only part fits. Existing pages remain writable
+at the limit. Truncation releases pages and zeroes the retained page's tail.
+Unlink removes the name immediately, but pages and the inode remain charged
+until the last strong reference, including open descriptors, is released.
+
+The in-memory backends support create/exclusive-open, truncate, atomic append,
+mkdir/rmdir, unlink, rename within one mount, and uid/gid/mode updates. Tmpfs
+`statfs`/`fstatfs` report page/inode capacity and free counts; file `stat` reports
+allocated 512-byte blocks rather than charging sparse holes. The new `*at`
+operations support absolute paths and `AT_FDCWD`; other relative dirfds fail
+explicitly. Other filesystem drivers retain unsupported-operation errors for
+VFS methods they do not implement.
+
+This is not full Linux tmpfs compatibility: the kernel does not yet provide
+complete permission/sticky-bit enforcement, umask, timestamps, or hard-link
+syscalls. Storing `mode=1777` does not itself enforce sticky-directory rules.
+There is no swap or file-backed mmap; `/dev/shm` alone would therefore not supply
+shared-memory mappings. Follow-ups are [shared mappings (#68)](https://github.com/duggaraju/krust/issues/68)
+and [swap/reclaim (#69)](https://github.com/duggaraju/krust/issues/69).
+
+### RAM filesystem regression tests
+
+```bash
+cargo test -Z bindeps --locked -p krust --test memfs --bin krust
+cargo test -Z bindeps --locked -p krust --test qemu tmpfs -- --ignored --exact --nocapture
+```
+
+Host tests cover sparse holes, exact byte/inode limits, partial writes,
+allocation-failure rollback, truncation, metadata, atomic append, concurrent
+reservations, cross-directory rename/cycle rejection, mount independence,
+ramfs behavior, and final-close reclamation through VFS.
+The guest suite uses a Cargo-built `no_std` Rust probe and builds an owned ext4
+fixture using an existing BusyBox, tests
+real syscalls on BIOS and UEFI, verifies nested mounts, writes 3 MiB (larger than
+the kernel heap), and repeatedly reuses freed frames. It does not modify the
+source BusyBox or existing disks. Logs are retained as
+the unique `target/cargo-tests/native/tmpfs-*/` directory printed by the Rust harness.
+
 ## Mount regression tests
 
 ```bash
 cargo test -Z bindeps --locked -p krust --bin krust
-cargo build -Z bindeps --locked
-scripts/test-boot-mounts.sh              # requires target/rootfs/bin/busybox and e2fsprogs
-scripts/smoke-shell.sh target/krust-disk-ext4.vhd
+# Requires target/rootfs/bin/busybox and e2fsprogs.
+cargo test -Z bindeps --locked -p krust --test qemu boot_mounts -- --ignored --exact --nocapture
+cargo test -Z bindeps --locked -p krust --test qemu shell_commands -- --ignored --exact --nocapture
 ```
 
 The mount suite exercises FAT/ext4 roots, source/custom fstab preservation,
@@ -121,5 +191,4 @@ required devices. Guest tests use snapshots and bounded process cleanup.
 It does not certify ext4 mutations:
 [the mkdir EIO issue remains open (#51)](https://github.com/duggaraju/krust/issues/51).
 
-The suite is also available as the `boot_mounts` Cargo integration test;
-see [Cargo test targets](testing/README.md).
+See [Cargo test targets](testing/README.md) for fixture overrides and test filtering.

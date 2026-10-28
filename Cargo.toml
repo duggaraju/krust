@@ -15,13 +15,13 @@ ovmf-prebuilt = "0.2.9"
 fatfs = "0.3.6"
 clap = { version = "4.6.1", features = ["derive"] }
 
-[[test]]
-name = "cloexec"
-path = "scripts/tests/cloexec.rs"
-
-[[test]]
-name = "mmap"
-path = "scripts/tests/mmap-range.rs"
+[dev-dependencies]
+guest = { package = "krust-guest", path = "tests/guest", artifact = "bin", target = "x86_64-unknown-none" }
+mock = { package = "krust-mock", path = "tests/mock", artifact = "bin" }
+spin = "0.12"
+log = "0.4.29"
+regex = "1"
+nix = { version = "0.31.3", features = ["signal", "process"] }
 
 [[test]]
 name = "pci"
@@ -31,6 +31,8 @@ path = "kernel/src/drivers/bus/pci/enumeration.rs"
 resolver = "3"
 members = [
     "kernel",
+    "tests/guest",
+    "tests/mock",
 ]
 
 [profile.dev]

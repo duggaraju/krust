@@ -8,6 +8,7 @@ pub mod devfs;
 pub mod ext4fs;
 pub mod fat;
 pub mod initrd;
+pub mod memfs;
 
 pub mod procfs;
 pub mod ramfs;
@@ -50,6 +51,12 @@ pub fn init() {
     let _ = register_filesystem(ramfs);
     log::info!("registered ramfs filesystem");
 
+    #[cfg(feature = "fs-tmpfs")]
+    {
+        let _ = register_filesystem_factory("tmpfs", Arc::new(TmpfsFactory));
+        log::info!("registered tmpfs filesystem factory");
+    }
+
     #[cfg(feature = "drivers")]
     {
         let _ = register_filesystem_factory("fatfs", Arc::new(fat::FatFsFactory));
@@ -90,6 +97,7 @@ pub struct MountOptions {
     pub create_mountpoint_if_missing: bool,
     pub uid: u32,
     pub gid: u32,
+    pub tmpfs: crate::boot_settings::TmpfsOptions,
 }
 
 #[derive(Clone, Default)]
@@ -130,12 +138,13 @@ impl Default for MountOptions {
             create_mountpoint_if_missing: true,
             uid: 0,
             gid: 0,
+            tmpfs: crate::boot_settings::TmpfsOptions::default(),
         }
     }
 }
 
 impl MountOptions {
-    pub fn with_pairs(mut self, pairs: &MountOptionPairs) -> Self {
+    pub fn with_pairs(mut self, pairs: &MountOptionPairs) -> Result<Self, FsError> {
         if let Some(create_mountpoint_if_missing) = pairs.get_bool("create_mountpoint_if_missing") {
             self.create_mountpoint_if_missing = create_mountpoint_if_missing;
         }
@@ -145,7 +154,14 @@ impl MountOptions {
         if let Some(gid) = pairs.get_u32("gid") {
             self.gid = gid;
         }
-        self
+        for key in ["size", "nr_inodes", "mode", "uid", "gid"] {
+            if let Some(value) = pairs.get(key) {
+                self.tmpfs
+                    .set(key, value)
+                    .map_err(|_| FsError::InvalidArgument)?;
+            }
+        }
+        Ok(self)
     }
 }
 
@@ -300,23 +316,66 @@ pub fn register_mount_with_options(
         path: normalized,
         filesystem: filesystem.to_string(),
         device,
-        options: MountOptions::default().with_pairs(&option_pairs),
+        options: MountOptions::default().with_pairs(&option_pairs)?,
     });
     Ok(())
 }
 
 pub fn mount_required(path: &str, name: &str, device: MountDevice) -> Result<(), FsError> {
+    mount_required_with_options(path, name, device, &MountOptions::default())
+}
+
+#[cfg(feature = "fs-tmpfs")]
+struct TmpfsFactory;
+
+#[cfg(feature = "fs-tmpfs")]
+impl FileSystemFactory for TmpfsFactory {
+    fn mount(
+        &self,
+        _mountpoint: Arc<dyn Inode>,
+        device: Option<MountBlockDevice>,
+        options: &MountOptions,
+    ) -> Result<Arc<dyn FileSystem>, FsError> {
+        if device.is_some() {
+            return Err(FsError::InvalidArgument);
+        }
+        let fs = memfs::MemoryFs::tmpfs(options.tmpfs)?;
+        Ok(Arc::try_new(fs).map_err(|_| FsError::OutOfMemory)?)
+    }
+
+    fn unmount(
+        &self,
+        _mountpoint: Arc<dyn Inode>,
+        _device: Option<MountBlockDevice>,
+    ) -> Result<(), FsError> {
+        Ok(())
+    }
+}
+
+pub fn mount_required_with_options(
+    path: &str,
+    name: &str,
+    device: MountDevice,
+    options: &MountOptions,
+) -> Result<(), FsError> {
     if path != "/" {
         ensure_directory_path(path)?;
     }
     let fs: Arc<dyn FileSystem> = if name == "ramfs" {
         Arc::new(RamFs::new())
     } else if matches!(device, MountDevice::None) {
-        filesystem(name)?
+        match filesystem(name) {
+            Ok(fs) => fs,
+            Err(FsError::NotFound) => {
+                let mountpoint = self::vfs::lookup_path(path)?;
+                filesystem_from_factory(name, mountpoint, None, options)?
+            }
+            Err(error) => return Err(error),
+        }
     } else {
         let mountpoint = self::vfs::lookup_path(path)?;
         let block = resolve_mount_block_device(&device)?;
-        filesystem_from_factory(name, mountpoint, block, &MountOptions::default())?
+        filesystem_from_factory(name, mountpoint, block, options)?
     };
     if path == "/" {
         self::vfs::mount_root(fs)?;

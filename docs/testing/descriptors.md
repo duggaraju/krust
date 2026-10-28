@@ -5,16 +5,15 @@
 Run all commands from the repository root. This documents the #20 regression.
 
 ```bash
-scripts/test-cloexec.sh
-scripts/test-smoke-userspace.sh
-cargo check -p kernel --target x86_64-unknown-none --locked
-cargo build -Z bindeps --locked
-scripts/test-cloexec-guest.sh target/krust-disk-ext4.vhd
-scripts/smoke-userspace.sh target/krust-disk-ext4.vhd
+cargo test -Z bindeps --locked -p krust --test cloexec
+cargo test -Z bindeps --locked -p krust --test harnesses
+cargo test -Z bindeps --locked -p krust --test qemu cloexec -- --ignored --exact --nocapture
+cargo test -Z bindeps --locked -p krust --test qemu userspace_smoke -- --ignored --exact --nocapture
 ```
 
-Cargo also exposes the native `cloexec` target and the ignored `qemu` target's
-`cloexec` case; see [test selection](README.md#cargo-targets-and-filtering).
+The native `cloexec` target runs host tests; the ignored `qemu::cloexec` case
+boots both firmware modes. See [test selection](README.md#cargo-targets-and-filtering)
+for fixture overrides and additional filters.
 
 ## Semantics
 
@@ -37,8 +36,9 @@ can use the kernel syscall stack.
 ## Coverage and requirements
 
 Host tests compile the actual generic descriptor table used by tasks, not a
-separate flag model. The guest harness compiles **two** static no-libc syscall
-images, injects them and a fixed data file into an owned ext4 VHD **copy**, and
+separate flag model. Cargo builds **two** static `no_std` Rust syscall
+images from [the guest package](../../tests/guest/Cargo.toml).
+The guest harness injects them and a fixed data file into an owned ext4 VHD **copy**, and
 runs BIOS and UEFI with `-snapshot`. Both source and copied VHD hashes are
 checked. It requires separate exact-line markers from the first image (failed
 exec preserved flags), second image (successful exec removed them), and kernel
@@ -47,9 +47,10 @@ It also exercises both open entry points, both fcntl duplication variants,
 invalid descriptors, flag clearing, I/O retention, close/reuse and fd 0 reuse.
 
 The complete ordinary BusyBox smoke follows in each boot; logs are retained in
-`target/cloexec-guest-{bios,uefi}{,-kernel}.log`. Owned binaries, disk copies,
-scratch directories and processes are cleaned up. Requires existing `cc`,
-`debugfs`, and the ordinary smoke prerequisites; no dependency changes.
+the unique `target/cargo-tests/native/cloexec-*/` directory printed by the harness.
+Owned binaries, disk copies,
+scratch directories and processes are cleaned up. Requires `debugfs`, the pinned
+Rust toolchain, and the ordinary smoke prerequisites; no C compiler or libc.
 
 ## Bounded scope
 

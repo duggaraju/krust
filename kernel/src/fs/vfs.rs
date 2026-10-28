@@ -67,6 +67,31 @@ pub enum FsError {
     Busy,
     IoError,
     NotSupported,
+    NoSpace,
+    OutOfMemory,
+    InvalidArgument,
+    NotEmpty,
+    CrossDevice,
+    NameTooLong,
+    FileTooLarge,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SetMetadata {
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub mode: Option<u16>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FsStats {
+    pub magic: u64,
+    pub block_size: u64,
+    pub blocks: u64,
+    pub blocks_free: u64,
+    pub files: u64,
+    pub files_free: u64,
+    pub name_max: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -109,6 +134,9 @@ pub trait FileSystem: Send + Sync {
     fn fs_id(&self) -> u64 {
         0
     }
+    fn statfs(&self) -> Result<FsStats, FsError> {
+        Err(FsError::NotSupported)
+    }
     fn ioctl(&self, _request: usize, _arg: usize) -> Result<usize, FsError> {
         Err(FsError::NotSupported)
     }
@@ -124,17 +152,43 @@ pub trait FileSystem: Send + Sync {
     }
 }
 
-pub trait Inode: Send + Sync {
+pub trait Inode: Send + Sync + core::any::Any {
     fn ino(&self) -> u64 {
         0
     }
 
     fn read(&self, offset: usize, buf: &mut [u8]) -> Result<usize, FsError>;
     fn write(&self, offset: usize, buf: &[u8]) -> Result<usize, FsError>;
+    fn append(&self, _buf: &[u8]) -> Result<(usize, usize), FsError> {
+        Err(FsError::NotSupported)
+    }
     fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>, FsError>;
     fn create(&self, name: &str, file_type: FileType) -> Result<Arc<dyn Inode>, FsError>;
     fn file_type(&self) -> FileType;
     fn size(&self) -> usize;
+    fn truncate(&self, _size: usize) -> Result<(), FsError> {
+        Err(FsError::NotSupported)
+    }
+    fn unlink(&self, _name: &str, _directory: bool) -> Result<(), FsError> {
+        Err(FsError::NotSupported)
+    }
+    fn rename(
+        &self,
+        _name: &str,
+        _destination: &dyn Inode,
+        _new_name: &str,
+    ) -> Result<(), FsError> {
+        Err(FsError::NotSupported)
+    }
+    fn set_metadata(&self, _metadata: SetMetadata) -> Result<(), FsError> {
+        Err(FsError::NotSupported)
+    }
+    fn links(&self) -> u64 {
+        1
+    }
+    fn blocks(&self) -> u64 {
+        (self.size() as u64).div_ceil(512)
+    }
     fn uid(&self) -> u32 {
         0
     }
@@ -230,6 +284,22 @@ pub fn mount(path: &str, fs: Arc<dyn FileSystem>) -> Result<(), FsError> {
 pub fn unmount(path: &str) -> Result<(), FsError> {
     let normalized = normalize_absolute_path(path)?;
     filesystem_manager().lock().unmount(&normalized)
+}
+
+pub fn check_mount_mutation(path: &str) -> Result<(), FsError> {
+    let manager = filesystem_manager().lock();
+    if path == "/"
+        || manager.mounts.iter().any(|mount| {
+            mount.path == path
+                || mount
+                    .path
+                    .strip_prefix(path)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+    {
+        return Err(FsError::Busy);
+    }
+    Ok(())
 }
 
 pub fn lookup_path(path: &str) -> Result<Arc<dyn Inode>, FsError> {
@@ -756,6 +826,7 @@ pub struct OpenFile {
     tracked_open: bool,
     tuple_key: InodeTuple,
     tracked_ref: bool,
+    append: bool,
     #[cfg(feature = "drivers")]
     device: Option<registry::DeviceDescriptor>,
 }
@@ -776,6 +847,7 @@ impl OpenFile {
             tracked_open: false,
             tuple_key: key,
             tracked_ref: false,
+            append: false,
             #[cfg(feature = "drivers")]
             device: None,
         };
@@ -795,11 +867,11 @@ impl OpenFile {
             }
             file.device = Some(descriptor);
         }
-        inode_tuple_index()
-            .lock()
-            .insert(key, Arc::clone(&file.inode));
         {
             let mut counts = inode_ref_counts().lock();
+            inode_tuple_index()
+                .lock()
+                .insert(key, Arc::clone(&file.inode));
             let count = counts.entry(key).or_insert(0);
             *count = count.saturating_add(1);
             file.tracked_ref = true;
@@ -817,6 +889,14 @@ impl OpenFile {
 
     pub fn position(&self) -> usize {
         self.cursor
+    }
+
+    pub fn set_append(&mut self, append: bool) {
+        self.append = append;
+    }
+
+    pub fn is_append(&self) -> bool {
+        self.append
     }
 
     pub fn descriptor(&self, mode: FileOpenMode) -> FileDescriptor {
@@ -893,6 +973,7 @@ impl OpenFile {
         if let Some(count) = counts.get_mut(&self.tuple_key) {
             if *count <= 1 {
                 counts.remove(&self.tuple_key);
+                inode_tuple_index().lock().remove(&self.tuple_key);
             } else {
                 *count -= 1;
             }
@@ -919,6 +1000,11 @@ impl File for OpenFile {
     }
 
     fn write(&mut self, buf: &[u8]) -> Result<usize, FsError> {
+        if self.append {
+            let (offset, written) = self.inode.append(buf)?;
+            self.cursor = offset + written;
+            return Ok(written);
+        }
         #[cfg(feature = "drivers")]
         let bytes_written = if let Some(device) = self.lookup_device() {
             device

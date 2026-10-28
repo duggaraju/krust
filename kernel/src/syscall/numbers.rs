@@ -51,6 +51,21 @@ pub const SYS_WAIT4: usize = 61;
 pub const SYS_SCHED_YIELD: usize = 24;
 pub const SYS_EXIT_GROUP: usize = 231;
 pub const SYS_SHUTDOWN: usize = 500;
+pub const SYS_TRUNCATE: usize = 76;
+pub const SYS_FTRUNCATE: usize = 77;
+pub const SYS_RENAME: usize = 82;
+pub const SYS_MKDIR: usize = 83;
+pub const SYS_RMDIR: usize = 84;
+pub const SYS_UNLINK: usize = 87;
+pub const SYS_CHMOD: usize = 90;
+pub const SYS_FCHMOD: usize = 91;
+pub const SYS_CHOWN: usize = 92;
+pub const SYS_FCHOWN: usize = 93;
+pub const SYS_STATFS: usize = 137;
+pub const SYS_FSTATFS: usize = 138;
+pub const SYS_MKDIRAT: usize = 258;
+pub const SYS_UNLINKAT: usize = 263;
+pub const SYS_RENAMEAT: usize = 264;
 
 pub const MAX_SYSCALL: usize = 512;
 
@@ -110,6 +125,21 @@ pub enum Syscall {
     SchedYield = SYS_SCHED_YIELD,
     ExitGroup = SYS_EXIT_GROUP,
     Shutdown = SYS_SHUTDOWN,
+    Truncate = SYS_TRUNCATE,
+    Ftruncate = SYS_FTRUNCATE,
+    Rename = SYS_RENAME,
+    Mkdir = SYS_MKDIR,
+    Rmdir = SYS_RMDIR,
+    Unlink = SYS_UNLINK,
+    Chmod = SYS_CHMOD,
+    Fchmod = SYS_FCHMOD,
+    Chown = SYS_CHOWN,
+    Fchown = SYS_FCHOWN,
+    Statfs = SYS_STATFS,
+    Fstatfs = SYS_FSTATFS,
+    Mkdirat = SYS_MKDIRAT,
+    Unlinkat = SYS_UNLINKAT,
+    Renameat = SYS_RENAMEAT,
 }
 
 impl Syscall {
@@ -172,6 +202,21 @@ impl Syscall {
             Self::SchedYield => "sched_yield",
             Self::ExitGroup => "exit_group",
             Self::Shutdown => "shutdown",
+            Self::Truncate => "truncate",
+            Self::Ftruncate => "ftruncate",
+            Self::Rename => "rename",
+            Self::Mkdir => "mkdir",
+            Self::Rmdir => "rmdir",
+            Self::Unlink => "unlink",
+            Self::Chmod => "chmod",
+            Self::Fchmod => "fchmod",
+            Self::Chown => "chown",
+            Self::Fchown => "fchown",
+            Self::Statfs => "statfs",
+            Self::Fstatfs => "fstatfs",
+            Self::Mkdirat => "mkdirat",
+            Self::Unlinkat => "unlinkat",
+            Self::Renameat => "renameat",
         }
     }
 
@@ -179,7 +224,7 @@ impl Syscall {
         match self {
             Self::Read => 3,
             Self::Write => 3,
-            Self::Open => 2,
+            Self::Open => 3,
             Self::Close => 1,
             Self::Stat => 2,
             Self::Fstat => 2,
@@ -230,11 +275,37 @@ impl Syscall {
             Self::SchedYield => 0,
             Self::ExitGroup => 1,
             Self::Shutdown => 0,
+            Self::Truncate
+            | Self::Ftruncate
+            | Self::Rename
+            | Self::Mkdir
+            | Self::Chmod
+            | Self::Fchmod
+            | Self::Statfs
+            | Self::Fstatfs => 2,
+            Self::Rmdir | Self::Unlink => 1,
+            Self::Chown | Self::Fchown | Self::Mkdirat | Self::Unlinkat => 3,
+            Self::Renameat => 4,
         }
     }
 
     pub const fn from_number(number: usize) -> Option<Self> {
         match number {
+            SYS_TRUNCATE => Some(Self::Truncate),
+            SYS_FTRUNCATE => Some(Self::Ftruncate),
+            SYS_RENAME => Some(Self::Rename),
+            SYS_MKDIR => Some(Self::Mkdir),
+            SYS_RMDIR => Some(Self::Rmdir),
+            SYS_UNLINK => Some(Self::Unlink),
+            SYS_CHMOD => Some(Self::Chmod),
+            SYS_FCHMOD => Some(Self::Fchmod),
+            SYS_CHOWN => Some(Self::Chown),
+            SYS_FCHOWN => Some(Self::Fchown),
+            SYS_STATFS => Some(Self::Statfs),
+            SYS_FSTATFS => Some(Self::Fstatfs),
+            SYS_MKDIRAT => Some(Self::Mkdirat),
+            SYS_UNLINKAT => Some(Self::Unlinkat),
+            SYS_RENAMEAT => Some(Self::Renameat),
             SYS_READ => Some(Self::Read),
             SYS_WRITE => Some(Self::Write),
             SYS_OPEN => Some(Self::Open),

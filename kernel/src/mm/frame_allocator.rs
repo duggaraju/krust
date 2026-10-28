@@ -12,6 +12,7 @@ pub struct BootInfoFrameAllocator {
     memory_regions: &'static [MemoryRegion],
     next: usize,
     recycled: Vec<PhysFrame>,
+    recycling_ready: bool,
 }
 
 impl BootInfoFrameAllocator {
@@ -20,12 +21,17 @@ impl BootInfoFrameAllocator {
             memory_regions,
             next: 0,
             recycled: Vec::new(),
+            recycling_ready: false,
         }
     }
 
     pub fn allocate_frame(&mut self) -> Option<PhysFrame> {
         if let Some(frame) = self.recycled.pop() {
             return Some(frame);
+        }
+        if self.recycling_ready {
+            // Reserve before issuing a frame so reclamation never allocates.
+            self.recycled.try_reserve(self.next + 1).ok()?;
         }
         let frame = self.usable_frames().nth(self.next);
         if frame.is_some() {
@@ -36,6 +42,11 @@ impl BootInfoFrameAllocator {
 
     pub fn deallocate_frame(&mut self, frame: PhysFrame) {
         self.recycled.push(frame);
+    }
+
+    pub fn enable_recycling(&mut self) {
+        self.recycled.reserve(self.next);
+        self.recycling_ready = true;
     }
 
     fn usable_frames(&self) -> impl Iterator<Item = PhysFrame> + '_ {

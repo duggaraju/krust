@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![feature(allocator_api)]
 #![cfg_attr(feature = "arch-x86_64", feature(abi_x86_interrupt))]
 
 extern crate alloc;

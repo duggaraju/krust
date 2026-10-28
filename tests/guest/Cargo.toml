@@ -1,0 +1,45 @@
+[package]
+name = "krust-guest"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+test = false
+bench = false
+doctest = false
+
+[[bin]]
+name = "tmpfs"
+path = "src/tmpfs.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "cloexec_before"
+path = "src/cloexec_before.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "cloexec_after"
+path = "src/cloexec_after.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "mmap"
+path = "src/mmap.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "mmap_protection"
+path = "src/mmap_protection.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "process"
+path = "src/process.rs"
+test = false
+bench = false

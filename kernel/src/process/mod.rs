@@ -323,16 +323,7 @@ pub fn close_all_fds(pid: u64) -> Result<(), isize> {
 }
 
 fn errno_from_fs(err: FsError) -> isize {
-    match err {
-        FsError::NotFound => -2,
-        FsError::PermissionDenied => -13,
-        FsError::NotADirectory => -20,
-        FsError::IsADirectory => -21,
-        FsError::AlreadyExists => -17,
-        FsError::IoError => -5,
-        FsError::Busy => -16,
-        FsError::NotSupported => -95,
-    }
+    crate::syscall::impls::errno_from_fs(err)
 }
 
 pub fn read_fd(fd: usize, buf: &mut [u8]) -> Result<usize, isize> {
@@ -484,7 +475,10 @@ pub fn wait_for_child(pid: Option<u64>) -> Result<(u64, i32), isize> {
     wait_for_child_with_options(pid, false)?.ok_or(-10)
 }
 
-pub fn wait_for_child_with_options(pid: Option<u64>, nohang: bool) -> Result<Option<(u64, i32)>, isize> {
+pub fn wait_for_child_with_options(
+    pid: Option<u64>,
+    nohang: bool,
+) -> Result<Option<(u64, i32)>, isize> {
     let parent_pid = current_pid();
 
     loop {
@@ -494,9 +488,11 @@ pub fn wait_for_child_with_options(pid: Option<u64>, nohang: bool) -> Result<Opt
                 return Err(-1);
             };
             let reaped = scheduler.reap_zombie_child(parent_pid, pid);
-            if reaped.is_none() && !scheduler.tasks().any(|task| {
-                task.parent_pid == parent_pid && pid.is_none_or(|pid| task.pid == pid)
-            }) {
+            if reaped.is_none()
+                && !scheduler.tasks().any(|task| {
+                    task.parent_pid == parent_pid && pid.is_none_or(|pid| task.pid == pid)
+                })
+            {
                 return Err(-10); // ECHILD
             }
             reaped

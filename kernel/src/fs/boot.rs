@@ -1,7 +1,7 @@
 use alloc::format;
 use alloc::string::String;
 
-use super::{MountDevice, mount_required, vfs};
+use super::{MountDevice, MountOptions, mount_required, mount_required_with_options, vfs};
 use crate::boot_config::{read_config_inode, read_ramdisk_file};
 use crate::boot_settings::{BootSettings, parse_fstab, validate_fstab_root};
 
@@ -66,12 +66,18 @@ pub fn mount_filesystems(
         } else {
             MountDevice::None
         };
-        mount_required(&entry.target, &entry.filesystem, device).map_err(|e| {
-            format!(
-                "fstab: {} on {} ({}): {e:?}",
-                entry.source, entry.target, entry.filesystem
-            )
-        })?;
+        let options = MountOptions {
+            tmpfs: entry.tmpfs,
+            ..MountOptions::default()
+        };
+        mount_required_with_options(&entry.target, &entry.filesystem, device, &options).map_err(
+            |e| {
+                format!(
+                    "fstab: {} on {} ({}): {e:?}",
+                    entry.source, entry.target, entry.filesystem
+                )
+            },
+        )?;
     }
     log::info!("fstab: configured mounts ready");
     Ok(())

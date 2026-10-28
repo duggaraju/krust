@@ -54,9 +54,14 @@ To exercise **every installed `/bin` utility through the userspace BusyBox
 shell**, rather than similarly named kernel built-ins:
 
 ```bash
-bash scripts/tests/test-utility-cases.sh
-scripts/test-busybox-utilities.sh
-scripts/test-busybox-utilities.sh target/rootfs/bin/busybox target/debug/krust ext4
+# Host-only validator checks using an existing BusyBox binary.
+cargo test -Z bindeps --locked -p krust --test harnesses installed_utility_validators -- --ignored --exact
+
+# All four full matrices: FAT/ext4, BIOS/UEFI.
+cargo test -Z bindeps --locked -p krust --test qemu busybox_ -- --ignored --nocapture --test-threads=2
+
+# One complete matrix, sharing a guest boot between utilities.
+cargo test -Z bindeps --locked -p krust --test qemu busybox_ext4_uefi -- --ignored --exact --nocapture
 ```
 
 The matrix is derived from the applets actually installed by the rootfs setup
@@ -70,15 +75,17 @@ existence are checked too. New-file destinations generally use a RAM-backed
 Compression and `xargs -a` avoid shell redirection so a broken redirection
 syscall cannot prevent those applets from actually launching.
 
-By default both BIOS and UEFI run the complete matrix. A hung/crashed case fails
+Guest tests are ignored by default; `--ignored` explicitly enables them. The
+`busybox_` filter above runs both filesystems under BIOS and UEFI. A hung/crashed case fails
 after a bounded deadline and the next case boots a fresh snapshot, so one broken
 utility cannot prevent the remaining utilities from being attempted. The source
 disk is hash-checked and temporary images/processes are cleaned up.
 
 Results, including trace-verified applet launches, are in
-`target/busybox-utilities-{fat,ext4}.tsv`; per-case console/kernel
-logs and per-firmware syscall/unimplemented-syscall inventories share that
-prefix. Any functional failure, missing completion marker, exception, timeout,
+`report.tsv` in the unique `target/cargo-tests/native/busybox-*` directory
+printed by the Rust harness. Per-case response/kernel logs, boot console logs,
+and syscall/unimplemented-syscall inventories are retained alongside it.
+Any functional failure, missing completion marker, exception, timeout,
 or bad shutdown makes the suite exit nonzero.
 
 These are compatibility tests, not a claim that all utilities or Linux syscalls
@@ -89,10 +96,27 @@ applet requires a guest-reachable HTTP fixture before it can pass if enabled.
 The host-only validator checks positive/negative output and status assertions;
 it does not replace the real QEMU runs.
 
-See [Cargo test targets and filtering](testing/README.md) for individual guest
-cases, full matrix targets, fixture overrides, and report directories. The
-script also supports focused runs:
+The native `busybox` target has 160 independently selectable tests for the
+current 40 installed utilities. Each selected test creates its own image and
+boot; use the `qemu` matrix targets above for efficient complete coverage.
+Cargo filters select utility, filesystem, and firmware:
 
 ```bash
-scripts/test-busybox-utilities.sh --firmware uefi --utility cat --utility false --output-dir target/selected-utilities
+# Discover available test names without booting QEMU.
+cargo test -Z bindeps --locked -p krust --test busybox -- --list
+
+# A single utility under one filesystem/firmware combination.
+cargo test -Z bindeps --locked -p krust --test busybox ext4::uefi::cat -- --ignored --exact --nocapture
+
+# cat under all four filesystem/firmware combinations.
+cargo test -Z bindeps --locked -p krust --test busybox ::cat -- --ignored --nocapture --test-threads=2
+
+# Multiple exact test names go after --.
+cargo test -Z bindeps --locked -p krust --test busybox -- --ignored --exact --nocapture ext4::uefi::cat ext4::uefi::false_exit_status
 ```
+
+`true` and `false` use the test names `true_exit_status` and `false_exit_status`.
+Set `KRUST_TEST_BUSYBOX` to override the BusyBox fixture and
+`KRUST_TEST_OUTPUT_DIR` to change the parent of the unique log/report directories.
+See [Cargo test targets and filtering](testing/README.md) for other guest suites,
+disk fixture overrides, and isolation details.

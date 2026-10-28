@@ -23,12 +23,56 @@ pub struct Stat {
     pub gid: u32,
     pub size: u64,
     pub mode: u32,
+    pub links: u64,
+    pub blocks: u64,
 }
 
 pub fn open(path: &str, flags: usize) -> Result<usize, isize> {
+    open_with_mode(path, flags, 0o644)
+}
+
+pub fn open_with_mode(path: &str, flags: usize, permissions: u16) -> Result<usize, isize> {
     let absolute = resolve_absolute_from_current_cwd(path).map_err(errno_from_fs)?;
-    let file = vfs::open_path(absolute.as_str()).map_err(errno_from_fs)?;
-    let mode = match flags & 3 {
+    let access = flags & 3;
+    if access == 3 {
+        return Err(-22);
+    }
+    if flags & 0x10040 == 0x10040 {
+        return Err(-22);
+    }
+    if flags & 0x40 != 0 {
+        match vfs::lookup_path(&absolute) {
+            Ok(_) if flags & 0x80 != 0 => return Err(-17),
+            Ok(_) => {}
+            Err(FsError::NotFound) => match vfs::create_path(&absolute, FileType::Regular) {
+                Ok(inode) if matches!(inode.filesystem_name(), "tmpfs" | "ramfs") => {
+                    inode
+                        .set_metadata(vfs::SetMetadata {
+                            uid: Some(process::current_uid()),
+                            gid: Some(process::current_gid()),
+                            mode: Some(permissions & 0o7777),
+                        })
+                        .map_err(errno_from_fs)?;
+                }
+                Ok(_) => {}
+                Err(FsError::AlreadyExists) if flags & 0x80 == 0 => {}
+                Err(error) => return Err(errno_from_fs(error)),
+            },
+            Err(error) => return Err(errno_from_fs(error)),
+        }
+    }
+    let mut file = vfs::open_path(absolute.as_str()).map_err(errno_from_fs)?;
+    if flags & 0x10000 != 0 && file.file_type() != FileType::Directory {
+        return Err(-20);
+    }
+    if flags & 0x200 != 0 {
+        if access == 0 {
+            return Err(-22);
+        }
+        file.inode().truncate(0).map_err(errno_from_fs)?;
+    }
+    file.set_append(flags & 0x400 != 0);
+    let mode = match access {
         0 => vfs::FileOpenMode::ReadOnly,
         1 => vfs::FileOpenMode::WriteOnly,
         _ => vfs::FileOpenMode::ReadWrite,
@@ -129,6 +173,8 @@ pub fn stat(path: &str) -> Result<Stat, isize> {
         gid: inode.gid(),
         size: inode.size() as u64,
         mode: u32::from(inode.mode()),
+        links: inode.links(),
+        blocks: inode.blocks(),
     })
 }
 
@@ -143,6 +189,8 @@ pub fn fstat(fd: usize) -> Result<Stat, isize> {
         gid: inode.gid(),
         size: inode.size() as u64,
         mode: u32::from(inode.mode()),
+        links: inode.links(),
+        blocks: inode.blocks(),
     })
 }
 
@@ -164,6 +212,112 @@ pub fn mkdir(path: &str) -> Result<(), isize> {
     create_from_cwd_from_current_cwd(path, FileType::Directory)
         .map(|_| ())
         .map_err(errno_from_fs)
+}
+
+pub fn mkdir_with_mode(path: &str, mode: u16) -> Result<(), isize> {
+    let (parent, name) = resolve_parent_from_current_cwd(path).map_err(errno_from_fs)?;
+    if !matches!(parent.filesystem_name(), "tmpfs" | "ramfs") {
+        return Err(-95);
+    }
+    let inode = parent
+        .create(&name, FileType::Directory)
+        .map_err(errno_from_fs)?;
+    inode
+        .set_metadata(vfs::SetMetadata {
+            uid: Some(process::current_uid()),
+            gid: Some(process::current_gid()),
+            mode: Some(mode & 0o7777),
+        })
+        .map_err(errno_from_fs)
+}
+
+pub fn truncate(path: &str, size: usize) -> Result<(), isize> {
+    resolve_path_from_current_cwd(path)
+        .map_err(errno_from_fs)?
+        .truncate(size)
+        .map_err(errno_from_fs)
+}
+
+pub fn ftruncate(fd: usize, size: usize) -> Result<(), isize> {
+    if process::fd_descriptor(fd)?.mode == vfs::FileOpenMode::ReadOnly {
+        return Err(-22);
+    }
+    process::with_fd(fd, |file| {
+        file.inode().truncate(size).map_err(errno_from_fs)
+    })
+}
+
+pub fn unlink(path: &str, directory: bool) -> Result<(), isize> {
+    if matches!(
+        path.trim_end_matches('/').rsplit('/').next(),
+        Some("." | "..")
+    ) {
+        return Err(-22);
+    }
+    let absolute = resolve_absolute_from_current_cwd(path).map_err(errno_from_fs)?;
+    vfs::check_mount_mutation(&absolute).map_err(errno_from_fs)?;
+    if path.ends_with('/') && !directory {
+        return Err(-21);
+    }
+    let (parent, name) = resolve_parent_from_current_cwd(&absolute).map_err(errno_from_fs)?;
+    parent.unlink(&name, directory).map_err(errno_from_fs)
+}
+
+pub fn rename(old: &str, new: &str) -> Result<(), isize> {
+    for path in [old, new] {
+        if matches!(
+            path.trim_end_matches('/').rsplit('/').next(),
+            Some("." | "..")
+        ) {
+            return Err(-22);
+        }
+    }
+    let old_absolute = resolve_absolute_from_current_cwd(old).map_err(errno_from_fs)?;
+    let new_absolute = resolve_absolute_from_current_cwd(new).map_err(errno_from_fs)?;
+    vfs::check_mount_mutation(&old_absolute).map_err(errno_from_fs)?;
+    vfs::check_mount_mutation(&new_absolute).map_err(errno_from_fs)?;
+    let (old_parent, old_name) =
+        resolve_parent_from_current_cwd(&old_absolute).map_err(errno_from_fs)?;
+    let (new_parent, new_name) =
+        resolve_parent_from_current_cwd(&new_absolute).map_err(errno_from_fs)?;
+    if old.ends_with('/') || new.ends_with('/') {
+        let inode = old_parent.lookup(&old_name).map_err(errno_from_fs)?;
+        if inode.file_type() != FileType::Directory {
+            return Err(-20);
+        }
+    }
+    old_parent
+        .rename(&old_name, new_parent.as_ref(), &new_name)
+        .map_err(errno_from_fs)
+}
+
+pub fn set_metadata(path: &str, metadata: vfs::SetMetadata) -> Result<(), isize> {
+    let inode = resolve_path_from_current_cwd(path).map_err(errno_from_fs)?;
+    update_metadata(inode.as_ref(), metadata)
+}
+
+pub fn fset_metadata(fd: usize, metadata: vfs::SetMetadata) -> Result<(), isize> {
+    process::with_fd(fd, |file| update_metadata(file.inode().as_ref(), metadata))
+}
+
+fn update_metadata(inode: &dyn Inode, metadata: vfs::SetMetadata) -> Result<(), isize> {
+    let uid = process::current_uid();
+    if uid != 0 && (uid != inode.uid() || metadata.uid.is_some() || metadata.gid.is_some()) {
+        return Err(-1);
+    }
+    inode.set_metadata(metadata).map_err(errno_from_fs)
+}
+
+pub fn statfs(path: &str) -> Result<vfs::FsStats, isize> {
+    let inode = resolve_path_from_current_cwd(path).map_err(errno_from_fs)?;
+    vfs::filesystem_by_id(inode.fs_id())
+        .map_err(errno_from_fs)?
+        .statfs()
+        .map_err(errno_from_fs)
+}
+
+pub fn fstatfs(fd: usize) -> Result<vfs::FsStats, isize> {
+    process::with_fd(fd, |file| file.filesystem().statfs().map_err(errno_from_fs))
 }
 
 pub fn write_file(path: &str, data: &[u8]) -> Result<usize, isize> {
@@ -580,6 +734,13 @@ pub fn errno_from_fs(err: FsError) -> isize {
         FsError::IoError => -5,
         FsError::Busy => -16,
         FsError::NotSupported => -95,
+        FsError::NoSpace => -28,
+        FsError::OutOfMemory => -12,
+        FsError::InvalidArgument => -22,
+        FsError::NotEmpty => -39,
+        FsError::CrossDevice => -18,
+        FsError::NameTooLong => -36,
+        FsError::FileTooLarge => -27,
     }
 }
 

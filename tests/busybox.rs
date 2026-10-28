@@ -1,17 +1,7 @@
 mod support;
 
 fn exercise(format: &str, firmware: &str, utility: &str) {
-    let output = format!("target/cargo-tests/busybox/{format}/{firmware}/{utility}");
-    support::run("scripts/test-busybox-utilities.sh", |command| {
-        command
-            .arg(support::fixture(
-                "KRUST_TEST_BUSYBOX",
-                "target/rootfs/bin/busybox",
-            ))
-            .arg(env!("CARGO_BIN_EXE_krust"))
-            .args([format, "--firmware", firmware, "--utility", utility])
-            .args(["--output-dir", &output]);
-    });
+    support::utilities::run(format, firmware, &[utility]);
 }
 
 macro_rules! utility_tests {

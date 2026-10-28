@@ -1,6 +1,6 @@
 extern crate alloc;
 
-#[path = "../../kernel/src/process/fd_table.rs"]
+#[path = "../kernel/src/process/fd_table.rs"]
 mod fd_table;
 
 use fd_table::{FD_CLOEXEC, FdTable, O_CLOEXEC};

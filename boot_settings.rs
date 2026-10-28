@@ -8,6 +8,69 @@ pub const MAX_CONFIG_BYTES: usize = 16 * 1024;
 pub const DEFAULT_VIRTUAL_CONSOLES: usize = 6;
 pub const MAX_VIRTUAL_CONSOLES: usize = 12;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TmpfsOptions {
+    pub size: usize,
+    pub nr_inodes: usize,
+    pub mode: u16,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+impl Default for TmpfsOptions {
+    fn default() -> Self {
+        Self {
+            size: 16 * 1024 * 1024,
+            nr_inodes: 1024,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+        }
+    }
+}
+
+impl TmpfsOptions {
+    pub fn set(&mut self, key: &str, value: &str) -> Result<(), &'static str> {
+        match key {
+            "size" => {
+                let (number, multiplier) = match value.as_bytes().last() {
+                    Some(b'k' | b'K') => (&value[..value.len() - 1], 1024usize),
+                    Some(b'm' | b'M') => (&value[..value.len() - 1], 1024usize.pow(2)),
+                    Some(b'g' | b'G') => (&value[..value.len() - 1], 1024usize.pow(3)),
+                    _ => (value, 1),
+                };
+                let bytes = number
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|n| n.checked_mul(multiplier))
+                    .filter(|n| *n > 0)
+                    .ok_or("invalid tmpfs size")?;
+                self.size = bytes
+                    .checked_add(4095)
+                    .map(|n| n & !4095)
+                    .ok_or("tmpfs size overflow")?;
+            }
+            "nr_inodes" => {
+                self.nr_inodes = value
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| *n > 0)
+                    .ok_or("invalid tmpfs inode limit")?;
+            }
+            "mode" => {
+                self.mode = u16::from_str_radix(value, 8)
+                    .ok()
+                    .filter(|n| *n <= 0o7777)
+                    .ok_or("invalid tmpfs mode")?;
+            }
+            "uid" => self.uid = value.parse().map_err(|_| "invalid tmpfs uid")?,
+            "gid" => self.gid = value.parse().map_err(|_| "invalid tmpfs gid")?,
+            _ => return Err("unsupported tmpfs mount option"),
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BootSettings {
     pub log_level: String,
@@ -160,6 +223,7 @@ pub struct FstabEntry {
     pub target: String,
     pub filesystem: String,
     pub noauto: bool,
+    pub tmpfs: TmpfsOptions,
 }
 
 fn canonical_path(path: &str) -> bool {
@@ -222,14 +286,26 @@ pub fn parse_fstab(contents: &str) -> Result<Vec<FstabEntry>, String> {
         let filesystem = fields[2];
         match filesystem {
             "fat" | "ext4" if source.starts_with("/dev/") && canonical_path(&source) => {}
-            "ramfs" | "proc" | "dev" if source == "none" || source == filesystem => {}
+            "ramfs" | "tmpfs" | "proc" | "dev" if source == "none" || source == filesystem => {}
             _ => return Err(error("unsupported filesystem or source")),
         }
         let mut noauto = false;
+        let mut tmpfs = TmpfsOptions::default();
+        let mut option_keys = Vec::new();
         for option in fields[3].split(',') {
             match option {
                 "defaults" => {}
                 "noauto" => noauto = true,
+                _ if filesystem == "tmpfs" => {
+                    let (key, value) = option
+                        .split_once('=')
+                        .ok_or_else(|| error("unsupported tmpfs mount option"))?;
+                    if option_keys.contains(&key) {
+                        return Err(error("duplicate tmpfs mount option"));
+                    }
+                    option_keys.push(key);
+                    tmpfs.set(key, value).map_err(error)?;
+                }
                 _ => {
                     return Err(error(
                         "unsupported mount option (only defaults and noauto are supported)",
@@ -253,6 +329,7 @@ pub fn parse_fstab(contents: &str) -> Result<Vec<FstabEntry>, String> {
             target,
             filesystem: filesystem.into(),
             noauto,
+            tmpfs,
         });
     }
     entries.sort_by_key(|entry| entry.target.matches('/').count());
@@ -351,6 +428,7 @@ mod tests {
         ] {
             assert!(parse_fstab(text).is_err(), "{text}");
         }
+
         let settings = BootSettings::default();
         assert!(
             validate_fstab_root(
@@ -359,6 +437,54 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn tmpfs_options_are_preserved_and_validated() {
+        let entries = parse_fstab(
+            "tmpfs /tmp tmpfs size=8k,nr_inodes=3,mode=1777,uid=12,gid=34 0 0\n\
+             none /run tmpfs defaults 0 0\n",
+        )
+        .unwrap();
+        assert_eq!(
+            entries[0].tmpfs,
+            TmpfsOptions {
+                size: 8192,
+                nr_inodes: 3,
+                mode: 0o1777,
+                uid: 12,
+                gid: 34,
+            }
+        );
+        assert_eq!(entries[1].tmpfs, TmpfsOptions::default());
+        for option in [
+            "size=0",
+            "size=-1",
+            "size=abc",
+            "size=18446744073709551615",
+            "size=18446744073709551615G",
+            "nr_inodes=0",
+            "nr_inodes=x",
+            "mode=888",
+            "mode=10000",
+            "uid=-1",
+            "gid=4294967296",
+            "size=4k,size=8k",
+            "noswap",
+            "ro",
+            "unknown=1",
+        ] {
+            assert!(
+                parse_fstab(&format!("none /tmp tmpfs {option} 0 0")).is_err(),
+                "{option}"
+            );
+        }
+        assert!(parse_fstab("none /tmp ramfs size=4k 0 0").is_err());
+        assert!(parse_fstab("/dev/sda /tmp tmpfs defaults 0 0").is_err());
+        assert!(parse_fstab("none / tmpfs defaults 0 0").is_err());
+        let entry = parse_fstab("none /tmp tmpfs size=1,noauto 0 0").unwrap();
+        assert_eq!(entry[0].tmpfs.size, 4096);
+        assert!(entry[0].noauto);
     }
 
     #[test]
