@@ -2,8 +2,8 @@ pub mod dispatch;
 pub mod handlers;
 pub mod impls;
 mod mmap;
-mod user_memory;
 pub mod numbers;
+pub(crate) mod user_memory;
 
 pub fn init(trace_enabled: bool) {
     dispatch::set_trace_enabled(trace_enabled);

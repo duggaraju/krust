@@ -6,42 +6,51 @@ fn visit_range(
     address: usize,
     length: usize,
     write: bool,
+    visit: impl FnMut(usize, usize, usize),
+) -> Result<(), isize> {
+    crate::process::with_current_task_mut(|task| {
+        visit_task_range(task, address, length, write, visit)
+    })
+    .ok_or(-14isize)?
+}
+
+fn visit_task_range(
+    task: &crate::process::task::Task,
+    address: usize,
+    length: usize,
+    write: bool,
     mut visit: impl FnMut(usize, usize, usize),
 ) -> Result<(), isize> {
     let end = address.checked_add(length).ok_or(-14isize)?;
     if address == 0 || end > USER_ADDRESS_END {
         return Err(-14);
     }
-    crate::process::with_current_task_mut(|task| {
-        let mut current = address;
-        while current < end {
-            let page = current & !(USER_PAGE_SIZE - 1);
-            let Some((_, physical, flags)) = task
-                .address_space
-                .mappings()
-                .find(|(virtual_address, _, _)| *virtual_address == page)
-            else {
-                log::warn!(
-                    "user copy: unmapped address 0x{:x}, pid={}",
-                    current,
-                    task.pid
-                );
-                return Err(-14);
-            };
-            let required = ArchPageFlags::PRESENT | ArchPageFlags::USER_ACCESSIBLE;
-            if !flags.contains(required) || (write && !flags.contains(ArchPageFlags::WRITABLE)) {
-                return Err(-14);
-            }
-            let offset = current - page;
-            let count = (USER_PAGE_SIZE - offset).min(end - current);
-            let pointer =
-                crate::arch::phys_to_virt_addr((physical + offset) as u64).ok_or(-14isize)?;
-            visit(pointer as usize, current - address, count);
-            current += count;
+    let mut current = address;
+    while current < end {
+        let page = current & !(USER_PAGE_SIZE - 1);
+        let Some((_, physical, flags)) = task
+            .address_space
+            .mappings()
+            .find(|(virtual_address, _, _)| *virtual_address == page)
+        else {
+            log::warn!(
+                "user copy: unmapped address 0x{:x}, pid={}",
+                current,
+                task.pid
+            );
+            return Err(-14);
+        };
+        let required = ArchPageFlags::PRESENT | ArchPageFlags::USER_ACCESSIBLE;
+        if !flags.contains(required) || (write && !flags.contains(ArchPageFlags::WRITABLE)) {
+            return Err(-14);
         }
-        Ok(())
-    })
-    .ok_or(-14isize)?
+        let offset = current - page;
+        let count = (USER_PAGE_SIZE - offset).min(end - current);
+        let pointer = crate::arch::phys_to_virt_addr((physical + offset) as u64).ok_or(-14isize)?;
+        visit(pointer as usize, current - address, count);
+        current += count;
+    }
+    Ok(())
 }
 
 pub fn validate_write(address: usize, length: usize) -> Result<(), isize> {
@@ -64,8 +73,18 @@ pub fn copy_from(address: usize, output: &mut [u8]) -> Result<(), isize> {
 }
 
 pub fn copy_to(address: usize, bytes: &[u8]) -> Result<(), isize> {
-    validate_write(address, bytes.len())?;
-    visit_range(
+    crate::process::with_current_task_mut(|task| copy_to_task(task, address, bytes))
+        .ok_or(-14isize)?
+}
+
+pub(crate) fn copy_to_task(
+    task: &crate::process::task::Task,
+    address: usize,
+    bytes: &[u8],
+) -> Result<(), isize> {
+    visit_task_range(task, address, bytes.len(), true, |_, _, _| {})?;
+    visit_task_range(
+        task,
         address,
         bytes.len(),
         true,

@@ -23,6 +23,12 @@ invalid pointers, oversized strings, a vector crossing a page boundary,
 failed-exec recovery, a canary next to the wait status buffer, and parent
 recovery after a fork child deliberately faults. It also checks the 52-field
 Linux proc stat layout, NUL-separated exec arguments, and `WUNTRACED` waits.
+Startup checks require a 16-byte-aligned stack, contiguous auxiliary vectors
+with empty/nonempty environments, a NULL static-executable finalizer, and
+`ENOSYS` for unsupported `rseq`. The fixture exercises fork-style `clone`,
+including a child-TID write crossing a page boundary, parent-memory isolation,
+and rejection of unsupported clone modes and invalid TID pointers. Relative
+`*at` calls are tested with both 32-bit representations of `AT_FDCWD`.
 The interactive shell runs userspace `ps`, and the kernel process listing must
 return to its pre-test baseline after shell exit, with no leaked zombies.
 CPU-accounting checks require both user and kernel counters to advance by at

@@ -108,6 +108,7 @@ pub struct Task {
     pub mmap_start: usize,
     pub mmap_end: usize,
     pub userland: bool,
+    pub clear_child_tid: usize,
     pub exec_path: String,
     pub cpu_time: CpuAccounting,
     fds: FdTable<FdEntry>,
@@ -218,6 +219,7 @@ impl Task {
             mmap_start: 0,
             mmap_end: 0,
             userland: false,
+            clear_child_tid: 0,
             exec_path: String::new(),
             cpu_time: CpuAccounting::new(),
             fds: FdTable::new(),
@@ -430,6 +432,7 @@ impl Task {
     }
 
     pub fn prepare_user_exec(&mut self, entry: usize, stack_top: usize) {
+        self.clear_child_tid = 0;
         self.context.set_user_entry_point(entry as u64);
         self.context.set_user_stack_pointer(stack_top as u64);
         self.context
@@ -460,6 +463,18 @@ impl Task {
 
     pub fn set_exit_code(&mut self, code: i32) {
         self.exit_code = code;
+        let address = core::mem::take(&mut self.clear_child_tid);
+        if address != 0 {
+            if let Err(errno) =
+                crate::syscall::user_memory::copy_to_task(self, address, &0i32.to_ne_bytes())
+            {
+                log::warn!(
+                    "exit: cannot clear child TID for pid={} errno={}",
+                    self.pid,
+                    errno
+                );
+            }
+        }
     }
 
     pub fn exit_code(&self) -> i32 {
@@ -482,7 +497,7 @@ impl Task {
     pub fn deliver_signal(&mut self, signal: Signal) {
         if signal.is_fatal() {
             self.terminated_by_signal = Some(signal);
-            self.exit_code = signal.exit_code();
+            self.set_exit_code(signal.exit_code());
             self.cpu_time.pause(crate::time::monotonic_ns());
             self.state = TaskState::Zombie;
         } else {
@@ -505,7 +520,7 @@ impl Task {
         while let Some(signal) = self.next_pending_signal() {
             if signal.is_fatal() {
                 self.terminated_by_signal = Some(signal);
-                self.exit_code = signal.exit_code();
+                self.set_exit_code(signal.exit_code());
                 self.cpu_time.pause(crate::time::monotonic_ns());
                 self.state = TaskState::Zombie;
                 return true;
@@ -595,6 +610,7 @@ impl Clone for Task {
             mmap_start: self.mmap_start,
             mmap_end: self.mmap_end,
             userland: self.userland,
+            clear_child_tid: 0,
             exec_path: self.exec_path.clone(),
             cpu_time: CpuAccounting::new(),
             fds: self.fds.clone(),

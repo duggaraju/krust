@@ -424,6 +424,12 @@ pub fn terminate_root_process() -> bool {
 }
 
 pub fn fork_current_task() -> Result<u64, isize> {
+    fork_current_task_with(|_| Ok(()))
+}
+
+pub(crate) fn fork_current_task_with(
+    prepare: impl FnOnce(&mut Task) -> Result<(), isize>,
+) -> Result<u64, isize> {
     let parent_pid = current_pid();
     let mut scheduler = SCHEDULER.lock();
     let Some(scheduler) = scheduler.as_mut() else {
@@ -456,6 +462,7 @@ pub fn fork_current_task() -> Result<u64, isize> {
     child
         .context
         .set_address_space_root(child.address_space.root_paddr());
+    prepare(&mut child)?;
     let child_priority_before = child.priority;
 
     if let Some(parent_task) = scheduler.task_by_pid_mut(parent_pid) {

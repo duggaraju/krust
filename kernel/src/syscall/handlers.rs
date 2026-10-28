@@ -110,7 +110,7 @@ const TIOCGPGRP: usize = 0x540F;
 const TIOCSPGRP: usize = 0x5410;
 const TCGETS: usize = 0x5401;
 const TCGETS2: usize = 0x802C_542A;
-const AT_FDCWD: isize = -100;
+const AT_FDCWD: i32 = -100;
 const POLLIN: i16 = 0x0001;
 const POLLOUT: i16 = 0x0004;
 
@@ -217,7 +217,7 @@ struct LinuxStatFs {
 
 fn checked_at_path(dirfd: usize, address: usize) -> Result<alloc::string::String, isize> {
     let path = super::user_memory::cstring(address, MAX_PATH_LEN)?;
-    if dirfd as isize != AT_FDCWD && !path.starts_with('/') {
+    if dirfd as i32 != AT_FDCWD && !path.starts_with('/') {
         return Err(-95);
     }
     if path.is_empty() {
@@ -580,7 +580,7 @@ fn to_linux_stat(st: impls::Stat) -> LinuxStat {
 }
 
 pub fn sys_newfstatat(args: &SyscallArgs) -> isize {
-    let dirfd = args.arg0 as isize;
+    let dirfd = args.arg0 as i32;
     let path_ptr = args.arg1 as *const u8;
     let stat_ptr = args.arg2 as *mut LinuxStat;
     let _flags = args.arg3;
@@ -713,6 +713,10 @@ pub fn sys_getpgid(args: &SyscallArgs) -> isize {
         .unwrap_or(-3)
 }
 
+pub fn sys_getpgrp(_args: &SyscallArgs) -> isize {
+    crate::process::current_pgid() as isize
+}
+
 pub fn sys_kill(args: &SyscallArgs) -> isize {
     let pid = args.arg0 as i64;
     let sig = args.arg1 as i32;
@@ -821,6 +825,35 @@ pub fn sys_getpid(_args: &SyscallArgs) -> isize {
 
 pub fn sys_fork(_args: &SyscallArgs) -> isize {
     match impls::fork() {
+        Ok(pid) => pid as isize,
+        Err(errno) => errno,
+    }
+}
+
+pub fn sys_clone(args: &SyscallArgs) -> isize {
+    const SIGCHLD: usize = 17;
+    const CLONE_CHILD_SETTID: usize = 0x0100_0000;
+    const CLONE_CHILD_CLEARTID: usize = 0x0020_0000;
+    let flags = args.arg0;
+    if flags & 0xff != SIGCHLD
+        || flags & !(0xff | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID) != 0
+        || args.arg1 != 0
+    {
+        return -95;
+    }
+    let child_tid = (flags & CLONE_CHILD_SETTID != 0).then_some(args.arg3);
+    if let Some(address) = child_tid {
+        if let Err(errno) = super::user_memory::validate_write(address, core::mem::size_of::<i32>())
+        {
+            return errno;
+        }
+    }
+    let clear_child_tid = if flags & CLONE_CHILD_CLEARTID != 0 {
+        args.arg3
+    } else {
+        0
+    };
+    match crate::arch::clone_from_syscall(child_tid, clear_child_tid) {
         Ok(pid) => pid as isize,
         Err(errno) => errno,
     }
@@ -1033,7 +1066,7 @@ pub fn sys_fcntl(args: &SyscallArgs) -> isize {
 }
 
 pub fn sys_openat(args: &SyscallArgs) -> isize {
-    let dirfd = args.arg0 as isize;
+    let dirfd = args.arg0 as i32;
     let path_ptr = args.arg1 as *const u8;
     let flags = args.arg2;
     let mode = args.arg3;

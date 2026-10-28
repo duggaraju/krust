@@ -312,6 +312,8 @@ pub unsafe fn enter_usermode() -> ! {
             "push {rflags}",
             "push {user_cs}",
             "push {user_rip}",
+            // Static executables have no dynamic-linker finalizer callback.
+            "xor edx, edx",
             "iretq",
             cr3 = in(reg) cr3,
             user_ss = in(reg) (gdt::user_data_selector().0 as u64 | 3),

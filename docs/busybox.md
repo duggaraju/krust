@@ -6,6 +6,49 @@
 Run all commands from the repository root. See [development prerequisites](development.md)
 for BusyBox build tools and the optional `--libc glibc` setup flag.
 
+## Static glibc builds
+
+The setup script supports both musl (default) and the host GCC/glibc toolchain.
+Install the glibc development files, including `libc.a`, before building.
+Use separate rootfs/image paths to retain an existing musl installation:
+
+```bash
+scripts/setup-busybox.sh target/rootfs-glibc target/krust-disk-glibc-ext4.vhd --format ext4 --libc glibc
+cargo run -Z bindeps -- run uefi --headless --vhd target/krust-disk-glibc-ext4.vhd
+```
+
+The binary must be a static, non-PIE x86-64 ELF executable (`readelf -h` reports
+`EXEC`, and `readelf -l` has no `INTERP`). No shared libc or dynamic linker needs
+to be installed in the rootfs. From the kernel shell, invoke `/bin/busybox`
+with an applet name or `/bin/busybox sh`.
+
+The initial stack keeps argc/argv/envp/auxv contiguous and 16-byte aligned, and
+the kernel clears the dynamic-linker finalizer register (`RDX`) on static exec.
+Unsupported `rseq` registration returns `ENOSYS` so glibc can disable it.
+Relative-path `*at` calls accept both sign-extended and zero-extended 32-bit
+`AT_FDCWD` arguments.
+The `getpgrp` syscall uses the same process-group state as `getpgid(0)`, allowing
+glibc-linked interactive shells to initialize terminal foreground handling.
+
+Glibc's fork path uses `clone`, not the legacy `fork` syscall. Krust supports
+fork-style `clone` with `SIGCHLD`, a NULL child stack, and optional
+`CLONE_CHILD_SETTID`/`CLONE_CHILD_CLEARTID`. Child TID writes occur only in the
+child's private address space; `set_tid_address` updates the exit-clear address,
+which is reset on exec and not inherited by plain fork. Unsupported clone
+flags, shared-memory/thread creation, and alternate child stacks return
+`EOPNOTSUPP`. This does not implement pthreads or futex waiting/waking.
+
+Run the existing BIOS/UEFI smoke with the glibc image:
+
+```bash
+KRUST_TEST_DISK=target/krust-disk-glibc-ext4.vhd cargo test -Z bindeps --locked -p krust --test qemu userspace_smoke -- --ignored --exact --nocapture
+KRUST_TEST_BUSYBOX=target/rootfs-glibc/bin/busybox cargo test -Z bindeps --locked -p krust --test qemu shell_process -- --ignored --exact --nocapture
+```
+
+These are focused compatibility checks, not support for every glibc facility
+or BusyBox applet. Signal semantics, per-task FP/SIMD state, and secure entropy
+remain incomplete.
+
 ## FAT and ext4 applet installation
 
 FAT has no symlinks: its `sh` and `ash` entrypoints are executable BusyBox

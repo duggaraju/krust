@@ -444,8 +444,12 @@ pub fn arch_prctl(code: usize, addr: usize) -> Result<usize, isize> {
     crate::arch::arch_prctl(code, addr)
 }
 
-pub fn set_tid_address(_clear_child_tid: usize) -> Result<usize, isize> {
-    Ok(process::current_pid() as usize)
+pub fn set_tid_address(clear_child_tid: usize) -> Result<usize, isize> {
+    process::with_current_task_mut(|task| {
+        task.clear_child_tid = clear_child_tid;
+        task.pid as usize
+    })
+    .ok_or(-1isize)
 }
 
 pub fn set_robust_list(_head: usize, _len: usize) -> Result<usize, isize> {
@@ -458,7 +462,7 @@ pub fn rseq(
     _flags: usize,
     _sig: usize,
 ) -> Result<usize, isize> {
-    Ok(0)
+    Err(-38)
 }
 
 pub fn fork() -> Result<u64, isize> {

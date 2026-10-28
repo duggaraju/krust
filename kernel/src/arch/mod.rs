@@ -126,10 +126,19 @@ pub fn restore_kernel_syscall_state() {
 }
 
 pub fn fork_from_syscall() -> Result<u64, isize> {
+    clone_from_syscall(None, 0)
+}
+
+pub fn clone_from_syscall(child_tid: Option<usize>, clear_child_tid: usize) -> Result<u64, isize> {
     #[cfg(target_arch = "x86_64")]
-    { current::syscall::fork_from_syscall() }
+    {
+        current::syscall::clone_from_syscall(child_tid, clear_child_tid)
+    }
     #[cfg(not(target_arch = "x86_64"))]
-    { Err(-38) }
+    {
+        let _ = (child_tid, clear_child_tid);
+        Err(-38)
+    }
 }
 
 pub fn set_physical_memory_offset(physical_memory_offset: u64) {

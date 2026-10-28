@@ -28,6 +28,7 @@ macro_rules! entry {
             ".section .text._start,\"ax\"",
             ".global _start",
             "_start:",
+            "mov rsi, rdx",
             "mov rdi, rsp",
             "and rsp, -16",
             "call guest_main",

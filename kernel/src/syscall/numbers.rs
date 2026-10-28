@@ -17,6 +17,7 @@ pub const SYS_GETEUID: usize = 107;
 pub const SYS_GETEGID: usize = 108;
 pub const SYS_SETPGID: usize = 109;
 pub const SYS_GETPPID: usize = 110;
+pub const SYS_GETPGRP: usize = 111;
 pub const SYS_GETPGID: usize = 121;
 pub const SYS_SETUID: usize = 105;
 pub const SYS_SETGID: usize = 106;
@@ -45,6 +46,7 @@ pub const SYS_NEWFSTATAT: usize = 262;
 pub const SYS_GETGID: usize = 104;
 pub const SYS_GETPID: usize = 39;
 pub const SYS_FORK: usize = 57;
+pub const SYS_CLONE: usize = 56;
 pub const SYS_EXECVE: usize = 59;
 pub const SYS_EXIT: usize = 60;
 pub const SYS_WAIT4: usize = 61;
@@ -91,6 +93,7 @@ pub enum Syscall {
     Getegid = SYS_GETEGID,
     Setpgid = SYS_SETPGID,
     Getppid = SYS_GETPPID,
+    Getpgrp = SYS_GETPGRP,
     Getpgid = SYS_GETPGID,
     Setuid = SYS_SETUID,
     Setgid = SYS_SETGID,
@@ -119,6 +122,7 @@ pub enum Syscall {
     Getgid = SYS_GETGID,
     Getpid = SYS_GETPID,
     Fork = SYS_FORK,
+    Clone = SYS_CLONE,
     Execve = SYS_EXECVE,
     Exit = SYS_EXIT,
     Wait4 = SYS_WAIT4,
@@ -168,6 +172,7 @@ impl Syscall {
             Self::Getegid => "getegid",
             Self::Setpgid => "setpgid",
             Self::Getppid => "getppid",
+            Self::Getpgrp => "getpgrp",
             Self::Getpgid => "getpgid",
             Self::Setuid => "setuid",
             Self::Setgid => "setgid",
@@ -196,6 +201,7 @@ impl Syscall {
             Self::Getgid => "getgid",
             Self::Getpid => "getpid",
             Self::Fork => "fork",
+            Self::Clone => "clone",
             Self::Execve => "execve",
             Self::Exit => "exit",
             Self::Wait4 => "wait4",
@@ -241,6 +247,7 @@ impl Syscall {
             Self::Getegid => 0,
             Self::Setpgid => 2,
             Self::Getppid => 0,
+            Self::Getpgrp => 0,
             Self::Getpgid => 1,
             Self::Setuid => 1,
             Self::Setgid => 1,
@@ -269,6 +276,7 @@ impl Syscall {
             Self::Getgid => 0,
             Self::Getpid => 0,
             Self::Fork => 0,
+            Self::Clone => 5,
             Self::Execve => 3,
             Self::Exit => 1,
             Self::Wait4 => 4,
@@ -325,6 +333,7 @@ impl Syscall {
             SYS_GETEGID => Some(Self::Getegid),
             SYS_SETPGID => Some(Self::Setpgid),
             SYS_GETPPID => Some(Self::Getppid),
+            SYS_GETPGRP => Some(Self::Getpgrp),
             SYS_GETPGID => Some(Self::Getpgid),
             SYS_SETUID => Some(Self::Setuid),
             SYS_SETGID => Some(Self::Setgid),
@@ -353,6 +362,7 @@ impl Syscall {
             SYS_GETGID => Some(Self::Getgid),
             SYS_GETPID => Some(Self::Getpid),
             SYS_FORK => Some(Self::Fork),
+            SYS_CLONE => Some(Self::Clone),
             SYS_EXECVE => Some(Self::Execve),
             SYS_EXIT => Some(Self::Exit),
             SYS_WAIT4 => Some(Self::Wait4),

@@ -121,7 +121,7 @@ extern "C" fn fork_child_prepare_return() -> u64 {
     frame as u64
 }
 
-pub fn fork_from_syscall() -> Result<u64, isize> {
+pub fn clone_from_syscall(child_tid: Option<usize>, clear_child_tid: usize) -> Result<u64, isize> {
     let frame = crate::process::with_current_task_mut(|task| {
         if !task.userland {
             return Err(-38isize);
@@ -131,8 +131,7 @@ pub fn fork_from_syscall() -> Result<u64, isize> {
         Ok(unsafe { (address as *const SavedRegs).read() })
     })
     .ok_or(-1isize)??;
-    let child = crate::process::fork_current_task()?;
-    crate::process::with_task_mut(child, |task| {
+    let child = crate::process::fork_current_task_with(|task| {
         let address = task.kernel_stack_top - core::mem::size_of::<SavedRegs>();
         unsafe {
             (address as *mut SavedRegs).write(frame);
@@ -145,8 +144,16 @@ pub fn fork_from_syscall() -> Result<u64, isize> {
             .set_kernel_entry_point(fork_child_trampoline as *const () as u64);
         task.context.set_user_entry_point(frame.rcx);
         task.context.set_user_stack_pointer(frame.user_rsp);
-    })
-    .ok_or(-1isize)?;
+        task.clear_child_tid = clear_child_tid;
+        if let Some(address) = child_tid {
+            crate::syscall::user_memory::copy_to_task(
+                task,
+                address,
+                &(task.pid as i32).to_ne_bytes(),
+            )?;
+        }
+        Ok(())
+    })?;
     if let Some(plan) = crate::process::yield_to_task(child) {
         unsafe {
             crate::arch::restore_kernel_syscall_state();

@@ -8,11 +8,16 @@ use krust_guest::{argument, call, exit, say};
 krust_guest::entry!();
 static mut GLOBAL_VALUE: i32 = 19;
 
-fn fork_registers() -> isize {
+fn fork_registers(number: usize, flags: usize, child_tid: usize) -> isize {
     let (result, r12, r13, r14, r15): (isize, usize, usize, usize, usize);
     unsafe {
         asm!("syscall",
-            inlateout("rax") 57isize => result,
+            inlateout("rax") number as isize => result,
+            in("rdi") flags,
+            in("rsi") 0usize,
+            in("rdx") 0usize,
+            in("r10") child_tid,
+            in("r8") 0usize,
             inout("r12") 0x1234_5678usize => r12,
             inout("r13") 0x2345_6789usize => r13,
             inout("r14") 0x3456_7890usize => r14,
@@ -149,8 +154,62 @@ fn check_cpu_accounting() {
     panic!("kernel CPU time did not advance");
 }
 
+unsafe fn check_initial_stack(stack: *const usize) {
+    assert_eq!(stack as usize % 16, 0);
+    let argc = unsafe { stack.read() };
+    assert_eq!(unsafe { stack.add(argc + 1).read() }, 0);
+    let mut cursor = unsafe { stack.add(argc + 2) };
+    let mut envc = 0;
+    while unsafe { cursor.read() } != 0 {
+        assert!(envc < 256);
+        envc += 1;
+        cursor = unsafe { cursor.add(1) };
+    }
+    cursor = unsafe { cursor.add(1) };
+    let mut values = [None; 32];
+    let mut terminated = false;
+    for _ in 0..64 {
+        let key = unsafe { cursor.read() };
+        let value = unsafe { cursor.add(1).read() };
+        if key == 0 {
+            assert_eq!(value, 0);
+            terminated = true;
+            break;
+        }
+        if key < values.len() {
+            assert!(values[key].replace(value).is_none());
+        }
+        cursor = unsafe { cursor.add(2) };
+    }
+    assert!(terminated, "unterminated auxiliary vector");
+    assert_eq!(values[4], Some(56), "AT_PHENT");
+    assert!(values[5].is_some_and(|count| count > 0), "AT_PHNUM");
+    assert_eq!(values[6], Some(4096), "AT_PAGESZ");
+    assert!(values[9].is_some_and(|entry| entry >= 0x400000), "AT_ENTRY");
+    assert_eq!(values[23], Some(0), "AT_SECURE");
+    assert!(values[25].is_some_and(|pointer| pointer != 0), "AT_RANDOM");
+    assert!(values[31].is_some_and(|pointer| pointer != 0), "AT_EXECFN");
+}
+
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn guest_main(stack: *const usize) -> ! {
+pub unsafe extern "C" fn guest_main(stack: *const usize, rtld_fini: usize) -> ! {
+    assert_eq!(rtld_fini, 0, "static executable finalizer");
+    unsafe { check_initial_stack(stack) };
+    assert_eq!(call!(334, 0, 0, 0, 0), -38, "unsupported rseq");
+    assert_eq!(call!(111, 0, 0, 0, 0), call!(121, 0, 0, 0, 0));
+    for flags in [0, 17 | 0x100, 17 | 0x10000, 17 | 0x80000, 17 | 0x100000] {
+        assert_eq!(call!(56, flags, 0, 0, 0), -95);
+    }
+    assert_eq!(call!(56, 17, 1, 0, 0), -95);
+    assert_eq!(call!(56, 0x0120_0011, 0, 0, 1), -14);
+    for dirfd in [(-100isize) as usize, (-100i32) as u32 as usize] {
+        let mut stat = [0u64; 32];
+        assert_eq!(call!(262, dirfd, c".".as_ptr(), stat.as_mut_ptr(), 0), 0);
+        let fd = call!(257, dirfd, c".".as_ptr(), 0, 0);
+        assert!(fd >= 0);
+        assert_eq!(call!(3, fd, 0, 0, 0), 0);
+        assert_eq!(call!(258, dirfd, c"".as_ptr(), 0o755, 0), -2);
+    }
     check_proc_stat();
     let argc = unsafe { stack.read() };
     let name = if argc > 0 {
@@ -248,7 +307,17 @@ pub unsafe extern "C" fn guest_main(stack: *const usize) -> ! {
                 args[0]
             });
         }
-        let child = fork_registers();
+        let child_tid = unsafe { memory.add(8190).cast::<i32>() };
+        unsafe { child_tid.write_unaligned(-123) };
+        let child = if iteration == 0 {
+            fork_registers(57, 0, 0)
+        } else {
+            fork_registers(
+                56,
+                if iteration == 1 { 0x0120_0011 } else { 17 },
+                child_tid as usize,
+            )
+        };
         assert!(child >= 0);
         unsafe {
             assert_eq!(addr_of!(local_value).read_volatile(), 23);
@@ -256,6 +325,14 @@ pub unsafe extern "C" fn guest_main(stack: *const usize) -> ! {
             assert_eq!(memory.add(12000).read_volatile(), 31);
         }
         if child == 0 {
+            assert_eq!(
+                unsafe { child_tid.read_unaligned() },
+                if iteration == 1 {
+                    call!(39, 0, 0, 0, 0) as i32
+                } else {
+                    -123
+                }
+            );
             let fresh = cpu_usage();
             assert!(fresh[0] < before_fork[0], "fork must reset CPU usage");
             assert_eq!(&fresh[2..], &[0, 0]);
@@ -278,6 +355,7 @@ pub unsafe extern "C" fn guest_main(stack: *const usize) -> ! {
             );
             panic!("successful exec returned");
         }
+        assert_eq!(unsafe { child_tid.read_unaligned() }, -123);
         let after_child = cpu_usage();
         assert!(
             after_child[0] <= before_fork[0] + 2,
@@ -304,7 +382,7 @@ pub unsafe extern "C" fn guest_main(stack: *const usize) -> ! {
         );
         assert_eq!(call!(61, child, addr_of_mut!(result.status), 3, 0), -10);
     }
-    let child = fork_registers();
+    let child = fork_registers(57, 0, 0);
     assert!(child >= 0);
     if child == 0 {
         unsafe {

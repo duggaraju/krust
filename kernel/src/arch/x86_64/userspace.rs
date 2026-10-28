@@ -198,6 +198,12 @@ pub fn build_initial_user_stack(
         push_u64(space, sp, key)
     };
 
+    // Auxv must immediately follow envp's NULL; put alignment padding above it.
+    let table_qwords = 1usize + argv.len() + 1 + envp.len() + 1;
+    if table_qwords % 2 != 0 {
+        push_u64(address_space, &mut sp, 0)?;
+    }
+
     push_auxv(address_space, &mut sp, AT_NULL, 0)?;
     push_auxv(address_space, &mut sp, AT_EXECFN, execfn_addr)?;
     push_auxv(address_space, &mut sp, AT_HWCAP2, 0)?;
@@ -217,12 +223,6 @@ pub fn build_initial_user_stack(
     push_auxv(address_space, &mut sp, AT_PHNUM, plan.phnum)?;
     push_auxv(address_space, &mut sp, AT_PHENT, plan.phent_size)?;
     push_auxv(address_space, &mut sp, AT_PHDR, plan.phdr_addr)?;
-
-    let table_qwords = 1usize + argv.len() + 1 + envp.len() + 1;
-    let desired_sp_mod_16 = if table_qwords % 2 == 0 { 0 } else { 8 };
-    while (sp % 16) != desired_sp_mod_16 {
-        push_u64(address_space, &mut sp, 0)?;
-    }
 
     push_u64(address_space, &mut sp, 0)?;
     let mut env_scan_sp = env_ptr_scan_start;
