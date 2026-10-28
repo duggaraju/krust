@@ -1,5 +1,6 @@
 #[cfg(feature = "boot-uefi")]
 pub mod boot;
+pub mod clock;
 pub mod context;
 pub mod interrupts;
 pub mod paging;

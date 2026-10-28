@@ -1,3 +1,4 @@
+pub mod accounting;
 pub mod binfmt;
 pub mod context;
 pub mod fd_table;
@@ -154,6 +155,27 @@ pub fn set_current_task_mode(mode: TaskMode) -> bool {
     };
     task.set_mode(mode);
     true
+}
+
+pub fn resume_cpu_accounting() {
+    let _ = with_current_task_mut(|task| {
+        if !matches!(task.state, TaskState::Waiting | TaskState::Zombie) {
+            task.cpu_time.resume(crate::time::monotonic_ns());
+        }
+    });
+}
+
+pub fn idle_until_interrupt() {
+    use x86_64::instructions::interrupts;
+    let enabled = interrupts::are_enabled();
+    interrupts::disable();
+    let _ = with_current_task_mut(|task| task.cpu_time.pause(crate::time::monotonic_ns()));
+    interrupts::enable_and_hlt();
+    interrupts::disable();
+    resume_cpu_accounting();
+    if enabled {
+        interrupts::enable();
+    }
 }
 
 /// Execute a closure with mutable access to the current task
@@ -505,11 +527,7 @@ pub fn wait_for_child_with_options(
             return Ok(None);
         }
 
-        let enabled = x86_64::instructions::interrupts::are_enabled();
-        x86_64::instructions::interrupts::enable_and_hlt();
-        if !enabled {
-            x86_64::instructions::interrupts::disable();
-        }
+        idle_until_interrupt();
     }
 }
 

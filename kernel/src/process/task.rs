@@ -1,5 +1,6 @@
 extern crate alloc;
 
+use super::accounting::CpuAccounting;
 use super::fd_table::FdTable;
 use crate::arch::CpuContext;
 use crate::fs::vfs::{FileDescriptor, FileOpenMode, Inode, OpenFile};
@@ -108,10 +109,7 @@ pub struct Task {
     pub mmap_end: usize,
     pub userland: bool,
     pub exec_path: String,
-    /// Time usage in milliseconds (incremented by timer interrupt every 10ms)
-    pub time_usage_ms: u64,
-    /// Time when task was last started running (in milliseconds since boot)
-    start_time_ms: u64,
+    pub cpu_time: CpuAccounting,
     fds: FdTable<FdEntry>,
     /// Environment variables: Arc<EnvMap> enables CoW semantics.
     /// Cloning a task is O(1); modifying an env var triggers Arc::make_mut().
@@ -221,8 +219,7 @@ impl Task {
             mmap_end: 0,
             userland: false,
             exec_path: String::new(),
-            time_usage_ms: 0,
-            start_time_ms: 0,
+            cpu_time: CpuAccounting::new(),
             fds: FdTable::new(),
             env: Arc::new(BTreeMap::new()),
             argv: vec![],
@@ -300,6 +297,7 @@ impl Task {
     }
 
     pub fn set_mode(&mut self, mode: TaskMode) {
+        self.cpu_time.set_mode(mode, crate::time::monotonic_ns());
         self.mode = mode;
     }
 
@@ -446,7 +444,6 @@ impl Task {
         self.context
             .set_address_space_root(self.address_space.root_paddr());
         self.user_stack_top = stack_top;
-        self.mode = TaskMode::User;
         self.userland = true;
     }
 
@@ -459,16 +456,6 @@ impl Task {
     pub fn set_mmap_start(&mut self, start: usize) {
         self.mmap_start = start;
         self.mmap_end = start;
-    }
-
-    /// Record when this task started running (called when transitioning to Running state)
-    pub fn set_start_time(&mut self, uptime_ms: u64) {
-        self.start_time_ms = uptime_ms;
-    }
-
-    /// Increment time usage by one time quantum (called by timer interrupt)
-    pub fn increment_time_usage(&mut self) {
-        self.time_usage_ms += 10; // PIT timer fires every 10ms
     }
 
     pub fn set_exit_code(&mut self, code: i32) {
@@ -496,6 +483,7 @@ impl Task {
         if signal.is_fatal() {
             self.terminated_by_signal = Some(signal);
             self.exit_code = signal.exit_code();
+            self.cpu_time.pause(crate::time::monotonic_ns());
             self.state = TaskState::Zombie;
         } else {
             self.pending_signals.push(signal);
@@ -518,6 +506,7 @@ impl Task {
             if signal.is_fatal() {
                 self.terminated_by_signal = Some(signal);
                 self.exit_code = signal.exit_code();
+                self.cpu_time.pause(crate::time::monotonic_ns());
                 self.state = TaskState::Zombie;
                 return true;
             }
@@ -607,8 +596,7 @@ impl Clone for Task {
             mmap_end: self.mmap_end,
             userland: self.userland,
             exec_path: self.exec_path.clone(),
-            time_usage_ms: self.time_usage_ms,
-            start_time_ms: self.start_time_ms,
+            cpu_time: CpuAccounting::new(),
             fds: self.fds.clone(),
             env: Arc::clone(&self.env), // CoW: cheap clone
             argv: self.argv.clone(),

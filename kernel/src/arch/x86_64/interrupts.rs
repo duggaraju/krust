@@ -96,10 +96,7 @@ extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFram
     let _kernel_mode = KernelModeGuard::enter();
     log::error!("EXCEPTION: INVALID OPCODE\n{stack_frame:#?}");
 
-    if matches!(
-        crate::process::current_task_mode(),
-        Some(crate::process::task::TaskMode::User)
-    ) {
+    if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
         let pid = crate::process::current_pid();
         log::error!("invalid opcode in user task pid={} - terminating task", pid);
         let switch_plan = {
@@ -139,10 +136,7 @@ extern "x86-interrupt" fn general_protection_fault_handler(
     let _kernel_mode = KernelModeGuard::enter();
     log::error!("EXCEPTION: GENERAL PROTECTION ({error_code:#x})\n{stack_frame:#?}");
 
-    if matches!(
-        crate::process::current_task_mode(),
-        Some(crate::process::task::TaskMode::User)
-    ) {
+    if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
         let pid = crate::process::current_pid();
         log::error!(
             "general protection fault in user task pid={} - terminating task",

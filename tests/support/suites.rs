@@ -436,7 +436,7 @@ pub fn shell_process() {
         for (command, expected) in [
             ("/bin/sh -c pwd", "/"),
             ("/bin/ash -c pwd", "/"),
-            ("/bin/proctest", "KRUST_PROCESS_OK"),
+            ("/bin/proctest", "KRUST_CPU_ACCOUNTING_OK\nKRUST_PROCESS_OK"),
             ("/bin/direct", "direct"),
             (
                 "/bin/nested1",

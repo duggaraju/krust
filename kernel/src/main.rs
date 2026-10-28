@@ -164,6 +164,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         process::register_boot_processes(root_cwd_inode);
 
         process::set_current_pid(crate::process::SHELL_PID);
+        process::resume_cpu_accounting();
 
         // Init framebuffer console output if needed.
         #[cfg(feature = "drivers")]

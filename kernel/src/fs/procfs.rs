@@ -899,7 +899,12 @@ fn task_stat_content(pid: Pid) -> Result<String, FsError> {
     fields[0] = task.parent_pid;
     fields[1] = task.pgid;
     fields[2] = task.sid;
-    fields[10] = task.time_usage_ms / 10; // utime, in USER_HZ (100 Hz) ticks
+    let usage = task.cpu_time.snapshot(crate::time::monotonic_ns());
+    let tick_ns = crate::process::accounting::NS_PER_USER_TICK;
+    fields[10] = usage.user_ns / tick_ns;
+    fields[11] = usage.kernel_ns / tick_ns;
+    fields[12] = task.cpu_time.children.user_ns / tick_ns;
+    fields[13] = task.cpu_time.children.kernel_ns / tick_ns;
     fields[14] = u64::from(task.priority);
     fields[16] = 1; // num_threads
     fields[34] = 17; // exit_signal (SIGCHLD)

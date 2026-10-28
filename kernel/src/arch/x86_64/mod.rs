@@ -2,6 +2,7 @@ use x86_64::instructions::port::{PortGeneric, ReadWriteAccess};
 
 use crate::arch::{ArchContext, ArchInterrupts, ArchPaging};
 
+pub mod clock;
 pub mod context;
 pub mod cpu;
 pub mod gdt;

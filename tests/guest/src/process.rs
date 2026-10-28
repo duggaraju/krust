@@ -34,7 +34,10 @@ struct WaitResult {
 }
 
 fn read_proc(suffix: &[u8], buf: &mut [u8]) -> usize {
-    let mut pid = call!(39, 0, 0, 0, 0) as usize;
+    read_proc_pid(call!(39, 0, 0, 0, 0) as usize, suffix, buf)
+}
+
+fn read_proc_pid(mut pid: usize, suffix: &[u8], buf: &mut [u8]) -> usize {
     let mut digits = [0u8; 20];
     let mut first = digits.len();
     loop {
@@ -82,6 +85,70 @@ fn check_proc_stat() {
     assert_eq!(count, 49);
 }
 
+fn cpu_usage() -> [u64; 4] {
+    cpu_usage_for(call!(39, 0, 0, 0, 0) as usize)
+}
+
+fn cpu_usage_for(pid: usize) -> [u64; 4] {
+    let mut buf = [0u8; 1024];
+    let count = read_proc_pid(pid, b"/stat", &mut buf);
+    let text = core::str::from_utf8(&buf[..count]).unwrap();
+    let (_, rest) = text.rsplit_once(") ").unwrap();
+    let mut values = rest.split_whitespace().skip(11);
+    core::array::from_fn(|_| values.next().unwrap().parse().unwrap())
+}
+
+fn wall_ns() -> u64 {
+    let mut time = [0u64; 2];
+    assert_eq!(call!(228, 1, time.as_mut_ptr(), 0, 0), 0);
+    time[0] * 1_000_000_000 + time[1]
+}
+
+fn user_workload() {
+    let start = wall_ns();
+    for _ in 0..100_000 {
+        for _ in 0..50_000 {
+            core::hint::spin_loop();
+        }
+        if wall_ns() - start >= 80_000_000 {
+            return;
+        }
+    }
+    panic!("user workload clock did not advance");
+}
+
+fn check_cpu_accounting() {
+    let before = cpu_usage();
+    let wall_start = wall_ns();
+    user_workload();
+    let after_user = cpu_usage();
+    let wall_elapsed = wall_ns() - wall_start;
+    assert!(
+        after_user[0] >= before[0] + 2,
+        "user CPU time did not advance"
+    );
+    assert!(
+        (after_user[0] - before[0]) * 10_000_000 <= wall_elapsed + 50_000_000,
+        "CPU accounting clock exceeds elapsed wall time"
+    );
+    for _ in 0..128 {
+        for _ in 0..32 {
+            assert!(call!(39, 0, 0, 0, 0) > 0);
+        }
+        let current = cpu_usage();
+        assert!(current[0] >= after_user[0]);
+        if current[1] >= after_user[1] + 2 {
+            assert!(
+                current[1] - after_user[1] > current[0] - after_user[0],
+                "syscall workload must be charged primarily as kernel time"
+            );
+            say("KRUST_CPU_ACCOUNTING_OK\n");
+            return;
+        }
+    }
+    panic!("kernel CPU time did not advance");
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn guest_main(stack: *const usize) -> ! {
     check_proc_stat();
@@ -92,6 +159,7 @@ pub unsafe extern "C" fn guest_main(stack: *const usize) -> ! {
         b""
     };
     if matches!(name, b"replacement" | b"replacement-empty") {
+        assert!(cpu_usage()[0] >= 2, "exec must preserve CPU usage");
         let mut cmdline = [0u8; 64];
         let count = read_proc(b"/cmdline", &mut cmdline);
         let expected = if name == b"replacement" {
@@ -118,6 +186,7 @@ pub unsafe extern "C" fn guest_main(stack: *const usize) -> ! {
         }
         exit(42);
     }
+    check_cpu_accounting();
     let path = c"/bin/proctest".as_ptr();
     let bad_string = [1usize, 0];
     let args = [
@@ -168,6 +237,7 @@ pub unsafe extern "C" fn guest_main(stack: *const usize) -> ! {
         -22
     );
     for iteration in 0..3 {
+        let before_fork = cpu_usage();
         let mut local_value = 23i32;
         unsafe {
             addr_of_mut!(GLOBAL_VALUE).write_volatile(19);
@@ -186,6 +256,10 @@ pub unsafe extern "C" fn guest_main(stack: *const usize) -> ! {
             assert_eq!(memory.add(12000).read_volatile(), 31);
         }
         if child == 0 {
+            let fresh = cpu_usage();
+            assert!(fresh[0] < before_fork[0], "fork must reset CPU usage");
+            assert_eq!(&fresh[2..], &[0, 0]);
+            user_workload();
             unsafe {
                 addr_of_mut!(local_value).write_volatile(99);
                 addr_of_mut!(GLOBAL_VALUE).write_volatile(98);
@@ -204,9 +278,30 @@ pub unsafe extern "C" fn guest_main(stack: *const usize) -> ! {
             );
             panic!("successful exec returned");
         }
+        let after_child = cpu_usage();
+        assert!(
+            after_child[0] <= before_fork[0] + 2,
+            "switched-out time charged to parent"
+        );
+        let zombie_usage = cpu_usage_for(child as usize);
+        user_workload();
+        assert_eq!(
+            cpu_usage_for(child as usize),
+            zombie_usage,
+            "zombie usage must be frozen"
+        );
         assert_eq!(call!(61, child, 1, 0, 0), -14);
         assert_eq!(call!(61, child, addr_of_mut!(result.status), 2, 0), child);
         assert_eq!((result.status, result.guard), (42 << 8, 0xfeed_cafe));
+        let after_wait = cpu_usage();
+        assert!(
+            after_wait[2] >= before_fork[2] + 2,
+            "reaped child user time missing"
+        );
+        assert!(
+            after_wait[3] >= before_fork[3],
+            "child kernel time regressed"
+        );
         assert_eq!(call!(61, child, addr_of_mut!(result.status), 3, 0), -10);
     }
     let child = fork_registers();

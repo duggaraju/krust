@@ -15,6 +15,7 @@ cargo test -Z bindeps --locked -p krust
 cargo test -Z bindeps --locked -p krust --test pci
 cargo test -Z bindeps --locked -p krust --test mmap protection
 cargo test -Z bindeps --locked -p krust --test memfs
+cargo test -Z bindeps --locked -p krust --test accounting
 
 # Discover the individually named guest cases without running them.
 cargo test -Z bindeps --locked -p krust --test busybox -- --list
@@ -44,7 +45,7 @@ cargo test -Z bindeps --locked -p krust --test qemu -- --ignored --nocapture
 cargo test -Z bindeps --locked -p krust --test harnesses installed_utility_validators -- --ignored --exact
 ```
 
-`cloexec`, `mmap`, `memfs`, and `pci` compile the Rust test sources directly as
+`accounting`, `cloexec`, `mmap`, `memfs`, and `pci` compile the Rust test sources directly as
 native Cargo targets; their individual assertions are not hidden behind a shell
 wrapper. Host integration tests live directly under `tests/`, with shared helpers
 and compile-only fixtures under `tests/support/`. Cargo discovers `cloexec`,

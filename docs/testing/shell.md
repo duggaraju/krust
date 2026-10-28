@@ -25,11 +25,24 @@ recovery after a fork child deliberately faults. It also checks the 52-field
 Linux proc stat layout, NUL-separated exec arguments, and `WUNTRACED` waits.
 The interactive shell runs userspace `ps`, and the kernel process listing must
 return to its pre-test baseline after shell exit, with no leaked zombies.
+CPU-accounting checks require both user and kernel counters to advance by at
+least two `USER_HZ` ticks under their respective workloads. They also verify
+fork resets counters, exec preserves usage, the parent is not charged for child
+execution, zombie totals stay frozen while the parent runs, and wait collects
+child CPU time. `KRUST_CPU_ACCOUNTING_OK` is required before the process marker.
 Exactly that one user-mode
 page fault is required; any additional exception fails the regression. The test
 uses an owned temporary image, QEMU snapshots, and unchanged-image hash checks.
 The fixture is built from [the guest package](../../tests/guest/Cargo.toml)
 using the pinned Rust toolchain; no host C compiler or libc is needed.
+
+Deterministic host tests cover nested mode transitions, repeated snapshots,
+idle/interrupt exclusion, resumed execution, sub-tick accumulation, descendant
+totals, and counter saturation without relying on QEMU timing:
+
+```bash
+cargo test -Z bindeps --locked -p krust --test accounting
+```
 
 ## BIOS/UEFI kernel-shell commands
 

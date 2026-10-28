@@ -303,6 +303,7 @@ pub unsafe fn enter_usermode() -> ! {
         task.activate_address_space();
     });
 
+    let _ = process::set_current_task_mode(process::task::TaskMode::User);
     unsafe {
         core::arch::asm!(
             "mov cr3, {cr3}",

@@ -52,6 +52,33 @@ command name and single-letter state. Untracked accounting fields are zero.
 `/proc/<pid>/cmdline` contains NUL-separated arguments, including empty arguments;
 kernel tasks without arguments return an empty command line.
 
+### CPU accounting
+
+Each task records user and kernel execution separately in nanoseconds.
+Syscall/interrupt mode transitions and scheduler switches settle the running
+interval; snapshots include the current interval without double-counting it.
+Idle waits are paused, fork starts fresh counters, exec preserves them, and
+exit freezes usage. Reaping collects the child's own and already-reaped
+descendant usage into the parent's child totals.
+
+Proc stat fields 14–17 expose user, system, child-user, and child-system time
+in Linux `USER_HZ` units (100 ticks/second), converting only after accumulation.
+The x86 accounting clock uses the TSC with CPUID frequency information or
+bounded PIT channel-2 calibration. It assumes a constant-rate TSC and the
+current single-running-CPU kernel; non-invariant hardware is warned about.
+The ARM64 counter adapter alone does not provide ARM64 runtime accounting.
+
+Remaining reporting and timekeeping work is tracked in:
+
+- [#70](https://github.com/duggaraju/krust/issues/70): Linux `times(2)`.
+- [#71](https://github.com/duggaraju/krust/issues/71): `getrusage` and `wait4` usage.
+- [#72](https://github.com/duggaraju/krust/issues/72): CPU clocks and Linux time APIs.
+- [#73](https://github.com/duggaraju/krust/issues/73): real, accounting-safe `nanosleep`.
+- [#74](https://github.com/duggaraju/krust/issues/74): clocksource/SMP/ARM64 hardening.
+
+Those APIs are not implemented by core accounting: in particular, `nanosleep`
+is still a stub and `times` still returns raw counter uptime without a `tms`.
+
 See the [shell/process regression](testing/shell.md#busybox-shell-and-process-regression)
 for BIOS/UEFI fork, exec, wait, fault-recovery, and interactive shell coverage.
 

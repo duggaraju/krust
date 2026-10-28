@@ -709,9 +709,6 @@ pub fn execve_with_args(path: &str, argv: Vec<String>, envp: Vec<String>) -> Res
                     stack_top
                 );
 
-                // Set task mode to User before entering usermode
-                let _ = process::set_current_task_mode(process::task::TaskMode::User);
-
                 unsafe {
                     crate::arch::enter_usermode();
                 }

@@ -109,7 +109,7 @@ unsafe extern "C" {
 #[unsafe(no_mangle)]
 extern "C" fn fork_child_prepare_return() -> u64 {
     let (frame, gs_base) = crate::process::with_current_task_mut(|task| {
-        task.mode = crate::process::task::TaskMode::User;
+        task.set_mode(crate::process::task::TaskMode::User);
         (
             task.kernel_stack_top - core::mem::size_of::<SavedRegs>(),
             task.context.thread_local_base(false),
@@ -158,6 +158,8 @@ pub fn fork_from_syscall() -> Result<u64, isize> {
 
 #[unsafe(no_mangle)]
 extern "C" fn syscall_dispatch_from_regs(number: u64, regs: *const SavedRegs) -> isize {
+    let previous = crate::process::current_task_mode();
+    let _ = crate::process::set_current_task_mode(crate::process::task::TaskMode::Kernel);
     let regs = unsafe { &*regs };
     log::debug!(
         "syscall_dispatch: pid={} nr={} rcx=0x{:x} r11=0x{:x}",
@@ -185,12 +187,7 @@ extern "C" fn syscall_dispatch_from_regs(number: u64, regs: *const SavedRegs) ->
         arg5: regs.r9 as usize,
     };
 
-    let previous = crate::process::current_task_mode();
-    let _ = crate::process::set_current_task_mode(crate::process::task::TaskMode::Kernel);
     let result = crate::syscall::dispatch::dispatch(&args);
-    if matches!(previous, Some(crate::process::task::TaskMode::User)) {
-        let _ = crate::process::set_current_task_mode(crate::process::task::TaskMode::User);
-    }
 
     log::debug!(
         "syscall_dispatch returning: pid={} nr={} result=0x{:x}",
@@ -204,6 +201,9 @@ extern "C" fn syscall_dispatch_from_regs(number: u64, regs: *const SavedRegs) ->
         // A faulting child can resume this syscall from an unswapped interrupt entry.
         GsBase::write(VirtAddr::from_ptr(core::ptr::addr_of!(SYSCALL_CPU_LOCAL)));
         KernelGsBase::write(VirtAddr::new(gs_base));
+    }
+    if matches!(previous, Some(crate::process::task::TaskMode::User)) {
+        let _ = crate::process::set_current_task_mode(crate::process::task::TaskMode::User);
     }
     result
 }

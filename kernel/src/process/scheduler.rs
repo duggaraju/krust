@@ -157,6 +157,9 @@ impl Scheduler {
 
     pub fn set_task_state(&mut self, pid: Pid, state: TaskState) -> bool {
         if let Some(task) = self.tasks.iter_mut().find(|task| task.pid == pid) {
+            if matches!(state, TaskState::Waiting | TaskState::Zombie) {
+                task.cpu_time.pause(crate::time::monotonic_ns());
+            }
             task.state = state;
             if self
                 .current_index
@@ -175,6 +178,16 @@ impl Scheduler {
 
     pub fn schedule(&mut self) -> Option<&mut Task> {
         self.schedule_on(0)
+    }
+
+    fn account_switch(&mut self, next_pid: Pid) {
+        let now = crate::time::monotonic_ns();
+        if let Some(previous) = self.task_by_pid_mut(crate::process::current_pid()) {
+            previous.cpu_time.pause(now);
+        }
+        if let Some(next) = self.task_by_pid_mut(next_pid) {
+            next.cpu_time.resume(now);
+        }
     }
 
     pub fn schedule_on(&mut self, core_id: usize) -> Option<&mut Task> {
@@ -202,6 +215,9 @@ impl Scheduler {
         let next_index = match next_index {
             Some(i) => i,
             None => {
+                if let Some(task) = self.task_by_pid_mut(crate::process::current_pid()) {
+                    task.cpu_time.pause(crate::time::monotonic_ns());
+                }
                 self.current_index = None;
                 self.set_core_idle(core_id);
                 return None;
@@ -223,6 +239,7 @@ impl Scheduler {
             self.set_core_idle(core_id);
             return None;
         };
+        self.account_switch(selected_pid);
         crate::process::set_current_pid(selected_pid);
         self.set_core_task(core_id, selected_pid);
 
@@ -321,6 +338,7 @@ impl Scheduler {
         }
 
         self.current_index = Some(target_idx);
+        self.account_switch(new_pid);
         crate::process::set_current_pid(new_pid);
         self.set_core_task(0, new_pid);
 
@@ -366,6 +384,9 @@ impl Scheduler {
         let task = self.tasks.remove(idx)?;
         let pid = task.pid;
         let status = task.exit_code();
+        if let Some(parent) = self.task_by_pid_mut(parent_pid) {
+            parent.cpu_time.reap(&task.cpu_time, crate::time::monotonic_ns());
+        }
         self.clear_core_task(pid);
 
         if let Some(current) = self.current_index {
@@ -415,6 +436,7 @@ impl Scheduler {
         }
 
         self.current_index = Some(next_index);
+        self.account_switch(new_pid);
         crate::process::set_current_pid(new_pid);
         self.set_core_task(0, new_pid);
 
@@ -444,24 +466,6 @@ impl Scheduler {
             new_ctx: new_ctx_ptr,
             new_pid,
         })
-    }
-
-    /// Increment the current task's time usage by one time quantum (called by timer interrupt)
-    pub fn increment_current_time_usage(&mut self) {
-        if let Some(idx) = self.current_index {
-            if let Some(task) = self.tasks.get_mut(idx) {
-                task.increment_time_usage();
-            }
-        }
-    }
-
-    /// Set the start time for the current task (called when transitioning to Running)
-    pub fn set_current_task_start_time(&mut self, uptime_ms: u64) {
-        if let Some(idx) = self.current_index {
-            if let Some(task) = self.tasks.get_mut(idx) {
-                task.set_start_time(uptime_ms);
-            }
-        }
     }
 
     pub fn set_core_kernel_workload(&mut self, core_id: usize, reason: &str) -> bool {
