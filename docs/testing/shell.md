@@ -21,7 +21,11 @@ BIOS and UEFI. A Cargo-built, freestanding Rust fixture additionally checks pres
 registers and stack/global/mmap isolation across child exec, exact argv/envp,
 invalid pointers, oversized strings, a vector crossing a page boundary,
 failed-exec recovery, a canary next to the wait status buffer, and parent
-recovery after a fork child deliberately faults. Exactly that one user-mode
+recovery after a fork child deliberately faults. It also checks the 52-field
+Linux proc stat layout, NUL-separated exec arguments, and `WUNTRACED` waits.
+The interactive shell runs userspace `ps`, and the kernel process listing must
+return to its pre-test baseline after shell exit, with no leaked zombies.
+Exactly that one user-mode
 page fault is required; any additional exception fails the regression. The test
 uses an owned temporary image, QEMU snapshots, and unchanged-image hash checks.
 The fixture is built from [the guest package](../../tests/guest/Cargo.toml)

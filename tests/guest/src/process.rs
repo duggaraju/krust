@@ -33,8 +33,58 @@ struct WaitResult {
     guard: u32,
 }
 
+fn read_proc(suffix: &[u8], buf: &mut [u8]) -> usize {
+    let mut pid = call!(39, 0, 0, 0, 0) as usize;
+    let mut digits = [0u8; 20];
+    let mut first = digits.len();
+    loop {
+        first -= 1;
+        digits[first] = b'0' + (pid % 10) as u8;
+        pid /= 10;
+        if pid == 0 {
+            break;
+        }
+    }
+    let mut path = [0u8; 64];
+    path[..6].copy_from_slice(b"/proc/");
+    let end = 6 + digits.len() - first;
+    path[6..end].copy_from_slice(&digits[first..]);
+    path[end..end + suffix.len()].copy_from_slice(suffix);
+    let fd = call!(2, path.as_ptr(), 0, 0, 0);
+    assert!(fd >= 0);
+    let count = call!(0, fd, buf.as_mut_ptr(), buf.len(), 0);
+    assert!(count >= 0);
+    assert_eq!(call!(3, fd, 0, 0, 0), 0);
+    count as usize
+}
+
+fn check_proc_stat() {
+    let mut buf = [0u8; 1024];
+    let count = read_proc(b"/stat", &mut buf);
+    let text = core::str::from_utf8(&buf[..count]).unwrap();
+    assert!(text.ends_with('\n'));
+    let (pid, rest) = text.split_once(" (").unwrap();
+    assert_eq!(pid.parse::<isize>().unwrap(), call!(39, 0, 0, 0, 0));
+    let (_, rest) = rest.rsplit_once(") ").unwrap();
+    let mut fields = rest.split_whitespace();
+    assert_eq!(fields.next(), Some("R"));
+    let mut count = 0;
+    for field in fields {
+        let value = field.parse::<i64>().unwrap();
+        if count == 0 {
+            assert_eq!(value, call!(110, 0, 0, 0, 0) as i64);
+        }
+        if count == 16 {
+            assert_eq!(value, 1);
+        }
+        count += 1;
+    }
+    assert_eq!(count, 49);
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn guest_main(stack: *const usize) -> ! {
+    check_proc_stat();
     let argc = unsafe { stack.read() };
     let name = if argc > 0 {
         unsafe { argument(stack, 0) }
@@ -42,6 +92,14 @@ pub unsafe extern "C" fn guest_main(stack: *const usize) -> ! {
         b""
     };
     if matches!(name, b"replacement" | b"replacement-empty") {
+        let mut cmdline = [0u8; 64];
+        let count = read_proc(b"/cmdline", &mut cmdline);
+        let expected = if name == b"replacement" {
+            b"replacement\0\0argument\0".as_slice()
+        } else {
+            b"replacement-empty\0\0argument\0".as_slice()
+        };
+        assert_eq!(&cmdline[..count], expected);
         assert_eq!(argc, 3);
         assert_eq!(unsafe { argument(stack, 1) }, b"");
         assert_eq!(unsafe { argument(stack, 2) }, b"argument");
@@ -103,6 +161,10 @@ pub unsafe extern "C" fn guest_main(stack: *const usize) -> ! {
     );
     assert_eq!(
         call!(61, usize::MAX, addr_of_mut!(result.status), 2, 0),
+        -10
+    );
+    assert_eq!(
+        call!(61, usize::MAX, addr_of_mut!(result.status), 4, 0),
         -22
     );
     for iteration in 0..3 {
@@ -143,9 +205,9 @@ pub unsafe extern "C" fn guest_main(stack: *const usize) -> ! {
             panic!("successful exec returned");
         }
         assert_eq!(call!(61, child, 1, 0, 0), -14);
-        assert_eq!(call!(61, child, addr_of_mut!(result.status), 0, 0), child);
+        assert_eq!(call!(61, child, addr_of_mut!(result.status), 2, 0), child);
         assert_eq!((result.status, result.guard), (42 << 8, 0xfeed_cafe));
-        assert_eq!(call!(61, child, addr_of_mut!(result.status), 1, 0), -10);
+        assert_eq!(call!(61, child, addr_of_mut!(result.status), 3, 0), -10);
     }
     let child = fork_registers();
     assert!(child >= 0);

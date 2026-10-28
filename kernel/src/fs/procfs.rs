@@ -860,7 +860,12 @@ fn task_cmdline_content(pid: Pid) -> Result<String, FsError> {
         return Err(FsError::NotFound);
     };
 
-    Ok(format!("{}\n", task.name))
+    let mut content = String::new();
+    for arg in &task.argv {
+        content.push_str(arg);
+        content.push('\0');
+    }
+    Ok(content)
 }
 
 fn task_cwd_target(pid: Pid) -> Result<String, FsError> {
@@ -884,26 +889,27 @@ fn task_stat_content(pid: Pid) -> Result<String, FsError> {
         return Err(FsError::NotFound);
     };
 
-    let mut content = format!(
-        "pid: {}\nppid: {}\ncwd_inode: {}\nname: {}\nstate: {}\nmode: {}\n",
-        task.pid,
-        task.parent_pid,
-        task.cwd_inode,
-        task.name,
-        state_name(task.state),
-        mode_name(task.mode),
-    );
+    let state = match task.state {
+        TaskState::Ready | TaskState::Running => 'R',
+        TaskState::Waiting => 'S',
+        TaskState::Zombie => 'Z',
+    };
+    // Linux stat fields 4..52; leave counters we do not track at zero.
+    let mut fields = [0u64; 49];
+    fields[0] = task.parent_pid;
+    fields[1] = task.pgid;
+    fields[2] = task.sid;
+    fields[10] = task.time_usage_ms / 10; // utime, in USER_HZ (100 Hz) ticks
+    fields[14] = u64::from(task.priority);
+    fields[16] = 1; // num_threads
+    fields[34] = 17; // exit_signal (SIGCHLD)
+    fields[48] = ((task.exit_code() & 0xff) << 8) as u64;
 
-    for (fd, desc) in task.fd_entries() {
-        content.push_str(&format!(
-            "fd: {} dev: {}:{} ino: {} mode: {}\n",
-            fd,
-            desc.major,
-            desc.minor,
-            desc.inode,
-            desc.mode.as_str(),
-        ));
+    let mut content = format!("{} ({}) {}", task.pid, task.name, state);
+    for field in fields {
+        content.push_str(&format!(" {}", field));
     }
+    content.push('\n');
 
     Ok(content)
 }

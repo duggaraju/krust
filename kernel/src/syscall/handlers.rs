@@ -851,7 +851,8 @@ pub fn sys_execve(args: &SyscallArgs) -> isize {
 }
 
 pub fn sys_wait4(args: &SyscallArgs) -> isize {
-    if args.arg2 & !1 != 0 {
+    // WUNTRACED is valid even though stopped-child reporting is not yet implemented.
+    if args.arg2 & !(1 | 2) != 0 {
         return -22;
     }
     if args.arg3 != 0 {

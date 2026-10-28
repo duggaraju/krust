@@ -40,10 +40,17 @@ vectors from validated user pages before replacing the image, preserving empty
 arguments and an explicitly empty environment.
 
 Wait status uses Linux's four-byte `int` buffer and exit-code encoding.
-Any-child/positive-PID waits support `WNOHANG` and return `ECHILD` after the last
-child is reaped. Process-group selection, nonzero rusage, and unsupported wait
+Any-child/positive-PID waits support `WNOHANG` and accept `WUNTRACED`, including
+their combination, so interactive shells can reap exited children. Stopped-child
+reporting is not yet implemented. Waits return `ECHILD` after the last child is
+reaped. Process-group selection, nonzero rusage, and unsupported wait
 options are explicitly rejected. Full signal/wait semantics and per-task
 x87/SSE state remain separate work items (#14/#15/#50).
+
+`/proc/<pid>/stat` uses Linux's positional 52-field format with a parenthesized
+command name and single-letter state. Untracked accounting fields are zero.
+`/proc/<pid>/cmdline` contains NUL-separated arguments, including empty arguments;
+kernel tasks without arguments return an empty command line.
 
 See the [shell/process regression](testing/shell.md#busybox-shell-and-process-regression)
 for BIOS/UEFI fork, exec, wait, fault-recovery, and interactive shell coverage.

@@ -432,6 +432,7 @@ pub fn shell_process() {
     for firmware in FIRMWARE {
         let mut guest = Guest::start(&work, firmware, firmware, Some(&disk), &[]);
         guest.boot();
+        let baseline = guest.command("ps");
         for (command, expected) in [
             ("/bin/sh -c pwd", "/"),
             ("/bin/ash -c pwd", "/"),
@@ -460,7 +461,7 @@ pub fn shell_process() {
         assert_eq!(guest.command("/bin/sh -c pwd"), "/");
         guest.send("/bin/busybox sh");
         let mut interactive = guest.until("# ").expect("interactive shell prompt");
-        for command in ["ls", "ls", "echo KRUST_INTERACTIVE_OK"] {
+        for command in ["ls", "ls", "/bin/busybox ps", "echo KRUST_INTERACTIVE_OK"] {
             guest.send(command);
             interactive.push_str(&guest.until("# ").expect("interactive command prompt"));
         }
@@ -469,6 +470,15 @@ pub fn shell_process() {
         subprocess_listing(
             &clean_response(&interactive, "/bin/busybox sh"),
             "KRUST_INTERACTIVE_OK",
+        );
+        assert!(
+            interactive.contains("PID") && interactive.contains("busybox"),
+            "{interactive}"
+        );
+        assert_eq!(
+            guest.command("ps"),
+            baseline,
+            "exited children must be reaped"
         );
         guest.shutdown("exit");
         let trace = guest.kernel();
